@@ -1,5 +1,33 @@
 import { defineConfig } from 'vitest/config';
 
+export type VitestFileFilters = {
+  readonly unit: readonly string[];
+  readonly e2e: readonly string[];
+};
+
+function isE2eTestPath(path: string): boolean {
+  return path.endsWith('.e2e.ts');
+}
+
+function isUnitTestPath(path: string): boolean {
+  return /\.(test|spec)\.ts$/.test(path) && !isE2eTestPath(path);
+}
+
+export function vitestFileFiltersAfterDoubleDash(argv: readonly string[]): VitestFileFilters | null {
+  const separatorIndex = argv.indexOf('--');
+  if (separatorIndex < 0) return null;
+
+  const paths = argv.slice(separatorIndex + 1).filter(arg => arg.length > 0 && !arg.startsWith('-'));
+  if (paths.length === 0) return null;
+
+  return {
+    unit: paths.filter(isUnitTestPath),
+    e2e: paths.filter(isE2eTestPath),
+  };
+}
+
+const doubleDashFilters = vitestFileFiltersAfterDoubleDash(process.argv);
+
 /**
  * Two projects, two execution profiles:
  *
@@ -28,7 +56,7 @@ export default defineConfig({
       {
         test: {
           name: 'unit',
-          include: ['test/**/*.{test,spec}.ts'],
+          include: doubleDashFilters ? [...doubleDashFilters.unit] : ['test/**/*.{test,spec}.ts'],
           // Belt-and-suspenders: *.test.ts never matches *.e2e.ts, but keep the
           // e2e dir out explicitly so a stray *.test.ts there can't sneak in.
           exclude: ['test/e2e-browser/**', '**/*.e2e.ts', 'node_modules/**'],
@@ -40,7 +68,7 @@ export default defineConfig({
       {
         test: {
           name: 'e2e',
-          include: ['test/**/*.e2e.ts'],
+          include: doubleDashFilters ? [...doubleDashFilters.e2e] : ['test/**/*.e2e.ts'],
           fileParallelism: false,
           testTimeout: 60_000,
           hookTimeout: 360_000,

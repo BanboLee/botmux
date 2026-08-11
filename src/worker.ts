@@ -38,6 +38,7 @@ import {
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
 import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { finalizeRawCommandDelivery, writeRawCommandLine } from './core/raw-command-writer.js';
+import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
@@ -2005,18 +2006,14 @@ function releaseReadyGate(reason: string, opts?: { promptReadyAfterSettle?: bool
 const STARTUP_CMD_QUIET_MS = 500;
 const STARTUP_CMD_CAP_MS = 4_000;
 
-/** Inter-keystroke spacing when typing a slash command into CoCo char-by-char.
- *  CoCo (Trae CLI, Ink TUI) treats "several bytes delivered in one PTY read" as a
- *  paste, which skips command mode + the slash picker — so each char must land as
- *  its own keystroke. 40ms is comfortably above CoCo's coalescing window (verified
- *  against Trae CLI 0.120.45) while keeping a short command sub-second. */
-const COCO_SLASH_TYPE_THROTTLE_MS = 40;
-
 /** Type one literal input LINE into the CLI exactly like a passthrough slash
- *  command: raw text → a 200ms beat (so the TUI's slash-command picker registers
- *  the match before submit) → a separate Enter. Non-TUI backends fall back to a
- *  single write + CR. Shared by the `raw_input` IPC handler and runStartupCommands
- *  so both stay in lockstep. */
+ *  command. Delivery is adapter-derived: adapters that declare a paste-line
+ *  input mode (e.g. OpenCode) paste the line up front, then wait out the
+ *  adapter's settle window before pressing Enter; generic backends keep the
+ *  classic raw text → a 200ms beat (so the TUI's slash-command picker
+ *  registers the match before submit) → a separate Enter, or fall back to a
+ *  single write + CR. Shared by the `raw_input` IPC handler and
+ *  runStartupCommands so both stay in lockstep. */
 async function sendRawCommandLine(be: NonNullable<typeof backend>, content: string): Promise<void> {
   // PR #597 extracted the CoCo/pty keystroke choreography into the shared
   // writeRawCommandLine helper (unit-tested in raw-command-writer.ts). It
@@ -2024,11 +2021,11 @@ async function sendRawCommandLine(be: NonNullable<typeof backend>, content: stri
   // recovery-fence transaction detects a failed submission by a thrown error, so
   // bridge the two: turn an explicit `false` into the same throw the inline
   // implementation used, letting runAmbiguousSubmissionTransaction cancel the WAL.
-  const accepted = await writeRawCommandLine(be, content, {
-    coco: lastInitConfig?.cliId === 'coco',
-    cocoThrottleMs: COCO_SLASH_TYPE_THROTTLE_MS,
-    submitBeatMs: 200,
-  });
+  const accepted = await writeRawCommandLine(
+    be,
+    content,
+    rawCommandWriteOptionsFor(cliAdapter ?? undefined, lastInitConfig?.cliId),
+  );
   if (accepted === false) {
     throw new Error('backend rejected command text or submit key input');
   }
