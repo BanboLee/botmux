@@ -2,6 +2,7 @@
  * commands. Historical backends return void on success; guarded backends
  * return false when the target pane/process is already unavailable. */
 export interface RawCommandWriter {
+  readonly supportsRawCommandPasteLine?: boolean;
   write(data: string): void | boolean;
   sendText?: (text: string) => void | boolean;
   sendSpecialKeys?: (...keys: string[]) => void | boolean;
@@ -42,7 +43,7 @@ export async function writeRawCommandLine(
       await delay(beatMs);
       return sendSpecialKeys('Enter') !== false;
     }
-    if (opts.pasteLine && pasteText) {
+    if (opts.pasteLine && backend.supportsRawCommandPasteLine && pasteText) {
       if (pasteText(content) === false) return false;
       await delay(opts.pasteSettleMs ?? beatMs);
       return sendSpecialKeys('Enter') !== false;

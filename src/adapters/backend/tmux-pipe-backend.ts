@@ -99,6 +99,7 @@ export function tmuxLifecycleInitialDelayMs(target: string): number {
 }
 
 export class TmuxPipeBackend implements SessionBackend {
+  readonly supportsRawCommandPasteLine = true;
   /** Real tmux pane address (e.g. "0:2.0") or botmux session name (bmx-*). */
   private readonly paneTarget: string;
   private readonly fifoPath: string;

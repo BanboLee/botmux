@@ -33,7 +33,7 @@ describe('OpenCode raw slash command passthrough', () => {
     // When: the Botmux raw passthrough seam maps OpenCode adapter capability
     // into the raw writer for the exact slash command with arguments.
     const accepted = await writeRawCommandLine(
-      { write, sendText, pasteText, sendSpecialKeys },
+      { supportsRawCommandPasteLine: true, write, sendText, pasteText, sendSpecialKeys },
       '/mr-review-team 127',
       { ...rawCommandWriteOptionsFor(adapter, 'opencode'), delay },
     );

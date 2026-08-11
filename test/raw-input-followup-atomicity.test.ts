@@ -352,7 +352,7 @@ describe('raw command backend acceptance', () => {
     const delay = vi.fn(async (ms: number) => {
       calls.push(`delay:${ms}`);
     });
-    const fake = { write, sendText, sendSpecialKeys, pasteText };
+    const fake = { supportsRawCommandPasteLine: true, write, sendText, sendSpecialKeys, pasteText };
     const pasteLineOptions = { pasteLine: true, pasteSettleMs: 300, delay };
 
     await expect(writeRawCommandLine(
@@ -369,6 +369,42 @@ describe('raw command backend acceptance', () => {
     expect(calls).toEqual([
       'pasteText:/mr-review-team 127',
       'delay:300',
+      'sendSpecialKeys:Enter',
+    ]);
+  });
+
+  it('falls back to sendText when pasteLine is enabled but the backend has no paste-line contract', async () => {
+    const calls: string[] = [];
+    const write = vi.fn(() => true);
+    const sendText = vi.fn((text: string) => {
+      calls.push(`sendText:${text}`);
+      return true;
+    });
+    const pasteText = vi.fn((text: string) => {
+      calls.push(`pasteText:${text}`);
+      return true;
+    });
+    const sendSpecialKeys = vi.fn((key: string) => {
+      calls.push(`sendSpecialKeys:${key}`);
+      return true;
+    });
+    const delay = vi.fn(async (ms: number) => {
+      calls.push(`delay:${ms}`);
+    });
+    const fake = { write, sendText, sendSpecialKeys, pasteText };
+
+    await expect(writeRawCommandLine(
+      fake,
+      '/mr-review-team 127',
+      { pasteLine: true, pasteSettleMs: 300, delay },
+    )).resolves.toBe(true);
+
+    expect(pasteText).not.toHaveBeenCalled();
+    expect(sendText).toHaveBeenCalledWith('/mr-review-team 127');
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(calls).toEqual([
+      'sendText:/mr-review-team 127',
+      'delay:200',
       'sendSpecialKeys:Enter',
     ]);
   });
@@ -422,7 +458,7 @@ describe('raw command backend acceptance', () => {
     const delay = vi.fn(async (ms: number) => {
       calls.push(`delay:${ms}`);
     });
-    const fake = { write, sendSpecialKeys, pasteText };
+    const fake = { supportsRawCommandPasteLine: true, write, sendSpecialKeys, pasteText };
 
     await expect(writeRawCommandLine(
       fake,
@@ -458,7 +494,7 @@ describe('raw command backend acceptance', () => {
     const delay = vi.fn(async (ms: number) => {
       calls.push(`delay:${ms}`);
     });
-    const fake = { write, sendText, sendSpecialKeys, pasteText };
+    const fake = { supportsRawCommandPasteLine: true, write, sendText, sendSpecialKeys, pasteText };
     const pasteLineOptions = {
       coco: true,
       cocoThrottleMs: 7,
