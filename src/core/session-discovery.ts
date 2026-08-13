@@ -149,7 +149,7 @@ export function bareShellLaunchGuidance(leafComm: string, expectedShell: string)
   if (expectedShell === 'fish') {
     return {
       rcFileHint: '~/.config/fish/config.fish',
-      manualTerminalGuard: `status is-interactive; and isatty stdout; and exec ${leafComm}`,
+      manualTerminalGuard: `status is-interactive; and isatty stdout; and not set -q BOTMUX_MANAGED_SHELL; and exec ${leafComm}`,
     };
   }
   return {

@@ -169,7 +169,7 @@ describe('bareShellLaunchGuidance()', () => {
     const guidance = bareShellLaunchGuidance('zsh', 'fish');
 
     expect(guidance.rcFileHint).toBe('~/.config/fish/config.fish');
-    expect(guidance.manualTerminalGuard).toBe('status is-interactive; and isatty stdout; and exec zsh');
+    expect(guidance.manualTerminalGuard).toBe('status is-interactive; and isatty stdout; and not set -q BOTMUX_MANAGED_SHELL; and exec zsh');
   });
 
   it('preserves POSIX rc and guard guidance for bash/zsh launches', () => {

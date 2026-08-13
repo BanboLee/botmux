@@ -70,6 +70,10 @@ function firstExistingPath(paths: readonly string[]): string | undefined {
   return paths.find(path => existsSync(path));
 }
 
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 describe('buildBotmuxEnvAssignments()', () => {
   it('forwards only the daemon-side keys; bare LARK_APP_* are NOT forwarded', () => {
     const out = buildBotmuxEnvAssignments({
@@ -381,7 +385,7 @@ describe('shellLaunchArgv()', () => {
     const argv = shellLaunchArgv('/bin/zsh', ['-l', '-i']);
     expect(argv).toEqual([
       '/usr/bin/env',
-      'DISABLE_AUTO_UPDATE=true',
+      ...NON_INTERACTIVE_SHELL_ENV,
       '/bin/zsh',
       '-l',
       '-i',
@@ -392,7 +396,7 @@ describe('shellLaunchArgv()', () => {
     const argv = shellLaunchArgv('/bin/sh', []);
     expect(argv).toEqual([
       '/usr/bin/env',
-      'DISABLE_AUTO_UPDATE=true',
+      ...NON_INTERACTIVE_SHELL_ENV,
       '/bin/sh',
     ]);
   });
@@ -401,7 +405,7 @@ describe('shellLaunchArgv()', () => {
     const argv = shellLaunchArgv('/bin/bash', ['-i']);
     expect(argv).toEqual([
       '/usr/bin/env',
-      'DISABLE_AUTO_UPDATE=true',
+      ...NON_INTERACTIVE_SHELL_ENV,
       '/bin/bash',
       '-i',
     ]);
@@ -410,25 +414,25 @@ describe('shellLaunchArgv()', () => {
   it('keeps bash/zsh/sh rcfile flags unchanged while adding fish as an interactive launch shell', () => {
     expect(shellLaunchArgv('/bin/bash', ['-i'])).toEqual([
       '/usr/bin/env',
-      'DISABLE_AUTO_UPDATE=true',
+      ...NON_INTERACTIVE_SHELL_ENV,
       '/bin/bash',
       '-i',
     ]);
     expect(shellLaunchArgv('/bin/zsh', ['-l', '-i'])).toEqual([
       '/usr/bin/env',
-      'DISABLE_AUTO_UPDATE=true',
+      ...NON_INTERACTIVE_SHELL_ENV,
       '/bin/zsh',
       '-l',
       '-i',
     ]);
     expect(shellLaunchArgv('/bin/sh', [])).toEqual([
       '/usr/bin/env',
-      'DISABLE_AUTO_UPDATE=true',
+      ...NON_INTERACTIVE_SHELL_ENV,
       '/bin/sh',
     ]);
     expect(shellLaunchArgv('/bin/fish', ['-i'])).toEqual([
       '/usr/bin/env',
-      'DISABLE_AUTO_UPDATE=true',
+      ...NON_INTERACTIVE_SHELL_ENV,
       '/bin/fish',
       '-i',
     ]);
@@ -438,7 +442,7 @@ describe('shellLaunchArgv()', () => {
     const posix = shellCommandArgv({ shell: '/bin/bash', flags: ['-i'] }, 'SCRIPT', ['/work', 'BOTMUX=1', 'bin']);
     expect(posix).toEqual([
       '/usr/bin/env',
-      'DISABLE_AUTO_UPDATE=true',
+      ...NON_INTERACTIVE_SHELL_ENV,
       '/bin/bash',
       '-i',
       '-c',
@@ -451,7 +455,7 @@ describe('shellLaunchArgv()', () => {
     const fish = shellCommandArgv({ shell: '/bin/fish', flags: ['-i'] }, 'SCRIPT', ['/work', 'BOTMUX=1', 'bin']);
     expect(fish).toEqual([
       '/usr/bin/env',
-      'DISABLE_AUTO_UPDATE=true',
+      ...NON_INTERACTIVE_SHELL_ENV,
       '/bin/fish',
       '-i',
       '-c',
@@ -823,6 +827,7 @@ describe('shell wrapper end-to-end (the contract spawn() builds)', () => {
   const hasEnvBin = existsSync(envBin);
   const hasBash = existsSync('/bin/bash');
   const fishPath = firstExistingPath(['/bin/fish', '/usr/bin/fish', '/usr/local/bin/fish', '/opt/homebrew/bin/fish']);
+  const hasScript = spawnSync('script', ['-qec', 'true', '/dev/null']).status === 0;
   // These tests exercise the wrapper's env-inject / unset / cd contract; the exact
   // bin dir is irrelevant to them, so bake a fixed placeholder. (Core-only vs shared
   // bin-dir RESOLUTION is covered by the dedicated scrub-order describe below.)
@@ -1104,6 +1109,41 @@ describe('shell wrapper end-to-end (the contract spawn() builds)', () => {
       expect(result.stdout).toContain('OWNER=ou_test value');
       expect(result.stdout).toContain('ARG1=ARG WITH SPACE');
       expect(result.stdout).toContain('ARG2=DOLLAR=$x');
+    },
+  );
+
+  it.skipIf(!fishPath || !hasEnvBin || !hasScript)(
+    'fish config.fish manual-terminal guard does not exec under managed PTY launch',
+    () => {
+      tmpDir = mkdtempSync(join(tmpdir(), 'botmux-fish-config-'));
+      const fishConfigDir = join(tmpDir, '.config', 'fish');
+      mkdirSync(fishConfigDir, { recursive: true });
+      writeFileSync(
+        join(fishConfigDir, 'config.fish'),
+        'echo CONFIG-SEEN\nstatus is-interactive; and isatty stdout; and not set -q BOTMUX_MANAGED_SHELL; and exec /bin/sh -c "echo TRAMPOLINED"\n',
+      );
+      const cwd = join(tmpDir, 'cwd');
+      mkdirSync(cwd);
+      const command = [
+        ...shellLaunchArgv(fishPath ?? '/bin/fish', ['-i']).map(shellSingleQuote),
+        '-c',
+        shellSingleQuote(FISH_SCRIPT),
+        shellSingleQuote(cwd),
+        '/bin/sh',
+        '-c',
+        shellSingleQuote('printf "CLI-RAN\\n"; printf "SENTINEL=%s\\n" "$BOTMUX_MANAGED_SHELL"'),
+      ].join(' ');
+
+      const result = spawnSync('script', ['-qec', command, '/dev/null'], {
+        encoding: 'utf-8',
+        env: { HOME: tmpDir, PATH: '/usr/bin:/bin' },
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('CONFIG-SEEN');
+      expect(result.stdout).toContain('CLI-RAN');
+      expect(result.stdout).toContain('SENTINEL=');
+      expect(result.stdout).not.toContain('TRAMPOLINED');
     },
   );
 

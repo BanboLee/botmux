@@ -592,6 +592,7 @@ export class TmuxBackend implements SessionBackend {
  */
 export const NON_INTERACTIVE_SHELL_ENV = [
   'DISABLE_AUTO_UPDATE=true',
+  'BOTMUX_MANAGED_SHELL=1',
 ] as const;
 
 /** Remove rcfile-only launch overrides before the managed CLI is exec'd. */
