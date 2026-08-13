@@ -1167,14 +1167,14 @@ export interface BotConfig {
   /**
    * Per-bot launch-shell override for the persistent backends (tmux/zellij/zmx).
    * When set, botmux launches the CLI under this shell instead of the daemon's
-   * `$SHELL`. Accepts a bare name (`zsh`/`bash`/`sh`) or an absolute path
-   * (`/usr/bin/zsh`). The escape hatch for a login `$SHELL` (e.g. bash) whose
+   * `$SHELL`. Accepts a bare name (`zsh`/`bash`/`fish`/`sh`) or an absolute path
+   * (`/usr/bin/fish`). The escape hatch for a login `$SHELL` (e.g. bash) whose
    * rcfile `exec`-trampolines into another shell: that trampoline replaces the
    * launch shell before it can `exec` the CLI, leaving a bare shell the first
-   * prompt gets typed into (`zsh: parse error`). Pinning `launchShell: zsh`
-   * launches under zsh directly and bypasses the bash `.bashrc`. CAVEAT:
-   * PATH/nvm/pnpm shims must then live in the pinned shell's rcfiles (e.g.
-   * `.zshrc`/`.zprofile`), not the bypassed one. Ignored by the pty backend
+   * prompt gets typed into (`zsh: parse error`). Pinning `launchShell: fish`
+   * launches under fish directly and bypasses the bash `.bashrc`. CAVEAT:
+   * PATH/nvm/pnpm shims must then live in the pinned shell's rcfiles (for
+   * example `.zshrc`/`.zprofile` or `~/.config/fish/config.fish`), not the bypassed one. Ignored by the pty backend
    * (which `exec`s the CLI directly, no shell wrapper, so it's trampoline-immune).
    */
   launchShell?: string;
