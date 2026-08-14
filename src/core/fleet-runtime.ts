@@ -8,8 +8,11 @@
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, openSync, mkdirSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import type { FleetBotSpec } from './fleet-supervisor.js';
+import { resolveEntrySpawn } from './self-spawn.js';
+import { readFleetState } from './fleet-state-store.js';
 
 const CONFIG_DIR = join(homedir(), '.botmux');
 const HEAPSHOT_DIR = join(CONFIG_DIR, 'heapshots');
@@ -65,3 +68,52 @@ export function resolveFleetBots(): FleetBotSpec[] {
     };
   });
 }
+
+const LOG_DIR = join(CONFIG_DIR, 'logs');
+
+/** True if a live fleet supervisor is already running (per fleet-state pid + kill -0). */
+export function liveSupervisorPid(): number | undefined {
+  const state = readFleetState(fleetStatePath());
+  const pid = state?.supervisorPid ?? 0;
+  if (!Number.isSafeInteger(pid) || pid <= 1) return undefined;
+  try { process.kill(pid, 0); return pid; } catch { return undefined; }
+}
+
+export interface StartFleetResult {
+  action: 'started' | 'already-running';
+  supervisorPid: number;
+  botCount: number;
+}
+
+/**
+ * Launch the fleet supervisor as a detached, long-lived process (replaces
+ * `pm2 start`). Single-supervisor guarantee: if a live supervisor already owns
+ * the fleet, this is a no-op ('already-running') — the running supervisor is
+ * itself idempotent and keeps the fleet reconciled. The spawned supervisor
+ * outlives this CLI (detached + unref), with stdout/err to the botmux log dir;
+ * boot persistence (systemd/launchd) re-invokes `botmux start` → here.
+ *
+ * NOTE: the caller must already hold the fleet-mutation file lock so two
+ * concurrent `botmux start` invocations can't both pass the liveness check.
+ */
+export function startFleetViaSupervisor(): StartFleetResult {
+  const bots = resolveFleetBots();
+  const existing = liveSupervisorPid();
+  if (existing !== undefined) {
+    return { action: 'already-running', supervisorPid: existing, botCount: bots.length };
+  }
+  mkdirSync(LOG_DIR, { recursive: true });
+  const out = openSync(join(LOG_DIR, 'supervisor-out.log'), 'a');
+  const err = openSync(join(LOG_DIR, 'supervisor-err.log'), 'a');
+  const { command, args } = resolveEntrySpawn('supervisor', fleetDistDir());
+  const nodeArgs = args.length > 0 && args[0].startsWith('__') ? [] : ['--enable-source-maps'];
+  const child = spawn(command, [...nodeArgs, ...args], {
+    cwd: CONFIG_DIR,
+    detached: true,
+    stdio: ['ignore', out, err],
+    env: { ...process.env },
+  });
+  child.unref();
+  return { action: 'started', supervisorPid: child.pid ?? 0, botCount: bots.length };
+}
+

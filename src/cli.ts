@@ -2730,62 +2730,20 @@ async function cmdStart(): Promise<void> {
       if (JSON.stringify(lockedBots) !== JSON.stringify(botsForCheck)) {
         throw new Error('[start] bots.json changed during credential preflight; retry with the new configuration');
       }
-      assertNoDuplicatePm2GodDaemons();
       preflightNodeSanity();
-      cleanupLegacyPm2();
-      const currentProjection = readVerifiedBotmuxPm2Projection('start');
-      assertNoUnregisteredLiveDaemonDescriptors('start', currentProjection);
-      assertCanonicalUniquePm2Rows('start', currentProjection);
-      const configuredNames = configuredCoreProcessNames(lockedBots);
-      const verifyTimeoutMs = pm2StartVerifyTimeoutMs(configuredNames.length);
-      const cfg = ecosystemConfig(lockedBots);
-      const liveEntries = currentProjection.filter(isLivePm2Entry);
-      if (liveEntries.length > 0) {
-        try {
-          readAndAssertConfiguredFleetOnline(
-            'start-idempotent-ready',
-            configuredNames,
-            PM2_HOME,
-            verifyTimeoutMs,
-          );
-          return;
-        } catch (error) {
-          throw new Error(
-            `[start] refusing PM2 start while a partial/live core fleet exists `
-            + `(${liveEntries.map(entry => `${entry.name}:${entry.pid}`).join(', ')}): `
-            + `${error instanceof Error ? error.message : String(error)}; `
-            + 'use start-bot only for an exact one-missing-bot fleet, or restart',
-          );
-        }
+      // Fleet launch via the built-in supervisor (replaces pm2). The supervisor
+      // owns the invariants pm2's guard layer used to enforce: single-supervisor
+      // exclusion (fleet-state pid + kill-0, under this same mutation lock),
+      // idempotent reconcile (planStart only (re)spawns missing/dead bots), and
+      // projection identity (validated on every state write). So `start` while a
+      // live supervisor already owns the fleet is a safe no-op — no pm2-style
+      // "refuse partial live fleet" dance needed; the running supervisor keeps
+      // the fleet reconciled itself.
+      const { startFleetViaSupervisor } = await import('./core/fleet-runtime.js');
+      const result = startFleetViaSupervisor();
+      if (result.action === 'already-running') {
+        console.log(`\n✅ fleet 已在运行 (supervisor pid ${result.supervisorPid}, ${result.botCount} 个机器人)`);
       }
-      const unprovenDormant = currentProjection.filter(
-        entry => !isFleetEntryProvenFreeOfAutorestartTimer(entry),
-      );
-      if (unprovenDormant.length > 0) {
-        throw new Error(
-          `[start] refusing PM2 start: dormant row(s) may still have a restart timer `
-          + `(${unprovenDormant.map(entry => `${entry.name}:${entry.status ?? 'unknown'}`).join(', ')})`,
-        );
-      }
-      runBoundedPm2StartTransaction(
-        'start',
-        PM2_START_COMMAND_TIMEOUT_MS,
-        verifyTimeoutMs,
-        {
-          start: timeoutMs => {
-            assertBotsConfigSnapshotUnchanged('start', lockedBots);
-            assertNoDuplicatePm2GodDaemons();
-            preflightNodeSanity();
-            runPm2(['start', cfg], true, PM2_HOME, timeoutMs);
-          },
-          verifyFresh: timeoutMs => readAndAssertConfiguredFleetOnline(
-            'start-after-launch', configuredNames, PM2_HOME, timeoutMs,
-          ),
-          rollback: () => rollbackPm2StartAttempt(
-            'start', currentProjection, configuredNames,
-          ),
-        },
-      );
     }, { maxWaitMs: 5_000 });
   }, { maxWaitMs: 5_000 });
   await reconcilePluginServicesForCli(undefined, { autoOnly: true });
