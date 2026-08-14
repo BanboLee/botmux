@@ -25,6 +25,7 @@ import { isGrantDurationOption } from './services/grant-policy.js';
 import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
+import { codexModelSupportsReasoningEffort, isCodexReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -1187,6 +1188,8 @@ export interface BotConfig {
    * `modelChoices` for the curated candidates surfaced in `botmux setup`.
    */
   model?: string;
+  /** Default Codex reasoning effort for newly created sessions. */
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   /**
    * If true, botmux does not add CLI-default approval/sandbox bypass flags
    * such as --yolo or --dangerously-*. Missing/false preserves legacy behavior.
@@ -2763,6 +2766,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
         : undefined,
+      reasoningEffort: isCodexReasoningCliId(entryCliId)
+        && isCodexReasoningEffort(entry.reasoningEffort)
+        && codexModelSupportsReasoningEffort(
+          typeof entry.model === 'string' ? entry.model : undefined,
+          entry.reasoningEffort,
+        )
+        ? entry.reasoningEffort : undefined,
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       codexRpcInput: entry.codexRpcInput === true,
