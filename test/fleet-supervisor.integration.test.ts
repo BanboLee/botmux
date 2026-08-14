@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FleetSupervisor, pidAlive, type FleetBotSpec } from '../src/core/fleet-supervisor.js';
@@ -132,5 +132,28 @@ describe('FleetSupervisor (live, integration)', () => {
     await delay(200);
     // all children gone
     expect(pids.every((pid) => !pidAlive(pid))).toBe(true);
+    // state finalized: every proc marked stopped (pid 0), supervisorPid cleared,
+    // so a later `status` read after a clean stop never shows stale 'online' rows.
+    const after = readFleetState(statePath)!;
+    expect(after.supervisorPid).toBe(0);
+    expect(after.procs.every((p) => p.status === 'stopped' && p.pid === 0)).toBe(true);
+  });
+
+  it('writes per-bot daemon logs to logDir (daemon-<index>-out.log)', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const logDir = join(root, 'logs');
+    // STAY prints `daemon pid=<pid> idx=<index>` to stdout on boot.
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, logDir, log: () => {},
+    });
+    sup.start([bots[0]]); // botIndex 0
+    await waitFor(() => existsSync(join(logDir, 'daemon-0-out.log')) &&
+      readFileSync(join(logDir, 'daemon-0-out.log'), 'utf-8').includes('idx=0'));
+    const out = readFileSync(join(logDir, 'daemon-0-out.log'), 'utf-8');
+    expect(out).toContain('idx=0');
+    // err file is created even if empty (the child dup'd both fds).
+    expect(existsSync(join(logDir, 'daemon-0-err.log'))).toBe(true);
+    await sup.stopAll();
   });
 });

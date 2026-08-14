@@ -8,11 +8,8 @@
  *   botmux setup list|add|configure|edit|remove — scripted (non-TUI) bot management, see `botmux setup help`
  *   botmux start          — start daemon and auto plugin services
  *   botmux stop [--with-plugin] — stop daemon (optionally stop auto plugin services)
- *   botmux restart [--include-pm2] [--with-plugin] — restart daemon, then ensure auto plugin services;
- *     --include-pm2 is a zero-live-God admission fence, not authority to signal an existing PM2 God
- *   botmux restart --bootstrap-shutdown-protocol --yes — operator-approved one-time retirement
- *     of a pre-protocol fleet after independently confirming all Session/Riff work is idle
- *   botmux logs [--lines] — view daemon logs
+ *   botmux restart [--with-plugin] — restart daemon, then ensure auto plugin services
+ *   botmux logs [--lines] [--bot <i>] [--no-follow] — view/stream per-bot daemon logs
  *   botmux status         — show daemon status
  *   botmux upgrade|update — upgrade to latest version
  *   botmux device enroll|status|logout — manage the host desktop device credential
@@ -3485,95 +3482,26 @@ function cleanupLegacyPm2(
 
 async function cmdStop(): Promise<void> {
   const includePluginServices = process.argv.includes('--with-plugin');
-  const bootstrapShutdownProtocol = process.argv.includes('--bootstrap-shutdown-protocol');
-  const bootstrapConfirmed = process.argv.includes('--yes');
-  if (bootstrapShutdownProtocol && !bootstrapConfirmed) {
-    throw new Error(
-      '[stop] --bootstrap-shutdown-protocol requires --yes after confirming every Session/Riff workload is idle',
-    );
-  }
   ensureConfigDir();
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
-    assertNoDuplicatePm2GodDaemons();
-    cleanupLegacyPm2(bootstrapShutdownProtocol ? 'stop' : undefined);
-    if (bootstrapShutdownProtocol) {
-      bootstrapDeleteAllBotmuxProcesses('stop');
+    cleanupLegacyPm2('stop'); // reap any pre-migration pm2 God still holding botmux procs
+    const { stopFleet } = await import('./core/fleet-runtime.js');
+    const result = stopFleet();
+    if (result.action === 'not-running') {
       cleanupStaleDaemonDescriptors();
-      if (includePluginServices) {
-        await stopPluginServicesForCli(undefined, { autoOnly: true });
-      }
-      console.log('daemon 已通过一次性 shutdown-protocol bootstrap 安全边界停止。');
-      return;
-    }
-    let entries: BotmuxPm2ProcessEntry[];
-    try {
-      entries = parsePm2JlistOutputStrict(pm2Capture(['jlist']))
-        .filter(app => app && isBotmuxCoreProcessName(String(app.name)))
-        .map(toBotmuxPm2ProcessEntry);
-    } catch (err) {
-      throw new Error(
-        `[stop] pm2 jlist failed; refusing an unverified stop: `
-        + `${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-    assertNoUnregisteredLiveDaemonDescriptors('stop', entries);
-    assertCanonicalUniquePm2Rows('stop', entries);
-    if (entries.length === 0) {
-      cleanupStaleDaemonDescriptors();
-      if (includePluginServices) {
-        await stopPluginServicesForCli(undefined, { autoOnly: true });
-      }
+      if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
       console.log('daemon 未在运行。');
       return;
     }
-    signalAndAwaitBotmuxProcesses(entries, 'stop');
-    const beforeStop = readVerifiedBotmuxPm2Projection('stop-before-registry-mutation');
-    assertNoUnregisteredLiveDaemonDescriptors('stop-before-registry-mutation', beforeStop);
-    exactQuiescentRowsForMutation('stop-before-registry-mutation', entries, beforeStop);
-
-    const stopErrors: string[] = [];
-    for (const entry of entries) {
-      try {
-        const exact = revalidateExactQuiescentRowBeforeMutation(
-          'stop-immediately-before-registry-mutation',
-          entry,
-          entries,
-        );
-        if (!exact) continue;
-        runPm2(['stop', String(exact.pmId)], false, PM2_HOME, 10_000);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        stopErrors.push(`${entry.name}: ${message}`);
-        console.error(`[stop] pm2 stop ${entry.name} failed: ${message}`);
-      }
-    }
-    let nonStoppedResidual: string[];
-    try {
-      const targetNames = new Set(entries.map(entry => entry.name));
-      const freshProjection = parsePm2JlistOutputStrict(pm2Capture(['jlist']))
-        .filter(app => app && isBotmuxCoreProcessName(String(app.name)))
-        .map(toBotmuxPm2ProcessEntry);
-      assertNoUnregisteredLiveDaemonDescriptors('stop-after-registry-mutation', freshProjection);
-      exactQuiescentRowsForMutation('stop-after-registry-mutation', entries, freshProjection);
-      nonStoppedResidual = freshProjection
-        .filter(entry => targetNames.has(entry.name) && entry.status !== 'stopped')
-        .map(entry => `${entry.name}:${entry.status ?? 'unknown'}`);
-    } catch (err) {
+    if (result.action === 'timeout') {
       throw new Error(
-        `[stop] PM2 stop verification failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-    if (stopErrors.length > 0 || nonStoppedResidual.length > 0) {
-      throw new Error(
-        `[stop] PM2 registry mutation incomplete`
-        + (nonStoppedResidual.length > 0
-          ? ` (not stopped: ${[...new Set(nonStoppedResidual)].join(', ')})`
-          : '')
-        + (stopErrors.length > 0 ? ` (errors: ${stopErrors.join('; ')})` : ''),
+        `[stop] supervisor (pid ${result.supervisorPid}) 未在超时时间内退出；已发送 SIGKILL，`
+        + `请用 \`botmux status\` 复核 fleet 状态。`,
       );
     }
     cleanupStaleDaemonDescriptors();
     if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
+    console.log(`✅ daemon 已停止 (supervisor pid ${result.supervisorPid})`);
   }, { maxWaitMs: 5_000 });
 }
 
@@ -3597,21 +3525,7 @@ async function cmdRestart(): Promise<void> {
   }
   ensureConfigDir();
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
-    const includePm2 = process.argv.includes('--include-pm2');
     const includePluginServices = process.argv.includes('--with-plugin');
-    const bootstrapShutdownProtocol = process.argv.includes('--bootstrap-shutdown-protocol');
-    const bootstrapConfirmed = process.argv.includes('--yes');
-    if (bootstrapShutdownProtocol && !bootstrapConfirmed) {
-      throw new Error(
-        '[restart] --bootstrap-shutdown-protocol requires --yes after confirming every Session/Riff workload is idle',
-      );
-    }
-    if (bootstrapShutdownProtocol && includePm2) {
-      throw new Error('[restart] --bootstrap-shutdown-protocol cannot be combined with --include-pm2');
-    }
-    if (includePm2) {
-      assertIncludePm2RestartAdmission(listPm2GodDaemonPids());
-    }
 
     const restartIntentDir = resolveDataDir();
     let stagedRestartIntent: RestartIntent | null = null;
@@ -3619,27 +3533,14 @@ async function cmdRestart(): Promise<void> {
       stagedRestartIntent = consumeRestartIntentTo(restartIntentDir, Date.now());
     } catch { /* intent reporting is best-effort */ }
 
-    assertNoDuplicatePm2GodDaemons();
     preflightNodeSanity();
     await ensureSystemDependencies();
-    cleanupLegacyPm2(bootstrapShutdownProtocol ? 'restart' : undefined);
-    if (bootstrapShutdownProtocol) bootstrapDeleteAllBotmuxProcesses('restart');
-    else deleteAllBotmuxProcesses();
+    cleanupLegacyPm2('restart'); // reap any pre-migration pm2 God still holding botmux procs
     if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
     cleanupStaleDaemonDescriptors();
 
-    const retiredProjection = readVerifiedBotmuxPm2Projection('restart-start');
-    assertNoUnregisteredLiveDaemonDescriptors('restart-start', retiredProjection);
-    if (retiredProjection.length > 0) {
-      throw new Error(
-        `[restart-start] new PM2 core row(s) appeared after verified retirement: `
-        + retiredProjection.map(entry => `${entry.name}:${entry.pid}`).join(', '),
-      );
-    }
-
     await withFileLock(BOTS_JSON_FILE, async () => {
       const restartBots = loadBotsJson();
-      const cfg = ecosystemConfig(restartBots);
       const restartAttemptId = randomBytes(16).toString('hex');
       let restartIntentPrepared = false;
       try {
@@ -3653,32 +3554,27 @@ async function cmdRestart(): Promise<void> {
         restartIntentPrepared = true;
       } catch { /* breadcrumb is best-effort */ }
 
+      // Stop the live supervisor (graceful, then killed if it overruns) and
+      // start a fresh one, which re-reads bots.json and (re)spawns every bot.
+      const { restartFleet, fleetBotNames, waitFleetOnline } = await import('./core/fleet-runtime.js');
+      let health: ReturnType<typeof waitFleetOnline>;
       try {
-        const configuredNames = configuredCoreProcessNames(restartBots);
-        const verifyTimeoutMs = pm2StartVerifyTimeoutMs(configuredNames.length);
-        runBoundedPm2StartTransaction(
-          'restart-start',
-          PM2_START_COMMAND_TIMEOUT_MS,
-          verifyTimeoutMs,
-          {
-            start: timeoutMs => {
-              assertBotsConfigSnapshotUnchanged('restart-start', restartBots);
-              assertNoDuplicatePm2GodDaemons();
-              preflightNodeSanity();
-              runPm2(['start', cfg], true, PM2_HOME, timeoutMs);
-            },
-            verifyFresh: timeoutMs => readAndAssertConfiguredFleetOnline(
-              'restart-after-launch', configuredNames, PM2_HOME, timeoutMs,
-            ),
-            rollback: () => rollbackPm2StartAttempt(
-              'restart-start', retiredProjection, configuredNames,
-            ),
-          },
-        );
+        const r = restartFleet();
+        if (r.stop.action === 'timeout') {
+          throw new Error(
+            `[restart] 旧 supervisor (pid ${r.stop.supervisorPid}) 未在超时时间内退出；已 SIGKILL 后仍存活，中止重启。`,
+          );
+        }
+        const names = fleetBotNames();
+        health = waitFleetOnline(names, pm2StartVerifyTimeoutMs(names.length));
+        if (!health.healthy) {
+          throw new Error(
+            `[restart] fleet 未在超时时间内全部上线 (${health.online}/${health.expected})；`
+            + `未上线: ${health.pending.join(', ')}。用 \`botmux status\` / \`botmux logs\` 排查。`,
+          );
+        }
       } catch (err) {
-        try {
-          removeRestartIntentAttemptTo(restartIntentDir, restartAttemptId);
-        } catch { /* best-effort */ }
+        try { removeRestartIntentAttemptTo(restartIntentDir, restartAttemptId); } catch { /* best-effort */ }
         throw err;
       }
 
@@ -3700,6 +3596,7 @@ async function cmdRestart(): Promise<void> {
     if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
       console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
     }
+    console.log('✅ daemon 已重启');
     await printDashboardHintWithRetry();
   }, { maxWaitMs: 5_000 });
 }
@@ -4132,50 +4029,91 @@ function warnIfLegacyBotmuxAlive(): void {
   } catch { /* ignore */ }
 }
 
-function cmdLogs(): void {
+async function cmdLogs(): Promise<void> {
   warnIfLegacyBotmuxAlive();
   const lines = process.argv.includes('--lines')
     ? process.argv[process.argv.indexOf('--lines') + 1] || '50'
     : '50';
+  const follow = !process.argv.includes('--no-follow'); // default: stream like pm2 logs
 
   const bots = loadBotsJson();
-  // Support --bot <0-based-index|pm2-name|appId> to filter specific bot logs.
-  const botIdx = process.argv.includes('--bot')
+  // Support --bot <0-based-index|name|appId> to filter one bot's logs; otherwise
+  // tail every bot's files. The supervisor writes daemon-<index>-out/err.log
+  // (see fleet-supervisor spawnBot), replacing pm2's out_file/error_file.
+  const botArg = process.argv.includes('--bot')
     ? process.argv[process.argv.indexOf('--bot') + 1]
     : undefined;
 
-  let target: string;
-  if (botIdx !== undefined) {
-    const numericIdx = /^\d+$/.test(botIdx) ? Number(botIdx) : undefined;
+  const { fleetLogDir } = await import('./core/fleet-runtime.js');
+  const logDir = fleetLogDir();
+
+  let indices: number[];
+  if (botArg !== undefined) {
+    const numericIdx = /^\d+$/.test(botArg) ? Number(botArg) : undefined;
     const selectedIdx = numericIdx === undefined
-      ? parseBotSelection(botIdx, bots)
-      : numericIdx >= 0 && numericIdx < bots.length
-        ? numericIdx
-        : undefined;
-    target = selectedIdx !== undefined
-      ? botProcessName(bots[selectedIdx], selectedIdx, PM2_NAME)
-      : numericIdx !== undefined
-        ? `${PM2_NAME}-${botIdx}`
-        : botIdx;
+      ? parseBotSelection(botArg, bots)
+      : (numericIdx >= 0 && numericIdx < bots.length ? numericIdx : undefined);
+    if (selectedIdx === undefined) {
+      console.error(`❌ 未识别的 --bot 选择: ${botArg}`);
+      process.exit(1);
+    }
+    indices = [selectedIdx];
   } else {
-    // Show all botmux logs via pm2 regex match
-    target = `/^${PM2_NAME}/`;
+    indices = bots.length > 0 ? bots.map((_, i) => i) : [0];
   }
 
-  // Use spawn for streaming output. Windows cannot spawn a .js CLI script
-  // directly, so run the bundled pm2 script through the current node.exe.
-  const pm2 = buildPm2SpawnCommand(pm2Bin(), ['logs', target, '--lines', lines]);
-  const child = spawn(pm2.command, pm2.args, {
-    stdio: 'inherit',
-    env: pm2Env(),
-    shell: pm2.shell ?? false,
+  const files: string[] = [];
+  for (const i of indices) {
+    for (const kind of ['out', 'err'] as const) {
+      const fp = join(logDir, `daemon-${i}-${kind}.log`);
+      if (existsSync(fp)) files.push(fp);
+    }
+  }
+  if (files.length === 0) {
+    console.error(`ℹ️  暂无日志文件（${logDir}/daemon-*-{out,err}.log）。daemon 可能尚未启动或还没有输出。`);
+    process.exit(0);
+  }
+
+  // Stream with `tail`: `-n <lines>` for the backlog, `-F` to follow across the
+  // supervisor's log rotation/reopen on restart. Multiple files get `==> file`
+  // banners from tail itself. `--no-follow` prints the backlog and exits.
+  const tailArgs = follow ? ['-n', lines, '-F', ...files] : ['-n', lines, ...files];
+  const child = spawn('tail', tailArgs, { stdio: 'inherit' });
+  child.on('error', (err) => {
+    console.error(`❌ 无法运行 tail：${err instanceof Error ? err.message : err}`);
+    process.exit(1);
   });
   child.on('exit', code => process.exit(code ?? 0));
 }
 
-function cmdStatus(): void {
+async function cmdStatus(): Promise<void> {
   warnIfLegacyBotmuxAlive();
-  runPm2(['status']);
+  const { readFleetStatus } = await import('./core/fleet-runtime.js');
+  const status = readFleetStatus();
+  if (!status.supervisorAlive && status.rows.length === 0) {
+    console.log('daemon 未在运行。（用 `botmux start` 启动）');
+    return;
+  }
+  const sup = status.supervisorAlive
+    ? `supervisor 在线 (pid ${status.supervisorPid}${status.supervisorStartedAt ? `, 自 ${status.supervisorStartedAt}` : ''})`
+    : 'supervisor 未在运行（下方为上次记录的状态）';
+  console.log(sup);
+  if (status.rows.length === 0) {
+    console.log('  （无已配置机器人）');
+    return;
+  }
+  // Fixed-width table: name | pid | status | ↺restarts | exit.
+  const nameW = Math.max(4, ...status.rows.map(r => r.name.length));
+  const header = `  ${'NAME'.padEnd(nameW)}  ${'PID'.padStart(7)}  ${'STATUS'.padEnd(9)}  ${'↺'.padStart(4)}  EXIT`;
+  console.log(header);
+  for (const r of status.rows) {
+    // A row recorded 'online' whose pid is actually dead is shown as such so
+    // status never lies while the supervisor is between reconcile ticks.
+    const shown = r.status === 'online' && !r.alive ? 'dead?' : r.status;
+    const pidCol = r.pid > 0 ? String(r.pid) : '-';
+    const exitCol = r.lastExitCode === null ? '-' : String(r.lastExitCode);
+    console.log(`  ${r.name.padEnd(nameW)}  ${pidCol.padStart(7)}  ${shown.padEnd(9)}  ${String(r.restarts).padStart(4)}  ${exitCol}`);
+  }
 }
 
 function cmdUpgrade(): void {
@@ -6707,10 +6645,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   start       启动 daemon，并启动 mode=auto 的插件 service
   stop        停止 daemon（默认不停止插件 service；--with-plugin 显式停止 mode=auto 的插件 service）
   restart     重启 daemon（默认不停止插件 service，core 启动后确保 mode=auto 正在运行；--with-plugin 显式先停再启动 auto service）
-              --include-pm2 仅允许“入场时没有 live PM2 God”的干净启动；若已有 live God，整条命令会在 fleet/breadcrumb 零改动处拒绝，且不会信号或重启现存 God
-              首次升级若旧 daemon 缺少 shutdown protocol：先独立确认所有 Session/Riff 工作均 idle，再一次性运行
-              botmux restart --bootstrap-shutdown-protocol --yes；普通 stop/restart 仍保持 fail-closed
-  logs        查看 daemon 日志（--lines N, --bot <0-based-index|pm2-name|appId>）
+  logs        查看/跟随 daemon 日志（--lines N, --bot <0-based-index|name|appId>, --no-follow 只打印不跟随）
   status      查看 daemon 状态
   upgrade     升级到最新版本（别名：update）
   dashboard current
@@ -13009,8 +12944,8 @@ switch (command) {
   case 'stop-bot': await cmdStopBot(process.argv.slice(3)); break;
   case 'stop':    await cmdStop(); break;
   case 'restart': await cmdRestart(); break;
-  case 'logs':    cmdLogs(); break;
-  case 'status':  cmdStatus(); break;
+  case 'logs':    await cmdLogs(); break;
+  case 'status':  await cmdStatus(); break;
   case 'upgrade':
   case 'update':  cmdUpgrade(); break;
   case 'dashboard': await cmdDashboard(process.argv.slice(3)); break;

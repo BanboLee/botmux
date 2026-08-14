@@ -90,39 +90,25 @@ describe('graceful shutdown supervisor contract', () => {
       .toBeGreaterThan(PM2_DAEMON_KILL_TIMEOUT_MS + FLEET_SUCCESSOR_SETTLE_MS);
   });
 
-  it('public stop signals and polls first, never deletes a possibly refusing entry', () => {
+  it('public stop signals the supervisor and waits, under the fleet lock', () => {
+    // Post-pm2: cmdStop no longer jlist-verifies + deletes per-row. It signals
+    // the single supervisor (which SIGTERMs every daemon + finalizes state) and
+    // waits for it to exit — all under the fleet-mutation lock.
     const start = cli.indexOf('async function cmdStop()');
     const end = cli.indexOf('async function cmdRestart()', start);
     const stop = cli.slice(start, end);
-    const signal = stop.indexOf("signalAndAwaitBotmuxProcesses(entries, 'stop')");
-    const preMutationProjection = stop.indexOf(
-      "readVerifiedBotmuxPm2Projection('stop-before-registry-mutation')",
-      signal,
-    );
-    const pm2Stop = stop.indexOf("runPm2(['stop', String(entry.pmId)])", preMutationProjection);
-    const justInTimeOffset = stop.slice(preMutationProjection).search(
-      /revalidateExactQuiescentRowBeforeMutation\(\s*'stop-immediately-before-registry-mutation'/,
-    );
-    const justInTime = justInTimeOffset < 0
-      ? -1
-      : preMutationProjection + justInTimeOffset;
-    const exactStop = stop.indexOf(
-      "runPm2(['stop', String(exact.pmId)]",
-      justInTime,
-    );
-
-    expect(signal).toBeGreaterThanOrEqual(0);
-    expect(preMutationProjection).toBeGreaterThan(signal);
-    expect(pm2Stop).toBe(-1);
-    expect(justInTime).toBeGreaterThan(preMutationProjection);
-    expect(exactStop).toBeGreaterThan(justInTime);
+    const lock = stop.indexOf('withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET');
+    const call = stop.indexOf('stopFleet()', lock);
+    expect(lock).toBeGreaterThanOrEqual(0);
+    expect(call).toBeGreaterThan(lock);
+    // The pm2 per-row jlist/stop/delete dance is gone.
+    expect(stop).not.toContain("runPm2(['stop'");
     expect(stop).not.toContain("runPm2(['delete'");
+    expect(stop).not.toContain("pm2Capture(['jlist'])");
+    expect(stop).not.toContain('signalAndAwaitBotmuxProcesses');
+    // Timeout is surfaced (SIGKILL escalation happens inside stopFleet).
+    expect(stop).toContain("result.action === 'timeout'");
     expect(stop).toContain('stopPluginServicesForCli(undefined, { autoOnly: true })');
-    expect(stop).toContain('const stopErrors: string[] = []');
-    expect(stop.indexOf("pm2Capture(['jlist'])", exactStop)).toBeGreaterThan(exactStop);
-    expect(stop.indexOf("assertNoUnregisteredLiveDaemonDescriptors('stop-after-registry-mutation'", exactStop))
-      .toBeGreaterThan(exactStop);
-    expect(stop).toContain('PM2 registry mutation incomplete');
   });
 
   it('restart waits for the fleet decision before any PM2 delete', () => {
@@ -217,7 +203,7 @@ describe('graceful shutdown supervisor contract', () => {
     const regions = [
       ['start', 'async function cmdStart()', '/**\n * Wipe stale dashboard-daemon descriptors'],
       ['stop', 'async function cmdStop()', 'async function cmdRestart()'],
-      ['restart', 'async function cmdRestart()', '/**\n * Bring a SINGLE bot'],
+      ['restart', 'async function cmdRestart()', '/** Observe botmux PM2 rows'],
       ['start-bot', 'async function ensureBotDaemonStarted(', '/**\n * `botmux start-bot'],
     ] as const;
     for (const [label, startMarker, endMarker] of regions) {
@@ -257,74 +243,100 @@ describe('graceful shutdown supervisor contract', () => {
     expect(preflight).not.toContain("'SIGKILL'");
     expect(pm2Preflight).toContain('拒绝自动清理');
 
-    for (const operation of ['start', 'stop', 'start-bot', 'restart-start']) {
+    // The still-pm2 start-bot surface keeps the unregistered-descriptor fence.
+    // The supervisor-managed start/stop/restart no longer inspect pm2 descriptors
+    // (the supervisor owns the live proc set via fleet-state.json).
+    for (const operation of ['start-bot', 'stop-bot']) {
       expect(cli).toContain(`assertNoUnregisteredLiveDaemonDescriptors('${operation}'`);
     }
   });
 
-  it('publishes manual restart intent only after verified fleet retirement', () => {
+  it('restart stages intent, restarts the supervisor, verifies health, then commits the breadcrumb', () => {
+    // Post-pm2 restart contract: consume any staged intent → write the attempt
+    // breadcrumb → restartFleet() (stop old supervisor + start fresh) →
+    // waitFleetOnline() health gate → commit the breadcrumb only after healthy.
+    // On any failure the breadcrumb attempt is removed (no false restart summary).
     const start = cli.indexOf('async function cmdRestart()');
-    const end = cli.indexOf('/**\n * Bring a SINGLE bot', start);
+    const end = cli.indexOf('/** Observe botmux PM2 rows', start);
     const restart = cli.slice(start, end);
-    const staged = restart.indexOf('consumeRestartIntentTo(');
-    const preflight = restart.indexOf('assertNoDuplicatePm2GodDaemons()', staged);
-    const retirement = restart.indexOf('deleteAllBotmuxProcesses()');
-    const descriptorCheck = restart.indexOf(
-      "assertNoUnregisteredLiveDaemonDescriptors('restart-start'",
-      retirement,
-    );
-    const intent = restart.indexOf('writeRestartAttemptIntentTo(', descriptorCheck);
-    const transaction = restart.indexOf('runBoundedPm2StartTransaction(', intent);
-    expect(restart.slice(transaction, transaction + 96)).toContain("'restart-start'");
-    const newFleet = restart.indexOf("runPm2(['start', cfg]", transaction);
-    const verify = restart.indexOf("'restart-after-launch'", newFleet);
-    const compensate = restart.indexOf('rollbackPm2StartAttempt(', verify);
-    expect(restart.slice(compensate, compensate + 128)).toContain("'restart-start'");
-    const rollback = restart.indexOf('removeRestartIntentAttemptTo(', compensate);
-    const commit = restart.indexOf('commitRestartIntentAttemptTo(', rollback);
-    expect(staged).toBeGreaterThanOrEqual(0);
-    expect(preflight).toBeGreaterThan(staged);
-    expect(retirement).toBeGreaterThanOrEqual(0);
-    expect(descriptorCheck).toBeGreaterThan(retirement);
-    expect(intent).toBeGreaterThan(descriptorCheck);
-    expect(transaction).toBeGreaterThan(intent);
-    expect(newFleet).toBeGreaterThan(transaction);
-    expect(verify).toBeGreaterThan(newFleet);
-    expect(compensate).toBeGreaterThan(verify);
-    expect(rollback).toBeGreaterThan(compensate);
-    expect(commit).toBeGreaterThan(rollback);
+    const consume = restart.indexOf('consumeRestartIntentTo(');
+    const writeIntent = restart.indexOf('writeRestartAttemptIntentTo(', consume);
+    const restartFleet = restart.indexOf('restartFleet()', writeIntent);
+    const health = restart.indexOf('waitFleetOnline(', restartFleet);
+    const removeOnFail = restart.indexOf('removeRestartIntentAttemptTo(', health);
+    const commit = restart.indexOf('commitRestartIntentAttemptTo(', health);
+    expect(consume).toBeGreaterThanOrEqual(0);
+    expect(writeIntent).toBeGreaterThan(consume);
+    expect(restartFleet).toBeGreaterThan(writeIntent);
+    expect(health).toBeGreaterThan(restartFleet);
+    expect(removeOnFail).toBeGreaterThan(health); // failure path removes the attempt
+    expect(commit).toBeGreaterThan(health);       // commit only after health gate
+    // The whole restart is serialized on the fleet-mutation lock, and the pm2
+    // transaction/rollback/ecosystem machinery is gone from this path.
+    expect(restart).toContain('withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET');
+    expect(restart).not.toContain('runBoundedPm2StartTransaction(');
+    expect(restart).not.toContain('rollbackPm2StartAttempt(');
+    expect(restart).not.toContain("runPm2(['start'");
+    expect(restart).not.toContain('ecosystemConfig(');
+    // A failed health gate aborts the restart (throws), not a silent success.
+    expect(restart).toContain('health.healthy');
   });
 
-  it('bounds and freshly verifies every public PM2 start surface with compensation', () => {
+  it('bounds and freshly verifies the still-pm2 start-bot surface with compensation', () => {
+    // start-bot is the last pm2-managed surface (single-bot spawn); cmdStart and
+    // cmdRestart moved to the supervisor. Until start-bot migrates, it keeps the
+    // bounded pm2 start transaction + fresh verify + rollback.
     expect(cli).toContain('const PM2_START_VERIFY_MIN_TIMEOUT_MS = 60_000;');
     expect(cli).toContain('pm2StartVerifyTimeoutMs(configuredNames.length)');
-    const regions = [
-      cli.slice(cli.indexOf('async function cmdStart()'), cli.indexOf('/**\n * Wipe stale dashboard-daemon descriptors')),
-      cli.slice(cli.indexOf('async function cmdRestart()'), cli.indexOf('/**\n * Bring a SINGLE bot')),
-      cli.slice(cli.indexOf('async function ensureBotDaemonStarted('), cli.indexOf('/**\n * `botmux start-bot')),
-    ];
-    for (const region of regions) {
-      expect(region).toContain('runBoundedPm2StartTransaction(');
-      expect(region).toContain('PM2_START_COMMAND_TIMEOUT_MS');
-      expect(region).toContain('readAndAssertConfiguredFleetOnline(');
-      expect(region).toContain('rollbackPm2StartAttempt(');
-      expect(region).toContain('timeoutMs');
-    }
+    const startBot = cli.slice(
+      cli.indexOf('async function ensureBotDaemonStarted('),
+      cli.indexOf('/**\n * `botmux start-bot'),
+    );
+    expect(startBot).toContain('runBoundedPm2StartTransaction(');
+    expect(startBot).toContain('PM2_START_COMMAND_TIMEOUT_MS');
+    expect(startBot).toContain('readAndAssertConfiguredFleetOnline(');
+    expect(startBot).toContain('rollbackPm2StartAttempt(');
+    expect(startBot).toContain('timeoutMs');
+    // The supervisor-managed surfaces no longer carry the pm2 transaction.
+    const cmdStart = cli.slice(
+      cli.indexOf('async function cmdStart()'),
+      cli.indexOf('/**\n * Wipe stale dashboard-daemon descriptors'),
+    );
+    const cmdRestart = cli.slice(
+      cli.indexOf('async function cmdRestart()'),
+      cli.indexOf('/** Observe botmux PM2 rows'),
+    );
+    expect(cmdStart).toContain('startFleetViaSupervisor()');
+    expect(cmdStart).not.toContain('runBoundedPm2StartTransaction(');
+    expect(cmdRestart).toContain('restartFleet()');
+    expect(cmdRestart).not.toContain('runBoundedPm2StartTransaction(');
   });
 
-  it('holds one bots.json generation from ecosystem rendering through verification/rollback', () => {
+  it('holds one bots.json generation for the still-pm2 start-bot surface', () => {
     expect(botsStore).toContain('withFileLockSync(botsJsonPath');
-    const regions = [
-      cli.slice(cli.indexOf('async function cmdStart()'), cli.indexOf('/**\n * Wipe stale dashboard-daemon descriptors')),
-      cli.slice(cli.indexOf('async function cmdRestart()'), cli.indexOf('/**\n * Bring a SINGLE bot')),
-      cli.slice(cli.indexOf('async function ensureBotDaemonStarted('), cli.indexOf('/**\n * `botmux start-bot')),
-    ];
-    for (const region of regions) {
-      expect(region).toContain('withFileLock(BOTS_JSON_FILE');
-      expect(region).toContain('ecosystemConfig(');
-      expect(region).toContain('configuredCoreProcessNames(');
-      expect(region).toContain('assertBotsConfigSnapshotUnchanged(');
-    }
+    // start-bot still renders the ecosystem under a bots.json snapshot lock.
+    const startBot = cli.slice(
+      cli.indexOf('async function ensureBotDaemonStarted('),
+      cli.indexOf('/**\n * `botmux start-bot'),
+    );
+    expect(startBot).toContain('withFileLock(BOTS_JSON_FILE');
+    expect(startBot).toContain('ecosystemConfig(');
+    expect(startBot).toContain('configuredCoreProcessNames(');
+    // Supervisor-managed start/restart still take the bots.json lock (start reads
+    // it for the credential-snapshot guard; restart for the intent breadcrumb),
+    // but no longer render an ecosystem — the supervisor re-reads bots.json itself.
+    const cmdStart = cli.slice(
+      cli.indexOf('async function cmdStart()'),
+      cli.indexOf('/**\n * Wipe stale dashboard-daemon descriptors'),
+    );
+    const cmdRestart = cli.slice(
+      cli.indexOf('async function cmdRestart()'),
+      cli.indexOf('/** Observe botmux PM2 rows'),
+    );
+    expect(cmdStart).toContain('withFileLock(BOTS_JSON_FILE');
+    expect(cmdStart).not.toContain('ecosystemConfig(');
+    expect(cmdRestart).toContain('withFileLock(BOTS_JSON_FILE');
+    expect(cmdRestart).not.toContain('ecosystemConfig(');
   });
 
   it('admits start-bot only through the exact configured fleet classifier', () => {
@@ -344,21 +356,19 @@ describe('graceful shutdown supervisor contract', () => {
     expect(region).toContain('preflightNodeSanity()');
   });
 
-  it('requires fresh handler-ready exact-set verification before idempotent start returns', () => {
+  it('idempotent start is a supervisor no-op when a live supervisor already owns the fleet', () => {
+    // Post-pm2: cmdStart delegates to startFleetViaSupervisor(), which is
+    // idempotent by construction — a live supervisor (fleet-state pid + kill-0,
+    // under the mutation lock) short-circuits to 'already-running'. No pm2
+    // exact-set re-verification dance; the running supervisor keeps reconciling.
     const start = cli.indexOf('async function cmdStart()');
     const end = cli.indexOf('/**\n * Wipe stale dashboard-daemon descriptors', start);
     const region = cli.slice(start, end);
-    const liveBranch = region.slice(
-      region.indexOf('if (liveEntries.length > 0)'),
-      region.indexOf('const unprovenDormant'),
-    );
-    const verify = liveBranch.indexOf('readAndAssertConfiguredFleetOnline(');
-    const ready = liveBranch.indexOf("'start-idempotent-ready'", verify);
-    const returns = liveBranch.indexOf('return;', ready);
-    expect(verify).toBeGreaterThanOrEqual(0);
-    expect(ready).toBeGreaterThan(verify);
-    expect(returns).toBeGreaterThan(ready);
-    expect(liveBranch).not.toContain('assertConfiguredPm2FleetOnline(');
+    expect(region).toContain('startFleetViaSupervisor()');
+    expect(region).toContain("result.action === 'already-running'");
+    expect(region).not.toContain('readAndAssertConfiguredFleetOnline(');
+    expect(region).not.toContain('assertConfiguredPm2FleetOnline(');
+    expect(region).not.toContain('runBoundedPm2StartTransaction(');
   });
 
   it('discovers legacy Gods from the process table and rechecks duplicate Gods before mutation', () => {
@@ -373,7 +383,10 @@ describe('graceful shutdown supervisor contract', () => {
     expect(cli).not.toContain("runPm2(['kill']");
   });
 
-  it('exposes an explicit double-confirmed first-upgrade bootstrap without weakening normal shutdown', () => {
+  it('the legacy pm2 bootstrap-delete helper stays birth-id bound (used only by legacy cleanup)', () => {
+    // The one-time pm2 God bootstrap-delete helper is retained for reaping a
+    // pre-migration pm2 God (cleanupLegacyPm2), and must still verify each row's
+    // process birth identity before deleting so it never kills a reused pid.
     const bootstrapStart = cli.indexOf('function bootstrapDeleteAllBotmuxProcesses(');
     const bootstrapEnd = cli.indexOf('/**\n * One-time migration', bootstrapStart);
     const bootstrap = cli.slice(bootstrapStart, bootstrapEnd);
@@ -381,31 +394,15 @@ describe('graceful shutdown supervisor contract', () => {
     expect(bootstrap).toContain('current.pid !== original.pid');
     expect(bootstrap).toMatch(/runPm2\(\s*\['delete', String\(current\.pmId\)\]/);
 
+    // cmdRestart no longer exposes pm2-specific bootstrap / include-pm2 flags —
+    // there is no pm2 God to bootstrap or co-restart under the supervisor.
     const restartStart = cli.indexOf('async function cmdRestart()');
-    const restartEnd = cli.indexOf('/**\n * Bring a SINGLE bot', restartStart);
+    const restartEnd = cli.indexOf('/** Observe botmux PM2 rows', restartStart);
     const restart = cli.slice(restartStart, restartEnd);
-    expect(restart).toContain("process.argv.includes('--bootstrap-shutdown-protocol')");
-    expect(restart).toContain("process.argv.includes('--yes')");
-    expect(restart).toContain("bootstrapDeleteAllBotmuxProcesses('restart')");
-    expect(restart).toContain('else deleteAllBotmuxProcesses()');
-    expect(cli).toContain('botmux restart --bootstrap-shutdown-protocol --yes');
-  });
-
-  it('rejects include-pm2 before breadcrumb/fleet mutation when a live God exists', () => {
-    const start = cli.indexOf('async function cmdRestart()');
-    const end = cli.indexOf('/**\n * Bring a SINGLE bot', start);
-    const restart = cli.slice(start, end);
-    const admission = restart.indexOf(
-      'assertIncludePm2RestartAdmission(listPm2GodDaemonPids())',
-    );
-    const consume = restart.indexOf('consumeRestartIntentTo(');
-    const retire = restart.indexOf('deleteAllBotmuxProcesses()');
-    expect(admission).toBeGreaterThanOrEqual(0);
-    expect(consume).toBeGreaterThan(admission);
-    expect(retire).toBeGreaterThan(consume);
-    expect(restart).not.toContain('killPm2GodDaemon');
-    expect(cli).toContain('--include-pm2 仅允许“入场时没有 live PM2 God”的干净启动');
-    expect(cli).not.toContain('--include-pm2 同时重启 PM2 God');
+    expect(restart).not.toContain("process.argv.includes('--bootstrap-shutdown-protocol')");
+    expect(restart).not.toContain("process.argv.includes('--include-pm2')");
+    expect(restart).not.toContain('assertIncludePm2RestartAdmission');
+    expect(restart).not.toContain('deleteAllBotmuxProcesses()');
   });
 
   it('attests the whole daemon fleet then uses exact IPC batch/successor requests', () => {

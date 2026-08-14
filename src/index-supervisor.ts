@@ -30,7 +30,7 @@ scrubWorkflowWorkerEnv(process.env);
 
 async function main(): Promise<void> {
   const { FleetSupervisor } = await import('./core/fleet-supervisor.js');
-  const { fleetStatePath, fleetDistDir, resolveFleetBots, resolveFleetDaemonEnv, fleetDaemonNodeArgs } = await import('./core/fleet-runtime.js');
+  const { fleetStatePath, fleetDistDir, fleetLogDir, resolveFleetBots, resolveFleetDaemonEnv, fleetDaemonNodeArgs } = await import('./core/fleet-runtime.js');
   const { logger } = await import('./utils/logger.js');
 
   const bots = resolveFleetBots();
@@ -45,6 +45,7 @@ async function main(): Promise<void> {
     daemonEnv: resolveFleetDaemonEnv(),
     cwd: configDir,
     daemonNodeArgs: fleetDaemonNodeArgs(),
+    logDir: fleetLogDir(),
     log: (m) => logger.info(`[supervisor] ${m}`),
   });
 

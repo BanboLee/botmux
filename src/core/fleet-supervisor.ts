@@ -12,6 +12,8 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import { openSync, closeSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { resolveEntrySpawn } from './self-spawn.js';
 import {
   decideOnExit,
@@ -43,6 +45,11 @@ export interface FleetSupervisorOptions {
   killTimeoutMs?: number;
   /** Node interpreter args (heap/diag) — Node path only; ignored in standalone. */
   daemonNodeArgs?: string[];
+  /** Directory for per-bot daemon logs (daemon-<index>-out/err.log). When set,
+   *  each child's stdout/stderr is redirected there so `botmux logs --bot <i>`
+   *  can tail a specific bot — mirrors pm2's out_file/error_file. When unset
+   *  (tests), children inherit the supervisor's stdio. */
+  logDir?: string;
   /** Injected for tests; defaults to console. */
   log?: (msg: string) => void;
 }
@@ -104,12 +111,34 @@ export class FleetSupervisor {
     // we prepend node_args only when the command is a node/JS invocation.
     const isStandalone = args.length > 0 && args[0].startsWith('__');
     const nodeArgs = isStandalone ? [] : (this.opts.daemonNodeArgs ?? []);
+    // Per-bot log files (mirrors pm2 out_file/error_file → `botmux logs --bot`).
+    // Opened in append mode so a restart keeps history; fds are closed when the
+    // child exits (see onChildExit). When no logDir is configured (tests), the
+    // child inherits our stdio.
+    let stdio: Array<'ignore' | 'inherit' | number> = ['ignore', 'inherit', 'inherit'];
+    let outFd: number | undefined;
+    let errFd: number | undefined;
+    if (this.opts.logDir) {
+      try {
+        mkdirSync(this.opts.logDir, { recursive: true });
+        outFd = openSync(join(this.opts.logDir, `daemon-${spec.botIndex}-out.log`), 'a');
+        errFd = openSync(join(this.opts.logDir, `daemon-${spec.botIndex}-err.log`), 'a');
+        stdio = ['ignore', outFd, errFd];
+      } catch (err) {
+        this.log(`${spec.name} log file open failed, inheriting stdio: ${err instanceof Error ? err.message : err}`);
+        if (outFd !== undefined) { try { closeSync(outFd); } catch { /* */ } outFd = undefined; }
+        if (errFd !== undefined) { try { closeSync(errFd); } catch { /* */ } errFd = undefined; }
+      }
+    }
     const child = spawn(command, [...nodeArgs, ...args], {
       cwd: this.opts.cwd,
-      stdio: ['ignore', 'inherit', 'inherit'],
+      stdio,
       env: { ...this.opts.daemonEnv, BOTMUX_BOT_INDEX: String(spec.botIndex) },
       windowsHide: true,
     });
+    // The child dup'd the fds; close our copies so we don't leak one per respawn.
+    if (outFd !== undefined) { try { closeSync(outFd); } catch { /* */ } }
+    if (errFd !== undefined) { try { closeSync(errFd); } catch { /* */ } }
     const now = new Date().toISOString();
 
     // Persist the new generation + pid atomically, bumping generation on restart.
@@ -182,13 +211,25 @@ export class FleetSupervisor {
 
   /** Graceful stop of the whole fleet: SIGTERM each child, then SIGKILL any that
    *  outlast kill_timeout. Cancels pending restart timers first so a mid-backoff
-   *  crash can't respawn during shutdown. Resolves when all children are gone. */
+   *  crash can't respawn during shutdown. Resolves when all children are gone.
+   *  Finalizes fleet-state (all procs stopped, supervisorPid cleared) so a later
+   *  `status` reflects reality — onChildExit is short-circuited while stopping. */
   async stopAll(): Promise<void> {
     this.stopping = true;
     for (const t of this.restartTimers.values()) clearTimeout(t);
     this.restartTimers.clear();
     const pending = [...this.children.entries()];
     await Promise.all(pending.map(([name, child]) => this.stopOne(name, child)));
+    // Reflect the stop in the durable record. onChildExit ignored these exits
+    // (stopping=true), so without this the state file would keep the now-dead
+    // pids as 'online'. Clear supervisorPid too: this supervisor is exiting.
+    mutateFleetState(this.opts.statePath, (cur) => {
+      for (const p of cur.procs) {
+        if (p.status === 'online' || p.status === 'launching') { p.status = 'stopped'; p.pid = 0; }
+      }
+      cur.supervisorPid = 0;
+      return cur;
+    });
   }
 
   private stopOne(name: string, child: ChildProcess): Promise<void> {
