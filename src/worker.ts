@@ -66,6 +66,7 @@ import {
 import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
 import { decideRestartFollowup, settleDurableTurnForRestart } from './core/restart-followup-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
+import { parseReadOnlyRemoteScrollPayload } from './utils/web-terminal-scroll.js';
 import { CodexUpdateDialogGuard } from './utils/codex-update-dialog.js';
 import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
@@ -6805,6 +6806,11 @@ function restoreHerdrWebBindings(): void {
     }
     applyHerdrWebBindingResult(ws, binding.restore());
   }
+}
+
+function canHandleReadOnlyRemoteScroll(): boolean {
+  return cliAdapter?.readOnlyRemoteScroll === true
+    && !(lastInitConfig?.adoptMode && lastInitConfig.adoptZellijPaneId);
 }
 
 function wireHerdrWebTerminalRelays(be: HerdrBackend): void {
@@ -14449,6 +14455,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       // normal buffer until resize causes a redraw. Preserve that mode so
       // scroll gestures continue to target the CLI's own transcript.
       const forceRemoteScroll = effectiveBackendType === 'herdr' && cliAdapter?.altScreen === true;
+      const allowReadOnlyRemoteScroll = canHandleReadOnlyRemoteScroll();
       // The wheel burst cap throttles backends where a forwarded wheel is
       // EXPENSIVE or has no local terminal to drive:
       //   • Herdr — each forwarded wheel → pane send-text + snapshot re-render.
@@ -14466,7 +14473,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         || effectiveBackendType === 'tmux'
         || effectiveBackendType === 'zellij';
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, localTerminalBackend));
+      res.end(getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, localTerminalBackend, allowReadOnlyRemoteScroll));
     });
 
     wss = new WebSocketServer({
@@ -14501,6 +14508,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         return;
       }
       const { hasWrite } = resolveTerminalAccessForReq(req, url);
+      const allowReadOnlyRemoteScroll = canHandleReadOnlyRemoteScroll();
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
 
@@ -14725,6 +14733,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 else if (msg.data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';
               }
               backend?.write(msg.data);
+            } else if (msg.type === 'scroll' && typeof msg.data === 'string') {
+              if (!allowReadOnlyRemoteScroll || authedClients.has(ws)) return;
+              const parsed = parseReadOnlyRemoteScrollPayload(msg.data);
+              if (!parsed) return;
+              if (usesHerdrSnapshotWebHistory()) herdrWebScrollDirection = parsed.direction;
+              backend?.write(msg.data);
             }
           } catch { /* ignore non-JSON or bad messages */ }
         });
@@ -14756,6 +14770,7 @@ function getTerminalHtml(
   loginUrl = '',
   forceRemoteScroll = false,
   localTerminalBackend = false,
+  allowReadOnlyRemoteScroll = false,
 ): string {
   const label = sessionId.substring(0, 8);
   return `<!DOCTYPE html>
@@ -14894,6 +14909,7 @@ var hasToken=${hasWrite};
 var platformReadonly=${platformReadonly};
 var remoteScroll=${forceRemoteScroll};
 var localTerminalBackend=${localTerminalBackend};
+var readOnlyRemoteScroll=${allowReadOnlyRemoteScroll};
 if(!hasToken){
   if(platformReadonly){var _lb=document.getElementById('login-banner');_lb.classList.add('show');}
   else{var _rb=document.getElementById('readonly-banner');_rb.classList.add('show');_rb.addEventListener('click',function(){_rb.classList.remove('show')});}
@@ -15190,8 +15206,9 @@ window.addEventListener('resize',onViewportResize);
 // Alt-screen + mouse-mode CLIs (e.g. Claude Code) keep NO scrollback in xterm OR
 // tmux — their whole transcript is redrawn by the app inside the fixed alt-screen
 // grid, so term.scrollLines() reveals nothing. In the alternate buffer we forward
-// scrolling as SGR mouse-wheel events so the CLI scrolls its own transcript and
-// repaints. This is write-capability only; view links stay locally scrollable.
+// scrolling as SGR mouse-wheel events so the CLI scrolls its own transcript.
+// Read-only viewers get this remote path only for adapters that explicitly opt
+// in; the server then accepts only validated wheel events, never general input.
 // Normal-buffer CLIs keep xterm's native scrollback scroll. Capture-phase +
 // stopPropagation pre-empts xterm's own handler. Skipped for pure tmux/zellij
 // ATTACH (gate), where the attach client owns scrolling via copy-mode.
@@ -15251,7 +15268,7 @@ function _cellAt(clientX,clientY){
   return col+';'+row;
 }
 function _fwdScroll(px,coord){
-  if(!hasToken||!ws_||ws_.readyState!==1||!px)return;
+  if((!hasToken&&!readOnlyRemoteScroll)||!ws_||ws_.readyState!==1||!px)return;
   coord=coord||(((term.cols>>1)+1)+';'+((term.rows>>1)+1)); // never (1,1)
   var dir=px<0?-1:1;
   if(_scrollBurstDir&&dir!==_scrollBurstDir){_scrollAccum=0;_scrollBurstTicks=0;}
@@ -15265,7 +15282,7 @@ function _fwdScroll(px,coord){
     _scrollAccum+=up?_SCROLL_STEP:-_SCROLL_STEP;n++;_scrollBurstTicks++;
   }
   if(_scrollBurstTicks>=_SCROLL_BURST_MAX)_scrollAccum=0;
-  if(data)ws_.send(JSON.stringify({type:'input',data:data}));
+  if(data)ws_.send(JSON.stringify({type:hasToken?'input':'scroll',data:data}));
 }
 if(!${isTmuxMode && !isPipeMode}){
   document.getElementById('terminal').addEventListener('wheel',function(e){
@@ -15278,7 +15295,9 @@ if(!${isTmuxMode && !isPipeMode}){
       return;
     }
     if(!hasToken){
-      e.preventDefault();e.stopPropagation();term.scrollLines(e.deltaY>0?3:-3);return;
+      e.preventDefault();e.stopPropagation();
+      if(readOnlyRemoteScroll)_fwdScroll(px,_cellAt(e.clientX,e.clientY));
+      else term.scrollLines(e.deltaY>0?3:-3);return;
     }
     e.preventDefault();e.stopPropagation();
     _fwdScroll(px,_cellAt(e.clientX,e.clientY)); // report the cell under the pointer
@@ -15599,8 +15618,7 @@ if(!${isTmuxMode && !isPipeMode}){
     if(e.touches.length===1)_tLastY=e.touches[0].clientY;
   },{capture:true,passive:true});
   _tTerm.addEventListener('touchmove',function(e){
-    // View links never forward input; let xterm/browser handle local scrolling.
-    if(!hasToken||_tLastY===null||e.touches.length!==1)return;
+    if((!hasToken&&!readOnlyRemoteScroll)||_tLastY===null||e.touches.length!==1)return;
     e.preventDefault();e.stopPropagation();
     var y=e.touches[0].clientY;
     var px=_tLastY-y;
