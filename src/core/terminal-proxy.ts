@@ -122,23 +122,31 @@ export function startTerminalProxy(opts: TerminalProxyOptions): Promise<Terminal
     const onData = (chunk: Buffer) => {
       if (routed) return;
       preamble = preamble.length ? Buffer.concat([preamble, chunk]) : chunk;
-      const lineEnd = preamble.indexOf('\r\n');
-      if (lineEnd < 0) {
-        // Request line not complete yet. Keep buffering unless the peer floods
-        // us with a line that never terminates.
+      // Buffer to the END OF THE HEADER BLOCK (\r\n\r\n), not just the request
+      // line: we must inspect + rewrite headers before forwarding. Routing on the
+      // request line alone and byte-splicing the rest verbatim is WRONG under
+      // HTTP keep-alive — the client can reuse one connection for a second
+      // request to a DIFFERENT session, which would ride the splice to the first
+      // request's worker (open A → 200, then open B on the same socket → served
+      // by A → 403). See the fix below: force Connection: close on plain HTTP so
+      // each connection serves exactly one request→response.
+      const headerEnd = preamble.indexOf('\r\n\r\n');
+      if (headerEnd < 0) {
         if (preamble.length > REQUEST_LINE_CAP) { routed = true; clearTimeout(routeTimer); client.destroy(); }
-        return;
+        return; // keep buffering until the full header block arrives
       }
       routed = true;
       clearTimeout(routeTimer);
       client.removeListener('data', onData);
-      // Pause the client before the async port resolve below: with the 'data'
-      // listener gone the socket would otherwise keep flowing and drop bytes that
-      // arrive in the gap (a pipelined client can send frames right after the
-      // handshake). Buffered while paused, replayed once `.pipe()` resumes it.
+      // Pause before the async port resolve so bytes arriving in the gap (a
+      // pipelined WS client sends frames right after the handshake) are buffered,
+      // not dropped; `.pipe()` resumes the socket and replays them.
       client.pause();
 
+      const lineEnd = preamble.indexOf('\r\n');
       const requestLine = preamble.subarray(0, lineEnd).toString('latin1');
+      const headerBlock = preamble.subarray(lineEnd + 2, headerEnd).toString('latin1');
+      const bodyAndRest = preamble.subarray(headerEnd + 4); // bytes after \r\n\r\n
       const parsedLine = parseRequestLine(requestLine);
       const parsed = parsedLine ? parseTarget(parsedLine.target) : null;
       if (!parsedLine || !parsed) {
@@ -146,23 +154,40 @@ export function startTerminalProxy(opts: TerminalProxyOptions): Promise<Terminal
         return;
       }
 
+      // Is this a WebSocket/Upgrade request? Then the connection legitimately
+      // stays open for the upgraded protocol (a single request per connection —
+      // no keep-alive reuse), so forward the headers as-is (they carry the
+      // Upgrade/Connection/Sec-WebSocket-* handshake the worker needs).
+      const headerLines = headerBlock.length ? headerBlock.split('\r\n') : [];
+      const isUpgrade = headerLines.some((l) => /^upgrade\s*:/i.test(l));
+
       resolvePortMaybeWake(parsed.sessionId).then((port) => {
         if (!port) {
           writeHttpError(client, 502, 'Bad Gateway', 'session not running');
           return;
         }
 
-        // Rewrite ONLY the request-target (strip the `/s/{sessionId}` prefix) and
-        // replay the method/version + every following byte (headers, body, or WS
-        // handshake) verbatim. The worker then sees a normal request on `parsed.rest`.
+        // Rewrite ONLY the request-target (strip the `/s/{sessionId}` prefix).
         const rewrittenLine = `${parsedLine.method} ${parsed.rest} ${parsedLine.version}`;
-        const rest = preamble.subarray(lineEnd); // includes the CRLF after the request line
+        let forwardedHeaders: string[];
+        if (isUpgrade) {
+          forwardedHeaders = headerLines; // verbatim — preserve the WS handshake
+        } else {
+          // Plain HTTP: force Connection: close so this connection serves exactly
+          // one request→response and can never be reused for a second (possibly
+          // different-session) request that our one-shot router would misroute.
+          forwardedHeaders = headerLines.filter((l) => !/^(connection|keep-alive|proxy-connection)\s*:/i.test(l));
+          forwardedHeaders.push('Connection: close');
+        }
+        const head = `${rewrittenLine}\r\n${forwardedHeaders.join('\r\n')}${forwardedHeaders.length ? '\r\n' : ''}\r\n`;
 
         const upstream = netConnect({ host: '127.0.0.1', port }, () => {
-          upstream.write(rewrittenLine);
-          upstream.write(rest);
-          // Opaque byte splice in both directions from here on — protocol-agnostic
-          // (a plain HTTP response body and every WebSocket frame both just flow).
+          upstream.write(head);
+          if (bodyAndRest.length) upstream.write(bodyAndRest);
+          // Opaque byte splice both ways from here — the response body (or every
+          // WS frame) flows through untouched. For plain HTTP the upstream sees
+          // Connection: close and ends the response by closing, which tears down
+          // this connection — exactly one request served, no misrouting.
           upstream.pipe(client);
           client.pipe(upstream);
         });

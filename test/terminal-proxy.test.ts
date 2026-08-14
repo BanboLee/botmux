@@ -137,6 +137,91 @@ describe('terminal proxy — HTTP', () => {
   });
 });
 
+describe('terminal proxy — HTTP keep-alive misroute guard', () => {
+  it('forces Connection: close so a keep-alive socket cannot be reused for a second (mis-routed) request', async () => {
+    // REGRESSION: the raw TCP router reads the header block, routes on the request
+    // line, then splices the socket to ONE worker. Under HTTP keep-alive a browser
+    // reuses a single connection for its next request — which may target a
+    // DIFFERENT session. If the splice stayed open, that second request would ride
+    // to the FIRST session's worker (open A → 200, then open B on the same socket
+    // → served by A → 403). The fix forces `Connection: close` on plain HTTP so
+    // each connection serves exactly one request→response and the client must open
+    // a fresh (correctly-routed) connection for the next request.
+    const workerA = await startFakeWorker(); // module-level `upstream`, echoes worker-saw:{url}
+
+    // A distinct worker B on its own port, so a misroute of sessB→workerA is
+    // observable (workerA would echo the unstripped `/s/sessB/` path).
+    const upstreamB = createServer((req: IncomingMessage, res: ServerResponse) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end(`B-saw:${req.url}`);
+    });
+    await new Promise<void>(r => upstreamB.listen(0, '127.0.0.1', () => r()));
+    const workerB = (upstreamB.address() as { port: number }).port;
+
+    proxy = await startTerminalProxy({
+      port: 0, host: '127.0.0.1',
+      resolvePort: (sid) => (sid === 'sessA' ? workerA : sid === 'sessB' ? workerB : undefined),
+    });
+
+    try {
+      // ONE socket. Pipeline two keep-alive requests for two DIFFERENT sessions,
+      // exactly as a browser reusing a connection would.
+      const raw = await new Promise<string>((resolve, reject) => {
+        const sock = connect(proxy!.port, '127.0.0.1', () => {
+          sock.write(
+            'GET /s/sessA/ HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n' +
+            'GET /s/sessB/ HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n',
+          );
+        });
+        let buf = '';
+        sock.on('data', (d) => { buf += d.toString(); });
+        sock.on('close', () => resolve(buf));
+        sock.on('error', reject);
+        setTimeout(() => resolve(buf), 2500);
+      });
+
+      // Exactly ONE response, from worker A with the `/s/sessA` prefix stripped.
+      expect(raw).toContain('worker-saw:/');
+      // The forwarded request carried `Connection: close`, so the worker closed
+      // after one response — the client can't reuse this socket for sessB.
+      expect(raw.toLowerCase()).toContain('connection: close');
+      // The pipelined sessB request must NOT have been served on this socket:
+      // no worker B content, and crucially no SECOND `worker-saw` from A echoing
+      // sessB's unstripped path (which is what the keep-alive splice bug did).
+      expect(raw).not.toContain('B-saw');
+      expect(raw).not.toContain('worker-saw:/s/sessB');
+      expect(raw.match(/worker-saw:/g)?.length ?? 0).toBe(1);
+    } finally {
+      await new Promise<void>(r => upstreamB.close(() => r()));
+    }
+  });
+
+  it('routes two separate connections (browser behavior post-close) to their own workers', async () => {
+    // With Connection: close the browser opens a fresh connection per request.
+    // Prove each fresh connection is routed independently to the right worker.
+    const workerA = await startFakeWorker();
+    const upstreamB = createServer((req: IncomingMessage, res: ServerResponse) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end(`B-saw:${req.url}`);
+    });
+    await new Promise<void>(r => upstreamB.listen(0, '127.0.0.1', () => r()));
+    const workerB = (upstreamB.address() as { port: number }).port;
+
+    proxy = await startTerminalProxy({
+      port: 0, host: '127.0.0.1',
+      resolvePort: (sid) => (sid === 'sessA' ? workerA : sid === 'sessB' ? workerB : undefined),
+    });
+    try {
+      const a = await fetch(`http://127.0.0.1:${proxy.port}/s/sessA/`);
+      const b = await fetch(`http://127.0.0.1:${proxy.port}/s/sessB/`);
+      expect(await a.text()).toBe('worker-saw:/'); // sessA → worker A, prefix stripped
+      expect(await b.text()).toBe('B-saw:/');       // sessB → worker B, prefix stripped
+    } finally {
+      await new Promise<void>(r => upstreamB.close(() => r()));
+    }
+  });
+});
+
 describe('terminal proxy — WebSocket', () => {
   it('proxies a WS upgrade to the worker with prefix stripped + view capability preserved', async () => {
     const workerPort = await startFakeWorker();
