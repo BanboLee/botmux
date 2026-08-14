@@ -39,6 +39,7 @@ import {
   resolveSessionContext,
 } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
+import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
@@ -652,8 +653,11 @@ async function cmdServe(args: string[]): Promise<void> {
   const workingDir = getOpt('--working-dir') ?? process.env.BOTMUX_CORE_WORKING_DIR;
   const stateDir = getOpt('--state-dir') ?? process.env.BOTMUX_CORE_STATE_DIR;
 
-  const coreScript = join(PKG_ROOT, 'dist', 'index-core-only.js');
-  const child = spawn(process.execPath, [coreScript], {
+  // Node: spawn `node dist/index-core-only.js`. Standalone binary: re-exec THIS
+  // binary with the hidden `__core-only` subcommand (no dist/ on disk). Same env
+  // contract either way (the entry reads BOTMUX_CORE_ONLY/API_PORT/… below).
+  const coreSpawn = resolveEntrySpawn('core-only', join(PKG_ROOT, 'dist'));
+  const child = spawn(coreSpawn.command, coreSpawn.args, {
     stdio: 'inherit',
     env: (() => {
       const e: NodeJS.ProcessEnv = {
@@ -12217,6 +12221,29 @@ function getVersion(): string {
 }
 
 const command = process.argv[2];
+
+// Single-file-executable self-hosting: when botmux is a `bun build --compile`
+// binary, it cannot spawn `node dist/index-*.js` (no dist/ on disk). Instead the
+// daemon/core-only/worker spawners re-exec THIS binary with a hidden subcommand
+// (see src/core/self-spawn.ts). Handle those tokens FIRST — before the workflow
+// gate and normal dispatch — by importing the corresponding entry module (each
+// bootstraps on import and then owns the process lifecycle) and then AWAITING a
+// never-resolving promise so control never reaches normal dispatch. Under Node
+// these tokens are never used (spawners pass the real dist/*.js path).
+const __entrySubcommand = command && ENTRY_SUBCOMMANDS.has(command) ? entryForSubcommand(command) : null;
+if (__entrySubcommand) {
+  // Bun's --compile can't bundle a fully-dynamic import specifier, so switch on
+  // a static import per entry — the same modules the Node path spawns as files.
+  if (__entrySubcommand === 'core-only') await import('./index-core-only.js');
+  else if (__entrySubcommand === 'daemon') await import('./index-daemon.js');
+  else if (__entrySubcommand === 'worker') await import('./worker.js');
+  // The entry module now drives the process (top-level main() keeps the event
+  // loop alive for the daemon; the worker's IPC listener does the same; a
+  // core-only bind failure exits from within). Park here so the normal dispatch
+  // below never runs. This awaits forever; the imported module owns exit().
+  await new Promise<never>(() => {});
+}
+
 
 // Workflow safety gate (Slice C0): a CLI invoked inside a workflow
 // subagent worker (BOTMUX_WORKFLOW=1, set by v3/ephemeral-pool) must not
