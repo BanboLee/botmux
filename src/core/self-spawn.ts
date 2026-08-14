@@ -24,13 +24,14 @@ import { join, dirname } from 'node:path';
  * on('message') both ways), so worker code that talks over IPC is unchanged.
  */
 
-export type BotmuxEntry = 'core-only' | 'daemon' | 'worker';
+export type BotmuxEntry = 'core-only' | 'daemon' | 'worker' | 'supervisor';
 
 /** Hidden CLI subcommand that runs a given entry inline (see cli.ts dispatch). */
 const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
   'core-only': '__core-only',
   'daemon': '__daemon',
   'worker': '__worker',
+  'supervisor': '__supervisor',
 };
 
 /** dist/<entry>.js filename for the Node path. */
@@ -38,6 +39,7 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
   'core-only': 'index-core-only.js',
   'daemon': 'index-daemon.js',
   'worker': 'worker.js',
+  'supervisor': 'index-supervisor.js',
 };
 
 /** True only when running as a `bun build --compile` single-file executable.

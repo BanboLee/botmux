@@ -12237,6 +12237,7 @@ if (__entrySubcommand) {
   if (__entrySubcommand === 'core-only') await import('./index-core-only.js');
   else if (__entrySubcommand === 'daemon') await import('./index-daemon.js');
   else if (__entrySubcommand === 'worker') await import('./worker.js');
+  else if (__entrySubcommand === 'supervisor') await import('./index-supervisor.js');
   // The entry module now drives the process (top-level main() keeps the event
   // loop alive for the daemon; the worker's IPC listener does the same; a
   // core-only bind failure exits from within). Park here so the normal dispatch
