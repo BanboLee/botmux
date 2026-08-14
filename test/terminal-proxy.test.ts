@@ -159,7 +159,33 @@ describe('terminal proxy — WebSocket', () => {
     expect(messages[1]).toBe('echo:ping');
   });
 
-  it('relays a non-101 upstream response and closes (framing headers stripped)', async () => {
+  it('streams many sequential WS frames (raw byte splice, no per-frame buffering)', async () => {
+    // A live terminal pushes a continuous stream of frames. The pre-Bun-fix HTTP
+    // proxy relied on http.request's 'upgrade' event; the raw TCP splice must
+    // carry an unbounded frame stream verbatim in both directions. Send 50 pings
+    // and require all 50 echoes back in order — a byte splice keeps them intact.
+    const workerPort = await startFakeWorker();
+    proxy = await startTerminalProxy({ port: 0, host: '127.0.0.1', resolvePort: () => workerPort });
+
+    const ws = new WebSocket(`ws://127.0.0.1:${proxy.port}/s/sess1/`);
+    const echoes: string[] = [];
+    await new Promise<void>((resolve, reject) => {
+      ws.on('open', () => { for (let i = 0; i < 50; i++) ws.send(`m${i}`); });
+      ws.on('message', (data) => {
+        const s = data.toString();
+        if (s.startsWith('echo:')) { echoes.push(s); if (echoes.length === 50) resolve(); }
+      });
+      ws.on('error', reject);
+      setTimeout(() => reject(new Error(`ws frame stream timeout: got ${echoes.length}/50`)), 4000);
+    });
+    ws.close();
+
+    expect(echoes).toHaveLength(50);
+    expect(echoes[0]).toBe('echo:m0');
+    expect(echoes[49]).toBe('echo:m49');
+  });
+
+  it('relays a non-101 upstream response verbatim and closes when the worker rejects the upgrade', async () => {
     upstream = createServer((_req, res) => { res.writeHead(200); res.end('ok'); });
     upstream.on('upgrade', (_req, sock) => {
       sock.write('HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 9\r\n\r\nrejected!');
@@ -183,10 +209,17 @@ describe('terminal proxy — WebSocket', () => {
       setTimeout(() => resolve(buf), 2500);
     });
 
+    // The raw TCP splice forwards the worker's response byte-for-byte (status,
+    // headers, body) and the worker's own socket close delimits it — no proxy-
+    // side reconstruction. The pre-raw-TCP HTTP proxy had to re-frame here
+    // (force `connection: close`, drop `content-length`) because de-chunking
+    // through `http.request` lost the original framing; a byte splice keeps the
+    // upstream's real framing intact, so the client sees the genuine 400.
     expect(raw).toContain('400 Bad Request');
     expect(raw).toContain('rejected!');
-    expect(raw.toLowerCase()).toContain('connection: close');
-    expect(raw.toLowerCase()).not.toContain('content-length');
+    // Content-Length is now preserved verbatim (9 = 'rejected!'.length), and the
+    // connection still ends because the upstream closed its socket.
+    expect(raw.toLowerCase()).toContain('content-length: 9');
   });
 
   it('destroys the socket when the session is unknown', async () => {
