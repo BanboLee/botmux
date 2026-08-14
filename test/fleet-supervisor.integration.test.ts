@@ -156,4 +156,71 @@ describe('FleetSupervisor (live, integration)', () => {
     expect(existsSync(join(logDir, 'daemon-0-err.log'))).toBe(true);
     await sup.stopAll();
   });
+
+  it('startOneBot brings up a single bot; idempotent when already online', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const sup = new FleetSupervisor({ statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, log: () => {} });
+    sup.start([bots[0]]); // only botmux-0 up
+    await waitFor(() => readFleetState(statePath)?.procs.find((p) => p.name === 'botmux-0')?.status === 'online');
+
+    // Bring up botmux-1 without touching botmux-0.
+    const pid0 = readFleetState(statePath)!.procs.find((p) => p.name === 'botmux-0')!.pid;
+    sup.startOneBot(bots[1]);
+    await waitFor(() => readFleetState(statePath)?.procs.find((p) => p.name === 'botmux-1')?.status === 'online');
+    const s = readFleetState(statePath)!;
+    expect(s.procs.find((p) => p.name === 'botmux-0')!.pid).toBe(pid0); // untouched
+    expect(pidAlive(s.procs.find((p) => p.name === 'botmux-1')!.pid)).toBe(true);
+
+    // Idempotent: calling again with botmux-1 already online must not respawn.
+    const pid1 = s.procs.find((p) => p.name === 'botmux-1')!.pid;
+    sup.startOneBot(bots[1]);
+    await delay(200);
+    expect(readFleetState(statePath)!.procs.find((p) => p.name === 'botmux-1')!.pid).toBe(pid1);
+    await sup.stopAll();
+  });
+
+  it('stopOneBot stops exactly one bot and does NOT resurrect it (explicit stop ≠ crash)', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 10, restartDelayMs: 50 }, log: () => {},
+    });
+    sup.start(bots);
+    await waitFor(() => (readFleetState(statePath)?.procs.filter((p) => p.status === 'online').length ?? 0) === 2);
+    const pid1 = readFleetState(statePath)!.procs.find((p) => p.name === 'botmux-1')!.pid;
+
+    await sup.stopOneBot('botmux-1');
+    // botmux-1 must be stopped, its pid dead, and stay stopped (no crash-restart).
+    expect(readFleetState(statePath)!.procs.find((p) => p.name === 'botmux-1')).toMatchObject({ status: 'stopped', pid: 0 });
+    expect(pidAlive(pid1)).toBe(false);
+    await delay(300); // give a (wrong) restart every chance to fire
+    const after = readFleetState(statePath)!.procs.find((p) => p.name === 'botmux-1')!;
+    expect(after.status).toBe('stopped');
+    expect(after.restarts).toBe(0); // explicit stop is not a crash → no restart bump
+    // botmux-0 is untouched and still online.
+    expect(readFleetState(statePath)!.procs.find((p) => p.name === 'botmux-0')!.status).toBe('online');
+    await sup.stopAll();
+  });
+
+  it('drainCommands applies queued start-bot / stop-bot in order', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const sup = new FleetSupervisor({ statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, log: () => {} });
+    sup.start([bots[0]]);
+    await waitFor(() => readFleetState(statePath)?.procs.find((p) => p.name === 'botmux-0')?.status === 'online');
+
+    // Queue: start botmux-1, then stop botmux-0.
+    await sup.drainCommands([
+      { id: 'a', op: 'start-bot', name: 'botmux-1', appId: 'cli_b', botIndex: 1, at: 'T' },
+      { id: 'b', op: 'stop-bot', name: 'botmux-0', appId: 'cli_a', botIndex: 0, at: 'T' },
+    ]);
+    await waitFor(() => readFleetState(statePath)?.procs.find((p) => p.name === 'botmux-1')?.status === 'online');
+    await waitFor(() => readFleetState(statePath)?.procs.find((p) => p.name === 'botmux-0')?.status === 'stopped');
+    const s = readFleetState(statePath)!;
+    expect(s.procs.find((p) => p.name === 'botmux-1')!.status).toBe('online');
+    expect(s.procs.find((p) => p.name === 'botmux-0')!.status).toBe('stopped');
+    await sup.stopAll();
+  });
 });

@@ -14,7 +14,9 @@ import type { FleetBotSpec } from './fleet-supervisor.js';
 import { pidAlive } from './fleet-supervisor.js';
 import { resolveEntrySpawn } from './self-spawn.js';
 import { readFleetState } from './fleet-state-store.js';
+import { enqueueFleetCommand } from './fleet-command-queue.js';
 import type { FleetProcState, FleetState } from './fleet-supervisor-policy.js';
+import { botProcessName } from '../setup/bot-config-editor.js';
 
 const CONFIG_DIR = join(homedir(), '.botmux');
 const HEAPSHOT_DIR = join(CONFIG_DIR, 'heapshots');
@@ -29,6 +31,11 @@ export function fleetStatePath(): string {
  *  LOG_DIR the old pm2 ecosystem wrote out_file/error_file into. */
 export function fleetLogDir(): string {
   return LOG_DIR;
+}
+
+/** Path to the CLI→supervisor single-bot command queue (start-bot / stop-bot). */
+export function fleetCommandPath(): string {
+  return join(CONFIG_DIR, 'fleet-commands.json');
 }
 
 /** dist/ directory of THIS build (Node path). Under the standalone binary the
@@ -54,8 +61,10 @@ export function resolveFleetDaemonEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-/** Build the fleet's bot specs from bots.json: name (botmux-<name|index>),
- *  appId, and the 0-based index the daemon reads via BOTMUX_BOT_INDEX. */
+/** Build the fleet's bot specs from bots.json: name, appId, and the 0-based
+ *  index the daemon reads via BOTMUX_BOT_INDEX. The name MUST equal
+ *  botProcessName(bot, index) so it correlates 1:1 with what the CLI (status,
+ *  logs --bot, start-bot/stop-bot) and the dashboard address a bot by. */
 export function resolveFleetBots(): FleetBotSpec[] {
   const botsJson = join(CONFIG_DIR, 'bots.json');
   if (!existsSync(botsJson)) return [];
@@ -65,12 +74,11 @@ export function resolveFleetBots(): FleetBotSpec[] {
   if (!Array.isArray(list)) return [];
   return list.map((b, index) => {
     const bot = (b ?? {}) as { name?: unknown; larkAppId?: unknown };
-    const rawName = typeof bot.name === 'string' && bot.name.trim() ? bot.name.trim() : String(index);
-    // Match botProcessName: `botmux-<normalized name | index>`. We normalize the
-    // same way (safe chars) to keep names stable + unique across restarts.
-    const normalized = rawName.replace(/[^A-Za-z0-9._-]/g, '_');
     return {
-      name: `botmux-${normalized}`,
+      // Canonical process name — reuse botProcessName so the supervisor's proc
+      // name is byte-identical to every other addressing surface (no second,
+      // divergent normalization that would desync status/logs/start-bot).
+      name: botProcessName(bot as { name?: unknown }, index),
       appId: typeof bot.larkAppId === 'string' ? bot.larkAppId : '',
       botIndex: index,
     };
@@ -278,5 +286,95 @@ export function waitFleetOnline(
 /** Configured supervisor process names (botmux-<name|index>) for health checks. */
 export function fleetBotNames(): string[] {
   return resolveFleetBots().map((b) => b.name);
+}
+
+/** Resolve one bot's fleet spec by larkAppId (null if not in bots.json). */
+export function resolveFleetBotByAppId(appId: string): FleetBotSpec | null {
+  return resolveFleetBots().find((b) => b.appId === appId) ?? null;
+}
+
+export type StartBotSupervisorResult =
+  | { ok: true; state: 'started' | 'already-online'; name: string }
+  | { ok: false; reason: 'not_found' | 'fleet_down' | 'timeout'; message: string; name?: string };
+
+export type StopBotSupervisorResult =
+  | { ok: true; state: 'stopped' | 'already-stopped'; name: string }
+  | { ok: false; reason: 'not_found' | 'fleet_down' | 'timeout'; message: string; name?: string };
+
+/**
+ * Ask the LIVE supervisor to bring one bot online (the `botmux start-bot` core).
+ * The supervisor owns every daemon child, so we enqueue a start-bot command,
+ * SIGHUP the supervisor to drain it, and poll fleet-state until that bot is
+ * online+alive. When no supervisor is running we return fleet_down — a lone bot
+ * belongs to `botmux start`, which brings up the whole fleet (matches the old
+ * pm2 semantics). Idempotent: already-online short-circuits.
+ *
+ * `idFactory`/`nowIso` are injected (no Date/random in shared code paths that
+ * also run under the workflow sandbox); the CLI passes real ones.
+ */
+export function startBotViaSupervisor(
+  appId: string,
+  idFactory: () => string,
+  nowIso: () => string,
+  timeoutMs = 30_000,
+): StartBotSupervisorResult {
+  const spec = resolveFleetBotByAppId(appId);
+  if (!spec) return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
+  const supervisorPid = liveSupervisorPid();
+  if (supervisorPid === undefined) {
+    return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行，请先 botmux start', name: spec.name };
+  }
+  // Already online+alive? No-op.
+  const existing = readFleetStatus().rows.find((r) => r.name === spec.name);
+  if (existing && existing.status === 'online' && existing.alive) {
+    return { ok: true, state: 'already-online', name: spec.name };
+  }
+  enqueueFleetCommand(fleetCommandPath(), {
+    id: idFactory(), op: 'start-bot', name: spec.name, appId: spec.appId, botIndex: spec.botIndex, at: nowIso(),
+  });
+  try { process.kill(supervisorPid, 'SIGHUP'); } catch {
+    return { ok: false, reason: 'fleet_down', message: 'supervisor 已不在运行', name: spec.name };
+  }
+  const health = waitFleetOnline([spec.name], timeoutMs);
+  if (health.healthy) return { ok: true, state: 'started', name: spec.name };
+  return { ok: false, reason: 'timeout', message: `${spec.name} 未在超时时间内上线`, name: spec.name };
+}
+
+/**
+ * Ask the LIVE supervisor to stop one bot (the `botmux stop-bot` core). Enqueue a
+ * stop-bot command, SIGHUP, poll fleet-state until that bot is no longer
+ * online+alive. The supervisor marks it explicit-stop so its SIGTERM exit is not
+ * treated as a crash-to-restart. fleet_down when no supervisor is running.
+ */
+export function stopBotViaSupervisor(
+  appId: string,
+  idFactory: () => string,
+  nowIso: () => string,
+  timeoutMs = 15_000,
+): StopBotSupervisorResult {
+  const spec = resolveFleetBotByAppId(appId);
+  if (!spec) return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
+  const supervisorPid = liveSupervisorPid();
+  if (supervisorPid === undefined) {
+    return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行', name: spec.name };
+  }
+  const existing = readFleetStatus().rows.find((r) => r.name === spec.name);
+  if (!existing || existing.status !== 'online' || !existing.alive) {
+    return { ok: true, state: 'already-stopped', name: spec.name };
+  }
+  enqueueFleetCommand(fleetCommandPath(), {
+    id: idFactory(), op: 'stop-bot', name: spec.name, appId: spec.appId, botIndex: spec.botIndex, at: nowIso(),
+  });
+  try { process.kill(supervisorPid, 'SIGHUP'); } catch {
+    return { ok: false, reason: 'fleet_down', message: 'supervisor 已不在运行', name: spec.name };
+  }
+  // Poll until the bot leaves online+alive (stopped), or timeout.
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  for (;;) {
+    const row = readFleetStatus().rows.find((r) => r.name === spec.name);
+    if (!row || row.status !== 'online' || !row.alive) return { ok: true, state: 'stopped', name: spec.name };
+    if (Date.now() >= deadline) return { ok: false, reason: 'timeout', message: `${spec.name} 未在超时时间内停止`, name: spec.name };
+    sleepSyncMs(150);
+  }
 }
 

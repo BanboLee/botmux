@@ -25,6 +25,7 @@ import {
   type ChildExit,
 } from './fleet-supervisor-policy.js';
 import { mutateFleetState, readFleetState } from './fleet-state-store.js';
+import type { FleetCommand } from './fleet-command-queue.js';
 
 export interface FleetBotSpec {
   /** botmux-<index> process name. */
@@ -65,6 +66,13 @@ export class FleetSupervisor {
   /** Per-name generation the live child was spawned with — guards stale exits. */
   private readonly liveGeneration = new Map<string, number>();
   private readonly restartTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Names an operator explicitly stopped (stop-bot). Their SIGTERM would look
+   *  like a crash to onChildExit, so we suppress the restart for exactly one exit
+   *  and mark them stopped. Cleared when the bot is explicitly started again. */
+  private readonly explicitStop = new Set<string>();
+  /** Bot specs known to this supervisor (from the last start() reconcile), so a
+   *  queued start-bot/stop-bot can resolve a name→spec without re-reading config. */
+  private readonly knownSpecs = new Map<string, FleetBotSpec>();
   private stopping = false;
   private readonly policy: RestartPolicy;
   private readonly killTimeoutMs: number;
@@ -81,6 +89,12 @@ export class FleetSupervisor {
    *  This is both the initial start and the resurrect path. */
   start(bots: readonly FleetBotSpec[]): void {
     const specByName = new Map(bots.map((b) => [b.name, b]));
+    // Remember the spec set so queued start-bot/stop-bot can resolve name→spec.
+    this.knownSpecs.clear();
+    for (const b of bots) this.knownSpecs.set(b.name, b);
+    // A full fleet start clears any explicit-stop marks — `botmux start` means
+    // "bring everything up", overriding a prior single-bot stop.
+    this.explicitStop.clear();
     // Record our supervisor identity + reconcile the persisted proc set against
     // reality before deciding what to (re)spawn.
     mutateFleetState(this.opts.statePath, (cur) => {
@@ -100,6 +114,60 @@ export class FleetSupervisor {
     for (const name of toStart) {
       const spec = specByName.get(name);
       if (spec) this.spawnBot(spec, /* isRestart */ false);
+    }
+  }
+
+  /** Start (or reconcile) ONE bot without touching the rest — the live side of
+   *  `botmux start-bot`. Idempotent: a no-op if that bot is already online+alive.
+   *  Registers the spec so a later exit is handled with the right identity, and
+   *  clears any explicit-stop mark (an explicit start overrides a prior stop). */
+  startOneBot(spec: FleetBotSpec): void {
+    if (this.stopping) return;
+    this.knownSpecs.set(spec.name, spec);
+    this.explicitStop.delete(spec.name);
+    const proc = readFleetState(this.opts.statePath)?.procs.find((p) => p.name === spec.name);
+    if (proc && proc.status === 'online' && pidAlive(proc.pid) && this.children.has(spec.name)) {
+      this.log(`start-bot ${spec.name}: already online (pid ${proc.pid})`);
+      return;
+    }
+    this.spawnBot(spec, /* isRestart */ false);
+  }
+
+  /** Stop ONE bot without touching the rest — the live side of `botmux stop-bot`.
+   *  Cancels a pending restart, marks it explicit-stop so the ensuing SIGTERM exit
+   *  is not treated as a crash, then SIGTERM→(kill_timeout)→SIGKILL. Resolves when
+   *  the child is gone. A no-op (marks stopped in state) if nothing is live. */
+  async stopOneBot(name: string): Promise<void> {
+    const timer = this.restartTimers.get(name);
+    if (timer) { clearTimeout(timer); this.restartTimers.delete(name); }
+    const child = this.children.get(name);
+    if (!child) {
+      // Nothing live to signal (already down, or mid-backoff we just cancelled).
+      // Reflect stopped in state so status is truthful and no restart is pending.
+      this.explicitStop.delete(name);
+      mutateFleetState(this.opts.statePath, (cur) => {
+        const p = cur.procs.find((x) => x.name === name);
+        if (p && p.status !== 'errored') { p.status = 'stopped'; p.pid = 0; }
+        return cur;
+      });
+      this.log(`stop-bot ${name}: not running (marked stopped)`);
+      return;
+    }
+    this.explicitStop.add(name); // onChildExit will suppress the restart + mark stopped
+    await this.stopOne(name, child);
+  }
+
+  /** Drain + execute queued single-bot commands (SIGHUP handler). Each command is
+   *  resolved to a spec (queue carries name/appId/botIndex, so no config re-read
+   *  is required) and applied via startOneBot/stopOneBot. */
+  async drainCommands(commands: readonly FleetCommand[]): Promise<void> {
+    for (const cmd of commands) {
+      const spec: FleetBotSpec = { name: cmd.name, appId: cmd.appId, botIndex: cmd.botIndex };
+      if (cmd.op === 'start-bot') {
+        this.startOneBot(spec);
+      } else {
+        await this.stopOneBot(cmd.name);
+      }
     }
   }
 
@@ -174,6 +242,16 @@ export class FleetSupervisor {
     if (this.liveGeneration.get(spec.name) !== generation) return;
     this.children.delete(spec.name);
     if (this.stopping) return;
+
+    // Explicit stop-bot: this exit is operator-intended, not a crash. Suppress the
+    // restart and mark it stopped, then clear the one-shot mark. (A SIGTERM exit
+    // looks like a crash to decideOnExit, so this check must come first.)
+    if (this.explicitStop.has(spec.name)) {
+      this.explicitStop.delete(spec.name);
+      this.log(`${spec.name} stopped by operator (stop-bot); not restarting`);
+      this.markStopped(spec.name, exit, 'stopped'); // clears liveGeneration too
+      return;
+    }
 
     const current = readFleetState(this.opts.statePath)?.procs.find((p) => p.name === spec.name);
     const decision = decideOnExit({ restarts: current?.restarts ?? 0 }, exit, this.policy);

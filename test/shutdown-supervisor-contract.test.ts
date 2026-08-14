@@ -225,7 +225,10 @@ describe('graceful shutdown supervisor contract', () => {
     expect(exactHelper).toContain('lockPid !== process.ppid');
   });
 
-  it('fails closed before PM2 mutation on duplicate Gods, stale preflight, or unregistered descriptors', () => {
+  it('the retained legacy-pm2 reaper fails closed on duplicate Gods / stale preflight (never force-kills)', () => {
+    // cleanupLegacyPm2 still reaps a pre-migration pm2 God, so its safety helpers
+    // stay: duplicate-God detection and node-sanity preflight never SIGTERM/SIGKILL
+    // a pid or auto-clean a stale pidfile — they fail closed and report.
     const duplicateStart = cli.indexOf('function listSingletonPm2GodDaemonPidsForMutation(');
     const duplicateEnd = cli.indexOf('function runPm2(', duplicateStart);
     const duplicate = cli.slice(duplicateStart, duplicateEnd);
@@ -242,13 +245,6 @@ describe('graceful shutdown supervisor contract', () => {
     expect(preflight).not.toContain("runPm2(['kill']");
     expect(preflight).not.toContain("'SIGKILL'");
     expect(pm2Preflight).toContain('拒绝自动清理');
-
-    // The still-pm2 start-bot surface keeps the unregistered-descriptor fence.
-    // The supervisor-managed start/stop/restart no longer inspect pm2 descriptors
-    // (the supervisor owns the live proc set via fleet-state.json).
-    for (const operation of ['start-bot', 'stop-bot']) {
-      expect(cli).toContain(`assertNoUnregisteredLiveDaemonDescriptors('${operation}'`);
-    }
   });
 
   it('restart stages intent, restarts the supervisor, verifies health, then commits the breadcrumb', () => {
@@ -282,22 +278,9 @@ describe('graceful shutdown supervisor contract', () => {
     expect(restart).toContain('health.healthy');
   });
 
-  it('bounds and freshly verifies the still-pm2 start-bot surface with compensation', () => {
-    // start-bot is the last pm2-managed surface (single-bot spawn); cmdStart and
-    // cmdRestart moved to the supervisor. Until start-bot migrates, it keeps the
-    // bounded pm2 start transaction + fresh verify + rollback.
-    expect(cli).toContain('const PM2_START_VERIFY_MIN_TIMEOUT_MS = 60_000;');
-    expect(cli).toContain('pm2StartVerifyTimeoutMs(configuredNames.length)');
-    const startBot = cli.slice(
-      cli.indexOf('async function ensureBotDaemonStarted('),
-      cli.indexOf('/**\n * `botmux start-bot'),
-    );
-    expect(startBot).toContain('runBoundedPm2StartTransaction(');
-    expect(startBot).toContain('PM2_START_COMMAND_TIMEOUT_MS');
-    expect(startBot).toContain('readAndAssertConfiguredFleetOnline(');
-    expect(startBot).toContain('rollbackPm2StartAttempt(');
-    expect(startBot).toContain('timeoutMs');
-    // The supervisor-managed surfaces no longer carry the pm2 transaction.
+  it('every fleet surface (start/stop/restart/start-bot/stop-bot) is supervisor-managed, not pm2', () => {
+    // The whole fleet lifecycle now goes through the built-in supervisor; no
+    // command function renders a pm2 ecosystem or runs a pm2 start transaction.
     const cmdStart = cli.slice(
       cli.indexOf('async function cmdStart()'),
       cli.indexOf('/**\n * Wipe stale dashboard-daemon descriptors'),
@@ -305,55 +288,40 @@ describe('graceful shutdown supervisor contract', () => {
     const cmdRestart = cli.slice(
       cli.indexOf('async function cmdRestart()'),
       cli.indexOf('/** Observe botmux PM2 rows'),
+    );
+    const startBot = cli.slice(
+      cli.indexOf('async function ensureBotDaemonStarted('),
+      cli.indexOf('/**\n * `botmux start-bot'),
+    );
+    const stopBot = cli.slice(
+      cli.indexOf('async function ensureBotDaemonStopped('),
+      cli.indexOf('/**\n * Bring a SINGLE bot'),
     );
     expect(cmdStart).toContain('startFleetViaSupervisor()');
-    expect(cmdStart).not.toContain('runBoundedPm2StartTransaction(');
     expect(cmdRestart).toContain('restartFleet()');
-    expect(cmdRestart).not.toContain('runBoundedPm2StartTransaction(');
+    expect(startBot).toContain('startBotViaSupervisor(');
+    expect(stopBot).toContain('stopBotViaSupervisor(');
+    for (const [label, region] of [['start', cmdStart], ['restart', cmdRestart], ['start-bot', startBot], ['stop-bot', stopBot]] as const) {
+      expect(region, label).not.toContain('runBoundedPm2StartTransaction(');
+      expect(region, label).not.toContain('ecosystemConfig(');
+      expect(region, label).not.toContain("runPm2(['start'");
+    }
   });
 
-  it('holds one bots.json generation for the still-pm2 start-bot surface', () => {
-    expect(botsStore).toContain('withFileLockSync(botsJsonPath');
-    // start-bot still renders the ecosystem under a bots.json snapshot lock.
-    const startBot = cli.slice(
-      cli.indexOf('async function ensureBotDaemonStarted('),
-      cli.indexOf('/**\n * `botmux start-bot'),
-    );
-    expect(startBot).toContain('withFileLock(BOTS_JSON_FILE');
-    expect(startBot).toContain('ecosystemConfig(');
-    expect(startBot).toContain('configuredCoreProcessNames(');
-    // Supervisor-managed start/restart still take the bots.json lock (start reads
-    // it for the credential-snapshot guard; restart for the intent breadcrumb),
-    // but no longer render an ecosystem — the supervisor re-reads bots.json itself.
-    const cmdStart = cli.slice(
-      cli.indexOf('async function cmdStart()'),
-      cli.indexOf('/**\n * Wipe stale dashboard-daemon descriptors'),
-    );
-    const cmdRestart = cli.slice(
-      cli.indexOf('async function cmdRestart()'),
-      cli.indexOf('/** Observe botmux PM2 rows'),
-    );
-    expect(cmdStart).toContain('withFileLock(BOTS_JSON_FILE');
-    expect(cmdStart).not.toContain('ecosystemConfig(');
-    expect(cmdRestart).toContain('withFileLock(BOTS_JSON_FILE');
-    expect(cmdRestart).not.toContain('ecosystemConfig(');
-  });
-
-  it('admits start-bot only through the exact configured fleet classifier', () => {
+  it('start-bot keeps the activation-readiness gate and only runs under the fleet lock', () => {
+    // The pm2 machinery is gone from start-bot, but the managed-onboarding
+    // readiness gate (activationPending / starting / committed / deactivating)
+    // is orthogonal and MUST survive — a not-yet-ready bot must never launch.
     const start = cli.indexOf('async function ensureBotDaemonStarted(');
     const end = cli.indexOf('/**\n * `botmux start-bot', start);
     const region = cli.slice(start, end);
-    expect(region).toContain('classifyStartBotFleetAdmission(');
-    expect(region).toContain("admission.state === 'already-online'");
-    const alreadyOnline = region.slice(
-      region.indexOf("admission.state === 'already-online'"),
-      region.indexOf("admission.state === 'fleet-down'"),
-    );
-    expect(alreadyOnline).toContain("'start-bot-already-online-ready'");
-    expect(alreadyOnline).toContain('readAndAssertConfiguredFleetOnline(');
-    expect(region).toContain("admission.state === 'fleet-down'");
-    expect(region).toContain("'start-bot-after-launch'");
-    expect(region).toContain('preflightNodeSanity()');
+    expect(region).toContain('withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET');
+    expect(region).toContain('activationPending');
+    expect(region).toContain('is still deactivating');
+    expect(region).toContain('conflicting activation markers');
+    expect(region).toContain('startBotViaSupervisor(');
+    // fleet_down is still surfaced (a lone bot belongs to `botmux start`).
+    expect(region).toContain("reason: r.reason === 'not_found' ? 'not_found'");
   });
 
   it('idempotent start is a supervisor no-op when a live supervisor already owns the fleet', () => {

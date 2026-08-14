@@ -3608,11 +3608,11 @@ function listBotmuxPm2Apps(): BotmuxPm2Inspection {
 
 export type StartBotLiveResult =
   | { ok: true; state: 'started' | 'already-online'; processName: string }
-  | { ok: false; reason: 'not_found' | 'not_ready' | 'fleet_down' | 'pm2_error'; message: string };
+  | { ok: false; reason: 'not_found' | 'not_ready' | 'fleet_down' | 'timeout' | 'supervisor_error'; message: string };
 
 export type StopBotLiveResult =
   | { ok: true; state: 'stopped' | 'already-stopped'; processName: string }
-  | { ok: false; reason: 'not_found' | 'pm2_error'; message: string };
+  | { ok: false; reason: 'not_found' | 'fleet_down' | 'timeout' | 'supervisor_error'; message: string };
 
 function retireExactBotmuxProcess(
   operation: string,
@@ -3644,45 +3644,32 @@ async function ensureBotDaemonStopped(
 ): Promise<StopBotLiveResult> {
   ensureConfigDir();
   try {
-    return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => (
-      withFileLock(BOTS_JSON_FILE, async () => {
-        assertNoDuplicatePm2GodDaemons();
-        preflightNodeSanity();
-        cleanupLegacyPm2();
-        const bots = loadBotsJson();
-        const index = bots.findIndex(b => b?.larkAppId === appId);
-        if (index < 0) {
-          return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
-        }
-        const processName = botProcessName(bots[index], index, PM2_NAME);
-        const inspection = listBotmuxPm2Apps();
-        if (!inspection.ok) {
-          return { ok: false, reason: 'pm2_error', message: inspection.message };
-        }
-        const named = inspection.apps.filter(app => app.name === processName);
-        if (named.length > 0 && !named.every(app =>
-          isExactPm2BotActivationReceipt(app, processName, index, appId))) {
-          return {
-            ok: false,
-            reason: 'pm2_error',
-            message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
-          };
-        }
-        const projection = readVerifiedBotmuxPm2Projection('stop-bot');
-        assertNoUnregisteredLiveDaemonDescriptors('stop-bot', projection);
-        assertCanonicalUniquePm2Rows('stop-bot', projection);
-        const target = projection.find(entry => entry.name === processName);
-        if (!target) {
-          return { ok: true, state: 'already-stopped', processName };
-        }
-        retireExactBotmuxProcess('stop-bot', target, projection);
-        return { ok: true, state: 'stopped', processName };
-      }, { maxWaitMs: 5_000 })
-    ), { maxWaitMs: 5_000 });
+    return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+      cleanupLegacyPm2(); // reap a pre-migration pm2 God if one is still around
+      const { stopBotViaSupervisor } = await import('./core/fleet-runtime.js');
+      const r = stopBotViaSupervisor(
+        appId,
+        () => randomBytes(8).toString('hex'),
+        () => new Date().toISOString(),
+      );
+      if (r.ok) {
+        return { ok: true, state: r.state, processName: r.name };
+      }
+      // fleet_down maps to already-stopped for a single bot: if no supervisor is
+      // running, that bot isn't running either — the stop intent is satisfied.
+      if (r.reason === 'fleet_down') {
+        return { ok: true, state: 'already-stopped', processName: r.name ?? appId };
+      }
+      return {
+        ok: false,
+        reason: r.reason === 'not_found' ? 'not_found' : r.reason === 'timeout' ? 'timeout' : 'supervisor_error',
+        message: r.message,
+      };
+    }, { maxWaitMs: 5_000 });
   } catch (err) {
     return {
       ok: false,
-      reason: 'pm2_error',
+      reason: 'supervisor_error',
       message: err instanceof Error ? err.message : String(err),
     };
   }
@@ -3690,22 +3677,19 @@ async function ensureBotDaemonStopped(
 
 /**
  * Bring a SINGLE bot's daemon online without touching any other bot's process.
- * The key to "add a bot without `botmux restart`": a new bot is always APPENDED
- * to bots.json (stable index), so the existing daemons (indices 0..N-1) keep
- * running unchanged — we only need to spawn the new bot's own process.
+ * A new bot is always APPENDED to bots.json (stable index), so the existing
+ * daemons keep running unchanged — we only need the supervisor to spawn the new
+ * bot's own daemon.
  *
- * We regenerate ecosystem.config.json (which now includes the new app at index
- * N) and run `pm2 start --only <processName>`, which starts exactly that one app
- * and leaves every already-online daemon untouched (unlike `botmux restart`,
- * which tears down the whole fleet). The new daemon runs its slice of
- * startDaemon() — registerBot + WSClient long-connection + descriptor publish —
- * so it starts receiving Feishu messages and the dashboard auto-discovers it via
- * its freshly-written descriptor.
+ * The live supervisor OWNS every daemon child, so we can't spawn one here (it
+ * would be an orphan the supervisor never tracks). Instead startBotViaSupervisor
+ * enqueues a start-bot command, SIGHUPs the supervisor, and waits for the bot to
+ * come online. Idempotent: a no-op when already online. When the whole fleet is
+ * down (no supervisor), we do NOT start a lone bot; that belongs to `botmux
+ * start`, which brings up the entire fleet.
  *
- * Idempotent: a no-op when the target is already online. When the whole fleet is
- * down (no botmux pm2 apps — the dashboard itself isn't running either), we do
- * NOT start a lone bot; that case belongs to `botmux start`, which brings up the
- * entire ecosystem (all bots + dashboard).
+ * The activation-readiness gate (activationPending/starting/committed/
+ * deactivating) is orthogonal to how the daemon is launched and is preserved.
  */
 async function ensureBotDaemonStarted(
   appId: string,
@@ -3713,175 +3697,64 @@ async function ensureBotDaemonStarted(
 ): Promise<StartBotLiveResult> {
   ensureConfigDir();
   try {
-    return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => (
-      withFileLock(BOTS_JSON_FILE, async () => {
-        assertNoDuplicatePm2GodDaemons();
-        preflightNodeSanity();
-        cleanupLegacyPm2();
-        const bots = loadBotsJson();
-        const index = bots.findIndex(b => b?.larkAppId === appId);
-        if (index < 0) {
-          return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
-        }
-        const bot = bots[index];
-        if (bot?.activationPending === true) {
-          return { ok: false, reason: 'not_ready', message: `appId ${appId} is still activation pending` };
-        }
-        const activationStarting = bot?.activationStarting;
-        const activationCommitted = bot?.activationCommitted;
-        const activationDeactivating = bot?.activationDeactivating;
-        if (activationDeactivating !== undefined) {
-          return { ok: false, reason: 'not_ready', message: `appId ${appId} is still deactivating` };
-        }
-        if (activationStarting !== undefined && activationCommitted !== undefined) {
-          return { ok: false, reason: 'not_ready', message: `appId ${appId} has conflicting activation markers` };
-        }
-        const activationMarker = activationStarting ?? activationCommitted;
-        const activationJobId = (
-          activationMarker
-          && typeof activationMarker === 'object'
-          && !Array.isArray(activationMarker)
-          && activationMarker.appId === appId
-          && typeof activationMarker.jobId === 'string'
-          && activationMarker.jobId
-        )
-          ? String(activationMarker.jobId)
-          : undefined;
-        if (activationMarker !== undefined && !activationJobId) {
-          return { ok: false, reason: 'not_ready', message: `appId ${appId} has an invalid activation marker` };
-        }
+    return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+      cleanupLegacyPm2(); // reap a pre-migration pm2 God if one is still around
+      const bots = loadBotsJson();
+      const index = bots.findIndex(b => b?.larkAppId === appId);
+      if (index < 0) {
+        return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
+      }
+      const bot = bots[index];
+      // Activation-readiness gate (managed onboarding) — unchanged by the pm2→
+      // supervisor migration; a not-yet-ready bot must not be launched.
+      if (bot?.activationPending === true) {
+        return { ok: false, reason: 'not_ready', message: `appId ${appId} is still activation pending` };
+      }
+      const activationStarting = bot?.activationStarting;
+      const activationCommitted = bot?.activationCommitted;
+      const activationDeactivating = bot?.activationDeactivating;
+      if (activationDeactivating !== undefined) {
+        return { ok: false, reason: 'not_ready', message: `appId ${appId} is still deactivating` };
+      }
+      if (activationStarting !== undefined && activationCommitted !== undefined) {
+        return { ok: false, reason: 'not_ready', message: `appId ${appId} has conflicting activation markers` };
+      }
+      const activationMarker = activationStarting ?? activationCommitted;
+      const activationJobId = (
+        activationMarker
+        && typeof activationMarker === 'object'
+        && !Array.isArray(activationMarker)
+        && activationMarker.appId === appId
+        && typeof activationMarker.jobId === 'string'
+        && activationMarker.jobId
+      )
+        ? String(activationMarker.jobId)
+        : undefined;
+      if (activationMarker !== undefined && !activationJobId) {
+        return { ok: false, reason: 'not_ready', message: `appId ${appId} has an invalid activation marker` };
+      }
 
-        const processName = botProcessName(bot, index, PM2_NAME);
-        const configuredNames = configuredCoreProcessNames(
-          bots,
-          activationJobId ? appId : undefined,
-        );
-        const verifyTimeoutMs = pm2StartVerifyTimeoutMs(configuredNames.length);
-        const inspection = listBotmuxPm2Apps();
-        if (!inspection.ok) {
-          return { ok: false, reason: 'pm2_error', message: inspection.message };
-        }
-        let projection = readVerifiedBotmuxPm2Projection('start-bot');
-        assertNoUnregisteredLiveDaemonDescriptors('start-bot', projection);
-        assertCanonicalUniquePm2Rows('start-bot', projection);
-
-        const namedInspection = inspection.apps.filter(app => app.name === processName);
-        if (activationJobId && namedInspection.length > 0) {
-          const disposition = managedActivationPm2Disposition(
-            namedInspection,
-            processName,
-            index,
-            appId,
-            activationJobId,
-          );
-          if (disposition === 'identity_mismatch') {
-            return {
-              ok: false,
-              reason: 'pm2_error',
-              message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
-            };
-          }
-          if (disposition === 'acknowledged') {
-            readAndAssertConfiguredFleetOnline(
-              'start-bot-already-online-ready',
-              configuredNames,
-              PM2_HOME,
-              verifyTimeoutMs,
-            );
-            return { ok: true, state: 'already-online', processName };
-          }
-          const target = projection.find(entry => entry.name === processName);
-          if (!target) {
-            throw new Error(`[start-bot] PM2 identity view disagrees about ${processName}`);
-          }
-          retireExactBotmuxProcess('start-bot-replace', target, projection);
-          projection = readVerifiedBotmuxPm2Projection('start-bot-after-replace');
-        } else if (namedInspection.length > 0) {
-          if (!namedInspection.every(app =>
-            isExactPm2BotActivationReceipt(app, processName, index, appId))) {
-            return {
-              ok: false,
-              reason: 'pm2_error',
-              message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
-            };
-          }
-        }
-
-        const admission = classifyStartBotFleetAdmission(
-          'start-bot',
-          projection,
-          configuredNames,
-          processName,
-          pid => { try { process.kill(pid, 0); return true; } catch { return false; } },
-        );
-        if (admission.state === 'already-online') {
-          readAndAssertConfiguredFleetOnline(
-            'start-bot-already-online-ready',
-            configuredNames,
-            PM2_HOME,
-            verifyTimeoutMs,
-          );
-          return { ok: true, state: 'already-online', processName };
-        }
-        if (admission.state === 'fleet-down') {
-          return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行，请先 botmux start' };
-        }
-
-        const beforeStart = projection;
-        const cfg = ecosystemConfig(bots, activationJobId ? appId : undefined);
-        runBoundedPm2StartTransaction(
-          'start-bot',
-          PM2_START_COMMAND_TIMEOUT_MS,
-          verifyTimeoutMs,
-          {
-            start: timeoutMs => {
-              assertBotsConfigSnapshotUnchanged('start-bot', bots);
-              assertNoDuplicatePm2GodDaemons();
-              preflightNodeSanity();
-              runPm2(
-                ['start', cfg, '--only', processName],
-                !opts.quiet,
-                PM2_HOME,
-                timeoutMs,
-              );
-            },
-            verifyFresh: timeoutMs => {
-              const fresh = readAndAssertConfiguredFleetOnline(
-                'start-bot-after-launch',
-                configuredNames,
-                PM2_HOME,
-                timeoutMs,
-              );
-              const acknowledged = listBotmuxPm2Apps();
-              if (!acknowledged.ok || !acknowledged.apps.some(app => (
-                isExactPm2BotActivationReceipt(
-                  app,
-                  processName,
-                  index,
-                  appId,
-                  activationJobId,
-                ) && app.online
-              ))) {
-                throw new Error(
-                  `pm2 start did not acknowledge ${processName} at bots.json slot ${index} / ${appId}`,
-                );
-              }
-              return fresh;
-            },
-            rollback: () => rollbackPm2StartAttempt(
-              'start-bot',
-              beforeStart,
-              [processName],
-            ),
-          },
-        );
-        return { ok: true, state: 'started', processName };
-      }, { maxWaitMs: 5_000 })
-    ), { maxWaitMs: 5_000 });
+      const { startBotViaSupervisor } = await import('./core/fleet-runtime.js');
+      const r = startBotViaSupervisor(
+        appId,
+        () => randomBytes(8).toString('hex'),
+        () => new Date().toISOString(),
+      );
+      if (r.ok) {
+        return { ok: true, state: r.state, processName: r.name };
+      }
+      return {
+        ok: false,
+        reason: r.reason === 'not_found' ? 'not_found'
+          : r.reason === 'fleet_down' ? 'fleet_down'
+          : r.reason === 'timeout' ? 'timeout' : 'supervisor_error',
+        message: r.message,
+      };
+    }, { maxWaitMs: 5_000 });
   } catch (err) {
     return {
       ok: false,
-      reason: 'pm2_error',
+      reason: 'supervisor_error',
       message: err instanceof Error ? err.message : String(err),
     };
   }

@@ -30,7 +30,8 @@ scrubWorkflowWorkerEnv(process.env);
 
 async function main(): Promise<void> {
   const { FleetSupervisor } = await import('./core/fleet-supervisor.js');
-  const { fleetStatePath, fleetDistDir, fleetLogDir, resolveFleetBots, resolveFleetDaemonEnv, fleetDaemonNodeArgs } = await import('./core/fleet-runtime.js');
+  const { fleetStatePath, fleetDistDir, fleetLogDir, fleetCommandPath, resolveFleetBots, resolveFleetDaemonEnv, fleetDaemonNodeArgs } = await import('./core/fleet-runtime.js');
+  const { drainFleetCommands } = await import('./core/fleet-command-queue.js');
   const { logger } = await import('./utils/logger.js');
 
   const bots = resolveFleetBots();
@@ -59,6 +60,31 @@ async function main(): Promise<void> {
   };
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGINT', () => void shutdown('SIGINT'));
+
+  // SIGHUP = "drain the single-bot command queue" (start-bot / stop-bot). The CLI
+  // enqueues a command under the fleet lock then signals us; we own the daemon
+  // children so we perform the spawn/stop. Serialized so overlapping SIGHUPs
+  // (or one arriving mid-drain) can't interleave two drains.
+  let draining = false;
+  let drainAgain = false;
+  const drain = async () => {
+    if (shuttingDown) return;
+    if (draining) { drainAgain = true; return; }
+    draining = true;
+    try {
+      do {
+        drainAgain = false;
+        const commands = drainFleetCommands(fleetCommandPath());
+        if (commands.length > 0) {
+          logger.info(`[supervisor] SIGHUP → draining ${commands.length} command(s)`);
+          await supervisor.drainCommands(commands);
+        }
+      } while (drainAgain);
+    } finally {
+      draining = false;
+    }
+  };
+  process.on('SIGHUP', () => void drain());
 
   logger.info(`[supervisor] starting fleet: ${bots.length} bot(s)`);
   supervisor.start(bots);
