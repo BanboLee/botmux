@@ -66,7 +66,12 @@ import {
 import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
 import { decideRestartFollowup, settleDurableTurnForRestart } from './core/restart-followup-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
-import { parseReadOnlyRemoteScrollPayload } from './utils/web-terminal-scroll.js';
+import {
+  parseReadOnlyRemoteScrollPayload,
+  READ_ONLY_REMOTE_SCROLL_SESSION_BUDGET,
+  READ_ONLY_REMOTE_SCROLL_WINDOW_MS,
+  ReadOnlyRemoteScrollLimiter,
+} from './utils/web-terminal-scroll.js';
 import { CodexUpdateDialogGuard } from './utils/codex-update-dialog.js';
 import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
@@ -1781,6 +1786,10 @@ const authedClients = new WeakSet<WebSocket>();
 const clientPtys = new Map<WebSocket, pty.IPty>();
 /** Managed-Herdr viewers survive an in-worker /restart while backend changes. */
 const herdrWebBindings = new Map<WebSocket, HerdrWebTerminalBinding>();
+const readOnlyRemoteScrollLimiter = new ReadOnlyRemoteScrollLimiter({
+  budget: READ_ONLY_REMOTE_SCROLL_SESSION_BUDGET,
+  windowMs: READ_ONLY_REMOTE_SCROLL_WINDOW_MS,
+});
 // Standalone/test fallback. Production replaces this after init with a stable
 // per-session HMAC derived from the host-only dashboard secret, so an
 // already-issued 「操作链接」/write link survives a worker restart (a silent
@@ -14737,6 +14746,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               if (!allowReadOnlyRemoteScroll || authedClients.has(ws)) return;
               const parsed = parseReadOnlyRemoteScrollPayload(msg.data);
               if (!parsed) return;
+              if (!readOnlyRemoteScrollLimiter.tryConsume(parsed.eventCount)) return;
               if (usesHerdrSnapshotWebHistory()) herdrWebScrollDirection = parsed.direction;
               backend?.write(msg.data);
             }
