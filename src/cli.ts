@@ -2271,6 +2271,11 @@ async function cmdStart(): Promise<void> {
         throw new Error('[start] bots.json changed during credential preflight; retry with the new configuration');
       }
       preflightNodeSanity();
+      // Upgrading from a pm2-based botmux: auto-stop a lingering legacy pm2 God
+      // before bringing up the supervisor, so a plain `botmux start` (the usual
+      // first command) doesn't end up double-running the old pm2 daemons
+      // alongside the new supervisor. Fail-safe no-op on fresh installs.
+      cleanupLegacyPm2();
       // Fleet launch via the built-in supervisor (replaces pm2). The supervisor
       // owns the invariants pm2's guard layer used to enforce: single-supervisor
       // exclusion (fleet-state pid + kill-0, under this same mutation lock),

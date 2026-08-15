@@ -1,13 +1,18 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { FleetSupervisor, pidAlive, type FleetBotSpec } from '../src/core/fleet-supervisor.js';
 import { readFleetState } from '../src/core/fleet-state-store.js';
 
 const dirs: string[] = [];
+const hostProcs: ChildProcess[] = [];
 function tmp(): string { const d = mkdtempSync(join(tmpdir(), 'fleet-sup-')); dirs.push(d); return d; }
-afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
+afterEach(() => {
+  for (const p of hostProcs.splice(0)) { try { p.kill('SIGKILL'); } catch { /* gone */ } }
+  for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+});
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -222,5 +227,37 @@ describe('FleetSupervisor (live, integration)', () => {
     expect(s.procs.find((p) => p.name === 'botmux-1')!.status).toBe('online');
     expect(s.procs.find((p) => p.name === 'botmux-0')!.status).toBe('stopped');
     await sup.stopAll();
+  });
+
+  it('REGRESSION: supervisor survives a crash-loop in its OWN process (restart timer keeps the loop alive)', async () => {
+    // The restart backoff timer must be ref'd. If it were unref'd, a single
+    // crash-looping bot would let the supervisor's event loop drain and the
+    // process would EXIT mid-backoff after the first crash — never restarting.
+    // The in-process tests above can't catch this (vitest's own handles keep the
+    // loop alive), so we run the supervisor in a DEDICATED subprocess whose only
+    // live handle is the supervisor's restart timer, and assert it keeps going.
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    // Fake daemon that always crashes (exit 1) → non-graceful → supervisor must
+    // keep restarting under the backoff.
+    const distDir = fakeDist(root, `process.exit(1);`);
+    const host = resolve('test/fixtures/fleet-supervisor-host.ts');
+    const child = spawn(process.execPath, ['--import', 'tsx', host, statePath, distDir, root], {
+      stdio: 'ignore',
+    });
+    hostProcs.push(child);
+
+    // Give it time for several crash→backoff→respawn cycles (restartDelayMs=60).
+    // If the timer were unref'd, the process would be gone well before this and
+    // restarts would be stuck at 1.
+    const reachedMany = await waitFor(
+      () => (readFleetState(statePath)?.procs[0]?.restarts ?? 0) >= 3,
+      6000,
+    );
+    expect(reachedMany).toBe(true);
+    // The host process must still be alive (its loop held by the restart timer).
+    expect(child.pid && pidAlive(child.pid)).toBe(true);
+
+    child.kill('SIGKILL');
   });
 });

@@ -273,8 +273,14 @@ export class FleetSupervisor {
       return cur;
     });
     this.log(`${spec.name} crashed (code=${exit.code} signal=${exit.signal}); restart ${decision.nextRestarts}/${this.policy.maxRestarts} in ${this.policy.restartDelayMs}ms`);
+    // The restart timer MUST keep the event loop alive: when the crashed child
+    // was the supervisor's only live handle, an unref'd timer would let the loop
+    // drain and the supervisor would exit mid-backoff — never respawning the bot
+    // (observed under bun: single-bot fleet, child crashloops, supervisor dies
+    // after scheduling the first restart). A ref'd timer holds the process until
+    // the respawn fires. (stopOne's kill timer stays unref'd — it's a shutdown
+    // safety net that must NOT keep the loop alive.)
     const timer = setTimeout(() => { this.restartTimers.delete(spec.name); this.spawnBot(spec, true); }, this.policy.restartDelayMs);
-    timer.unref?.();
     this.restartTimers.set(spec.name, timer);
   }
 
