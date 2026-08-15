@@ -31,3 +31,41 @@ export function parseReadOnlyRemoteScrollPayload(data: string): ReadOnlyRemoteSc
   if (offset !== data.length || eventCount === 0 || direction === undefined) return null;
   return { direction, eventCount };
 }
+
+export const READ_ONLY_REMOTE_SCROLL_SESSION_BUDGET = 12;
+export const READ_ONLY_REMOTE_SCROLL_WINDOW_MS = 1_000;
+
+export interface ReadOnlyRemoteScrollLimiterOptions {
+  readonly budget: number;
+  readonly windowMs: number;
+}
+
+/**
+ * Session-scoped fixed-window limiter for read-only remote scroll events.
+ * One instance is shared by every read-only WebSocket client of a session,
+ * so the budget aggregates across sockets. The window resets on the first
+ * consumption after it expires; excess events are dropped, never queued.
+ */
+export class ReadOnlyRemoteScrollLimiter {
+  private usedEvents = 0;
+  private windowStartMs: number | undefined;
+
+  constructor(
+    private readonly options: ReadOnlyRemoteScrollLimiterOptions,
+    private readonly nowMs: () => number = Date.now,
+  ) {
+    if (options.budget <= 0) throw new Error('ReadOnlyRemoteScrollLimiter: budget must be positive');
+    if (options.windowMs <= 0) throw new Error('ReadOnlyRemoteScrollLimiter: windowMs must be positive');
+  }
+
+  tryConsume(eventCount: number): boolean {
+    const now = this.nowMs();
+    if (this.windowStartMs === undefined || now - this.windowStartMs >= this.options.windowMs) {
+      this.windowStartMs = now;
+      this.usedEvents = 0;
+    }
+    if (this.usedEvents + eventCount > this.options.budget) return false;
+    this.usedEvents += eventCount;
+    return true;
+  }
+}
