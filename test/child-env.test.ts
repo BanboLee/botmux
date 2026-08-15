@@ -237,16 +237,18 @@ describe('scrubWorkflowWorkerEnv()', () => {
 describe('session CLI home scrub call sites', () => {
   // The scrub only works if every process boundary actually invokes it. These
   // source-level pins keep a refactor from silently dropping a boundary:
-  // pm2Env (bakes the caller env into pm2 apps + dump.pm2), daemon boot
-  // (resurrected from a stale dump, workers fork from it), worker boot
-  // (worker-side dynamic resolvers + childEnv seeding).
+  // the fleet supervisor boot (index-supervisor.ts — it spawns every daemon
+  // child from process.env, replacing the old pm2Env boundary), daemon boot
+  // (workers fork from it), worker boot (worker-side dynamic resolvers +
+  // childEnv seeding).
   const read = (rel: string) =>
     readFileSync(new URL(`../src/${rel}`, import.meta.url), 'utf-8');
 
-  it('cli.ts pm2Env scrubs the env handed to pm2', () => {
-    const src = read('cli.ts');
-    const fn = src.slice(src.indexOf('function pm2Env('));
-    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('scrubSessionCliHomeEnv(');
+  it('index-supervisor.ts scrubs process.env before spawning any daemon (replaces pm2Env boundary)', () => {
+    // The supervisor forks each daemon inheriting its (scrubbed) process.env via
+    // resolveFleetDaemonEnv, so scrubbing at supervisor boot is the boundary that
+    // pm2Env used to be — a leaked marker here would ride into every daemon.
+    expect(read('index-supervisor.ts')).toContain('scrubSessionCliHomeEnv(process.env)');
   });
 
   it('index-daemon.ts scrubs process.env at boot', () => {
@@ -258,12 +260,9 @@ describe('session CLI home scrub call sites', () => {
   });
 
   it('all three boundaries also scrub Claude session markers', () => {
-    // Same rationale, same boundaries: a marker that survives pm2's persisted
-    // env or a stale dump.pm2 reaches the daemon → the tmux server it forks →
-    // every pane on the machine.
-    const cli = read('cli.ts');
-    const fn = cli.slice(cli.indexOf('function pm2Env('));
-    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('scrubClaudeSessionMarkerEnv(');
+    // Same rationale, same boundaries: a marker that survives into the supervisor
+    // reaches the daemon → the tmux server it forks → every pane on the machine.
+    expect(read('index-supervisor.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
     expect(read('index-daemon.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
     expect(read('worker.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
   });
@@ -276,10 +275,8 @@ describe('session CLI home scrub call sites', () => {
     expect(worker).toContain('applySessionOwnerEnv(mergedEnv, cfg.ownerOpenId)');
   });
 
-  it('pm2, daemon, and dashboard boot scrub workflow identity without scrubbing real worker boot', () => {
-    const cli = read('cli.ts');
-    const fn = cli.slice(cli.indexOf('function pm2Env('));
-    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('scrubWorkflowWorkerEnv(');
+  it('supervisor, daemon, and dashboard boot scrub workflow identity without scrubbing real worker boot', () => {
+    expect(read('index-supervisor.ts')).toContain('scrubWorkflowWorkerEnv(process.env)');
     expect(read('index-daemon.ts')).toContain('scrubWorkflowWorkerEnv(process.env)');
     const dashboard = read('dashboard.ts');
     const scrubAt = dashboard.indexOf('scrubWorkflowWorkerEnv(process.env)');

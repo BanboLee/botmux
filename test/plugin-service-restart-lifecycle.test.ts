@@ -6,9 +6,8 @@ const pluginPage = readFileSync(new URL('../src/dashboard/web/plugin-page.tsx', 
 
 function restartFunctionSource(): string {
   const start = cliSource.indexOf('async function cmdRestart()');
-  // cmdRestart is immediately followed by the `/** Observe botmux PM2 rows */`
-  // helper comment; slice up to it.
-  const end = cliSource.indexOf('\n/** Observe botmux PM2 rows', start);
+  // cmdRestart is immediately followed by the StartBotLiveResult type export.
+  const end = cliSource.indexOf('\nexport type StartBotLiveResult', start);
   expect(start).toBeGreaterThanOrEqual(0);
   expect(end).toBeGreaterThan(start);
   return cliSource.slice(start, end);
