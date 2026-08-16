@@ -98,8 +98,15 @@ export class FleetSupervisor {
     // Record our supervisor identity + reconcile the persisted proc set against
     // reality before deciding what to (re)spawn.
     mutateFleetState(this.opts.statePath, (cur) => {
+      // Refresh the start time whenever a NEW supervisor takes over (pid differs
+      // from the one on record); a plain `||` would pin it to the first-ever
+      // start forever, so status/uptime would misreport across restarts. Keep it
+      // only when the SAME supervisor re-reconciles (idempotent re-start).
+      const priorPid = cur.supervisorPid;
+      if (priorPid !== process.pid || !cur.supervisorStartedAt) {
+        cur.supervisorStartedAt = new Date().toISOString();
+      }
       cur.supervisorPid = process.pid;
-      cur.supervisorStartedAt = cur.supervisorStartedAt || new Date().toISOString();
       // Drop procs no longer configured; mark dead 'online' procs as such so
       // planStart re-spawns them (reconcile after a supervisor restart).
       cur.procs = cur.procs.filter((p) => specByName.has(p.name));
@@ -218,7 +225,13 @@ export class FleetSupervisor {
         existing.status = 'online';
         existing.startedAt = now;
         existing.lastExitCode = null;
-        // restarts is bumped by the exit handler's decision, not here.
+        // A crash-driven respawn (isRestart) must PRESERVE restarts — that's the
+        // running tally the exit handler compares against maxRestarts. But a fresh
+        // operator-initiated start (isRestart=false: `botmux start` reconcile or
+        // start-bot) gives the bot a CLEAN restart budget; otherwise a proc that
+        // crashlooped in a previous supervisor generation would carry its stale
+        // count and be parked one crash later instead of getting a full budget.
+        if (!isRestart) existing.restarts = 0;
       } else {
         cur.procs.push({ ...freshProc(spec.name, spec.appId, child.pid ?? 0, now) });
       }

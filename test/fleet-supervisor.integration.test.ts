@@ -125,6 +125,35 @@ describe('FleetSupervisor (live, integration)', () => {
     await sup.stopAll();
   });
 
+  it('a fresh operator start resets a parked/crashed proc restart budget (crash respawn preserves it)', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    // First: a crash-looper that parks at restarts=3.
+    const crashSup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, `process.exit(1);`), daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 3, restartDelayMs: 20 }, log: () => {},
+    });
+    crashSup.start([bots[0]]);
+    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'errored', 8000);
+    expect(readFleetState(statePath)!.procs[0].restarts).toBe(3);
+    await crashSup.stopAll();
+
+    // Now a FRESH operator start (new supervisor, healthy daemon) must give the
+    // proc a clean restart budget — not inherit the stale 3 that would park it one
+    // crash sooner. Swap the fake daemon to STAY (stays online).
+    writeFileSync(join(root, 'dist', 'index-daemon.js'), STAY);
+    const freshSup = new FleetSupervisor({
+      statePath, distDir: join(root, 'dist'), daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 3, restartDelayMs: 20 }, log: () => {},
+    });
+    freshSup.start([bots[0]]);
+    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'online');
+    const p = readFleetState(statePath)!.procs[0];
+    expect(p.status).toBe('online');
+    expect(p.restarts).toBe(0); // fresh start reset the budget
+    await freshSup.stopAll();
+  });
+
   it('stopAll gracefully stops running children', async () => {
     const root = tmp();
     const statePath = join(root, 'fleet.json');

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,7 +6,21 @@ import { reapLegacyPm2 } from '../src/core/legacy-pm2-reaper.js';
 
 const dirs: string[] = [];
 function tmp(): string { const d = mkdtempSync(join(tmpdir(), 'legacy-pm2-')); dirs.push(d); return d; }
-afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
+
+// HERMETIC HOME: reapLegacyPm2 also scans homedir()/.pm2 (the shared default pm2
+// home). On a machine whose real ~/.pm2 has a live pm2 God (e.g. CI/dev boxes
+// running production pm2), leaving HOME unset would let that real God leak into
+// every test. Point HOME at a fresh temp dir so the shared-home scan is empty
+// unless a test explicitly populates it.
+let savedHome: string | undefined;
+beforeEach(() => {
+  savedHome = process.env.HOME;
+  process.env.HOME = tmp();
+});
+afterEach(() => {
+  if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+  for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+});
 
 /** Write an executable fake `pm2` at <pkgRoot>/node_modules/pm2/bin/pm2 that
  *  records its args and emits scripted stdout per subcommand. */
