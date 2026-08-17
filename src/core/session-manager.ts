@@ -1660,6 +1660,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   if (
     s.streamCardId === cardId &&
     s.streamCardNonce === ds.streamCardNonce &&
+    s.streamCardReplyTargetKey === ds.streamCardReplyTargetKey &&
     s.displayMode === ds.displayMode &&
     s.currentImageKey === ds.currentImageKey &&
     s.currentTurnTitle === ds.currentTurnTitle &&
@@ -1672,6 +1673,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   ) return;
   s.streamCardId = cardId;
   s.streamCardNonce = ds.streamCardNonce;
+  s.streamCardReplyTargetKey = ds.streamCardReplyTargetKey;
   s.displayMode = ds.displayMode;
   s.currentImageKey = ds.currentImageKey;
   s.currentTurnTitle = ds.currentTurnTitle;
@@ -2081,6 +2083,7 @@ export async function restoreActiveSessions(
           adoptedFrom: adopted,
           streamCardId: session.streamCardId,
           streamCardNonce: session.streamCardNonce,
+          streamCardReplyTargetKey: session.streamCardReplyTargetKey,
           displayMode: session.displayMode === 'screenshot' || session.displayMode === 'hidden'
             ? session.displayMode
             : (session.streamExpanded ? 'screenshot' : 'hidden'),
@@ -2285,6 +2288,7 @@ export async function restoreActiveSessions(
       // letting the next update create a new card.
       streamCardId: session.streamCardId,
       streamCardNonce: session.streamCardNonce,
+      streamCardReplyTargetKey: session.streamCardReplyTargetKey,
       displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
       currentImageKey: session.currentImageKey,
       currentTurnTitle: session.currentTurnTitle,
@@ -2958,6 +2962,7 @@ export async function resumeSession(
     ownerOpenId: session.ownerOpenId,
     streamCardId: session.streamCardId,
     streamCardNonce: session.streamCardNonce,
+    streamCardReplyTargetKey: session.streamCardReplyTargetKey,
     displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
     currentImageKey: session.currentImageKey,
     currentTurnTitle: session.currentTurnTitle,
