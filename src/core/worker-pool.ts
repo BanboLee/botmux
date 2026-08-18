@@ -1962,7 +1962,11 @@ function flushCardPatch(ds: DaemonSession): void {
   ds.pendingCardJson = undefined;
   ds.pendingCardId = undefined;
   ds.cardPatchInFlight = true;
+  let patchSucceeded = false;
   updateMessage(ds.larkAppId, cardId, json)
+    .then(() => {
+      patchSucceeded = true;
+    })
     .catch(err => {
       if (err instanceof MessageWithdrawnError) {
         // Only clear streamCardId when the withdrawn message is still the
@@ -1985,6 +1989,17 @@ function flushCardPatch(ds: DaemonSession): void {
     })
     .finally(() => {
       ds.cardPatchInFlight = false;
+      // A re-render can queue the exact same state while this PATCH is in
+      // flight. Drop only that adjacent duplicate after confirmed delivery.
+      // Failed PATCHes deliberately retain the queued item so it retries, and
+      // cardId participates in the comparison so a new turn's card is never
+      // mistaken for the card that just completed.
+      if (patchSucceeded
+        && ds.pendingCardId === cardId
+        && ds.pendingCardJson === json) {
+        ds.pendingCardJson = undefined;
+        ds.pendingCardId = undefined;
+      }
       if (ds.pendingCardJson) {
         flushCardPatch(ds);
       }
