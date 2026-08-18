@@ -232,6 +232,18 @@ describe('claude-code buildArgs', () => {
     }
   });
 
+  it('keeps the final-answer feedback hint aligned across both injection paths', () => {
+    // 回归守卫：feedbackResponseKindHint 必须同时出现在 system-prompt 路径
+    // （injectsSessionContext CLI）与 shell-hints 路径，否则启用最终回答反馈时
+    // 两类 CLI 的发送行为会静默分叉。
+    const systemPrompt = buildBotmuxSystemPromptText({ locale: 'en' });
+    const shellHints = buildBotmuxShellHints('en').join('\n');
+    for (const prompt of [systemPrompt, shellHints]) {
+      expect(prompt).toContain('--response-kind final');
+      expect(prompt).toContain('feedback buttons');
+    }
+  });
+
   it('passes configured model with --model', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, model: 'opus' });
     const idx = args.indexOf('--model');
