@@ -262,6 +262,7 @@ import type { CliId } from '../adapters/cli/types.js';
 import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.js';
 import { resolveEffectivePluginIds } from './plugins/effective.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
+import { readPeerCrossRef } from '../services/peer-cross-ref-store.js';
 import type {
   CliTurnPayload,
   CodexAppDeliverySink,
@@ -1121,14 +1122,7 @@ function sessionAgentConfig(
 
 function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
   const dataDir = config.session.dataDir;
-  let crossRef: Record<string, string> = {};
-  const crossRefPath = join(dataDir, `bot-openids-${larkAppId}.json`);
-  if (existsSync(crossRefPath)) {
-    const parsed = JSON.parse(readFileSync(crossRefPath, 'utf-8'));
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      crossRef = parsed as Record<string, string>;
-    }
-  }
+  const crossRef = readPeerCrossRef(dataDir, larkAppId);
 
   let botEntries: BotMentionEntry[] = [];
   const botInfoPath = join(dataDir, 'bots-info.json');
