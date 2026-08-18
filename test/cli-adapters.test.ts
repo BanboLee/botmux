@@ -751,8 +751,9 @@ describe('copilot buildArgs', () => {
 describe('cursor buildArgs', () => {
   const adapter = createCursorAdapter('/usr/bin/cursor-agent');
 
-  it('fresh session passes force/model flags without resume flags', () => {
+  it('fresh session passes trust/force/model flags without resume flags', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: false, model: 'gpt-5' });
+    expect(args).toContain('--trust');
     expect(args).toContain('--force');
     expect(args).toContain('--model');
     expect(args).toContain('gpt-5');
@@ -767,6 +768,7 @@ describe('cursor buildArgs', () => {
       resume: true,
       resumeSessionId: chatId,
     });
+    expect(args).toContain('--trust');
     expect(args).toContain('--resume');
     const idx = args.indexOf('--resume');
     expect(args[idx + 1]).toBe(chatId);
@@ -775,8 +777,19 @@ describe('cursor buildArgs', () => {
 
   it('resume without a persisted chatId falls back to --continue', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: true });
+    expect(args).toContain('--trust');
     expect(args).toContain('--continue');
     expect(args).not.toContain('--resume');
+  });
+
+  // The workspace-trust dialog is a startup gate, not an approval flow: a
+  // headless spawn can never answer it, and the injected first prompt would
+  // answer it by accident (`a` trusts, `q` quits). So --trust must survive
+  // disableCliBypass while --force is dropped.
+  it('disableCliBypass drops --force but keeps --trust', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: false, disableCliBypass: true });
+    expect(args).toContain('--trust');
+    expect(args).not.toContain('--force');
   });
 });
 
