@@ -273,7 +273,7 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     const routes: Array<[string, string, string]> = [
       ['chat-rename', "ipcRoute('POST', '/api/sessions/:sessionId/chat-rename'", 'groupsStore.renameChat('],
       ['write-link-card', "ipcRoute('POST', '/api/sessions/:sessionId/write-link-card'", 'deliverWriteLinkCardToOwners(ds)'],
-      ['locate', "ipcRoute('POST', '/api/sessions/:sessionId/locate'", 'replyMessage('],
+      ['locate', "ipcRoute('POST', '/api/sessions/:sessionId/locate'", 'sendSessionOwnerThreadNotification('],
     ];
     for (const [name, start, end] of routes) {
       const body = region(ipcSource, start, end);
