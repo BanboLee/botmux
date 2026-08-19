@@ -6221,6 +6221,24 @@ const server = createServer(async (req, res) => {
       });
     }
 
+    // PUT /api/bots/:appId/session-owner-reminder — per-Bot periodic owner
+    // reminder policy. The owning daemon validates, persists, and hot-applies.
+    let mBotOwnerReminder: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotOwnerReminder = url.pathname.match(/^\/api\/bots\/([^/]+)\/session-owner-reminder$/))) {
+      const appId = decodeURIComponent(mBotOwnerReminder[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-session-owner-reminder`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // Create a new chat — pick a creator from the user-selected larkAppIds
     // (Feishu makes the calling bot the implicit first member, so picking
     // anything else would silently add an unwanted bot). Auto-invite the

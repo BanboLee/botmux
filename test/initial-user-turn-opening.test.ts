@@ -43,6 +43,7 @@ const mocks = vi.hoisted(() => {
             openId,
             type: senderType === 'app' || senderType === 'bot' ? 'bot' as const : 'user' as const,
             name: openId === 'ou_owner' ? '凡辞' : undefined,
+            email: openId === 'ou_owner' ? 'owner@example.com' : undefined,
           }
         : undefined
     )),
@@ -338,6 +339,7 @@ describe('empty-started session — first real business turn must use the new-to
     expect(opening).not.toContain('<botmux_reminder>');
     // … with every per-turn datum still threaded through.
     expect(opening).toContain('<sender type="user" open_id="ou_owner"');
+    expect(opening).toContain('email="owner@example.com"');
     expect(opening).toContain('<mentions>');
     expect(opening).toContain('ou_peer');
     expect(opening).toContain('<available_bots');

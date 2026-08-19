@@ -735,7 +735,7 @@ function renderChatContextBlock(chatContext?: ChatContext): string {
 
 /**
  * Render a `<sender>` tag for prompt injection. Caller resolves the sender
- * (open_id + type + optional name) via `resolveSender(...)` in identity-cache.
+ * (open_id + type + optional name/email) via `resolveSender(...)` in identity-cache.
  * Returns empty string when no sender data is available so the prompt stays
  * clean for synthetic flows (scheduled tasks, no-op spawns).
  */
@@ -743,6 +743,7 @@ export function renderSenderTag(sender?: ResolvedSender): string {
   if (!sender || !sender.openId) return '';
   const attrs: string[] = [`type="${xmlEscape(sender.type)}"`, `open_id="${xmlEscape(sender.openId)}"`];
   if (sender.name) attrs.push(`name="${xmlEscape(sender.name)}"`);
+  if (sender.email) attrs.push(`email="${xmlEscape(sender.email)}"`);
   return `<sender ${attrs.join(' ')} />`;
 }
 

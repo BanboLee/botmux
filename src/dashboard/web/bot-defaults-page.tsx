@@ -939,6 +939,7 @@ function BotDefaultsCard(props: {
               <section className="bd-tile"><EnvelopeInjectionSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             <section className="bd-tile"><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
       </div>
@@ -1018,6 +1019,129 @@ function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: Patch
       <h3 className="bd-section-title">{tr('botDefaults.sectionRuntimeEnv')}</h3>
       <LaunchShellSection bot={props.bot} patchBot={props.patchBot} />
       <EnvSection bot={props.bot} patchBot={props.patchBot} />
+    </section>
+  );
+}
+
+type OwnerReminderState = NonNullable<BotDefaultsRow['sessionOwnerReminder']>['states'][number];
+const OWNER_REMINDER_STATE_OPTIONS = [
+  { value: 'idle', labelKey: 'botDefaults.ownerReminderStateIdle' },
+  { value: 'dormant', labelKey: 'botDefaults.ownerReminderStateDormant' },
+  { value: 'pending_repo', labelKey: 'botDefaults.ownerReminderStatePendingRepo' },
+  { value: 'tui_prompt', labelKey: 'botDefaults.ownerReminderStateTuiPrompt' },
+  { value: 'agent_attention', labelKey: 'botDefaults.ownerReminderStateAgentAttention' },
+  { value: 'limited', labelKey: 'botDefaults.ownerReminderStateLimited' },
+] as const;
+
+// Offline/error rows can lack the daemon-provided default payload. Keep this
+// browser fallback aligned with DEFAULT_SESSION_OWNER_REMINDER.
+const DEFAULT_OWNER_REMINDER = {
+  enabled: false,
+  intervalMinutes: 30,
+  text: '该会话已等待处理，请继续跟进。',
+  states: OWNER_REMINDER_STATE_OPTIONS.map(option => option.value),
+};
+
+function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const initial = props.bot.sessionOwnerReminder ?? DEFAULT_OWNER_REMINDER;
+  const [enabled, setEnabled] = useState(initial.enabled === true);
+  const [interval, setIntervalValue] = useState(String(initial.intervalMinutes));
+  const [text, setText] = useState(initial.text);
+  const [states, setStates] = useState<OwnerReminderState[]>([...initial.states]);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const next = props.bot.sessionOwnerReminder ?? DEFAULT_OWNER_REMINDER;
+    setEnabled(next.enabled === true);
+    setIntervalValue(String(next.intervalMinutes));
+    setText(next.text);
+    setStates([...next.states]);
+  }, [props.bot.sessionOwnerReminder]);
+
+  function toggleState(state: OwnerReminderState, checked: boolean): void {
+    setStates(current => checked
+      ? (current.includes(state) ? current : [...current, state])
+      : current.filter(item => item !== state));
+  }
+
+  async function save(): Promise<void> {
+    const minutes = Number(interval);
+    const cleanText = text.trim();
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 10_080) {
+      setStatus({ text: `✗ ${tr('botDefaults.ownerReminderIntervalInvalid')}` });
+      return;
+    }
+    if (!cleanText || Array.from(cleanText).length > 500 || /<\s*at\b/i.test(cleanText)) {
+      setStatus({ text: `✗ ${tr('botDefaults.ownerReminderTextInvalid')}` });
+      return;
+    }
+    if (enabled && states.length === 0) {
+      setStatus({ text: `✗ ${tr('botDefaults.ownerReminderStatesInvalid')}` });
+      return;
+    }
+    setBusy(true);
+    setStatus(null);
+    try {
+      const payload = { enabled, intervalMinutes: minutes, text: cleanText, states };
+      const res = await sendJson(
+        'PUT',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-owner-reminder`,
+        payload,
+      );
+      if (res.ok && res.body.ok) {
+        const next = res.body.sessionOwnerReminder ?? payload;
+        props.patchBot(props.bot.larkAppId, { sessionOwnerReminder: next });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (error: any) {
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section bd-owner-reminder">
+      <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.ownerReminderHelp')}>{tr('botDefaults.ownerReminderTitle')}</FieldTitle></h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-owner-reminder"
+        title={tr('botDefaults.ownerReminderEnabled')}
+        help={tr('botDefaults.ownerReminderEnabledHelp')}
+        onChange={setEnabled}
+      />
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.ownerReminderInterval')}</span>
+          <input type="number" min={1} max={10080} step={1} data-input="ownerReminderInterval" value={interval} disabled={busy} onChange={event => setIntervalValue(event.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="bd-subsection">
+        <h4 className="bd-subsection-title">{tr('botDefaults.ownerReminderStates')}</h4>
+        <div className="bd-owner-reminder-states">
+          {OWNER_REMINDER_STATE_OPTIONS.map(option => (
+            <label key={option.value}>
+              <input type="checkbox" checked={states.includes(option.value)} disabled={busy} onChange={event => toggleState(option.value, event.currentTarget.checked)} />
+              <span>{tr(option.labelKey)}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span><FieldTitle help={tr('botDefaults.ownerReminderTextHelp')}>{tr('botDefaults.ownerReminderText')}</FieldTitle></span>
+          <textarea rows={3} maxLength={500} data-input="ownerReminderText" value={text} disabled={busy} onChange={event => setText(event.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-owner-reminder" disabled={busy} onClick={() => void save()}>{tr('botDefaults.ownerReminderSave')}</button>
+        <StatusSpan status={status} attr={{ 'data-owner-reminder-status': '' }} />
+      </div>
     </section>
   );
 }

@@ -98,6 +98,9 @@ import { cleanupMaterializedDashboardImages, materializeDashboardImages } from '
 import { getCliDisplayName } from '../im/lark/card-builder.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { locateLimiter } from './dashboard-locate.js';
+import { DEFAULT_SESSION_OWNER_REMINDER } from './session-owner-reminder.js';
+import { updateSessionOwnerReminderConfig } from '../services/session-owner-reminder-config-store.js';
+import { sendSessionOwnerThreadNotification } from '../services/session-owner-notification.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -2660,13 +2663,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) =>
     return jsonRes(res, 200, { ok: false, error: 'no_feishu_transport' });
   }
   try {
-    const messageId = await replyMessage(
-      ctx.larkAppId,
-      ctx.rootMessageId,
-      `<at user_id="${ctx.ownerOpenId}"></at>`,
-      'text',
-      true,
-    );
+    const messageId = await sendSessionOwnerThreadNotification({
+      larkAppId: ctx.larkAppId,
+      rootMessageId: ctx.rootMessageId,
+      ownerOpenId: ctx.ownerOpenId,
+    });
     jsonRes(res, 200, { ok: true, messageId });
   } catch (err) {
     jsonRes(res, 502, { ok: false, error: String(err) });
@@ -3772,9 +3773,12 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined);
   } catch { /* no registered bot */ }
   let maxLiveWorkers: number | null = null;
+  let sessionOwnerReminder = DEFAULT_SESSION_OWNER_REMINDER;
   try {
-    const m = getBot(cachedLarkAppId).config.maxLiveWorkers;
+    const botConfig = getBot(cachedLarkAppId).config;
+    const m = botConfig.maxLiveWorkers;
     if (typeof m === 'number' && Number.isInteger(m) && m > 0) maxLiveWorkers = m;
+    sessionOwnerReminder = botConfig.sessionOwnerReminder ?? DEFAULT_SESSION_OWNER_REMINDER;
   } catch { /* default unlimited */ }
   let logicalSessionCount = 0;
   let residentSessionCount = 0;
@@ -3891,6 +3895,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     // value when this bot has no explicit override (prompt/global/off).
     skillInjectionDefault: globalBuiltinSkillInjectionDefault(),
     maxLiveWorkers,
+    sessionOwnerReminder,
     logicalSessionCount,
     residentSessionCount,
     dormantSessionCount,
@@ -4826,6 +4831,16 @@ ipcRoute('PUT', '/api/bot-max-live-workers', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, maxLiveWorkers: value });
+});
+
+ipcRoute('PUT', '/api/bot-session-owner-reminder', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let raw: unknown;
+  try { raw = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const result = await updateSessionOwnerReminderConfig(cachedLarkAppId, raw);
+  if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+  return jsonRes(res, 200, { ok: true, sessionOwnerReminder: result.config });
 });
 
 // Per-bot skill policy. Dashboard uses this for attach/detach; JSON policy

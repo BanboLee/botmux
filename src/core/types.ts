@@ -216,7 +216,7 @@ export interface DaemonSession {
   pendingAttachments?: LarkAttachment[];
   pendingMentions?: LarkMention[];    // @mentions from initial message, used when building prompt after repo selection
   pendingSubstituteTrigger?: import('../types.js').SubstituteTrigger;
-  /** Sender (open_id + type + resolved name) of the initial message — stashed
+  /** Sender (open_id + type + resolved name/email) of the initial message — stashed
    *  so the deferred spawn after repo-selection still injects a <sender> tag
    *  matching the original caller, not the user who clicked the card. */
   pendingSender?: import('../im/lark/identity-cache.js').ResolvedSender;

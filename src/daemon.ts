@@ -273,6 +273,15 @@ import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import { sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import {
+  DEFAULT_SESSION_OWNER_REMINDER,
+  SessionOwnerReminderController,
+} from './core/session-owner-reminder.js';
+import {
+  loadSessionOwnerReminderRecords,
+  saveSessionOwnerReminderRecords,
+} from './services/session-owner-reminder-store.js';
+import { sendSessionOwnerThreadNotification } from './services/session-owner-notification.js';
+import {
   getSessionPersistentBackendType,
   isRemoteBackendSession,
   killPersistentBackendTarget,
@@ -22046,6 +22055,45 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }, 60_000);
   idleWorkerSweepTimer.unref?.();
 
+  const sessionOwnerReminder = new SessionOwnerReminderController({
+    load: () => loadSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId),
+    save: records => saveSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId, records),
+    canSend: ds => larkTransportEnabled({
+      chatId: ds.chatId,
+      apiOnly: getBot(ds.larkAppId).config.apiOnly,
+    }),
+    send: async (ds, text, uuid) => {
+      await sendSessionOwnerThreadNotification({
+        larkAppId: ds.larkAppId,
+        rootMessageId: ds.session.rootMessageId,
+        ownerOpenId: ds.session.ownerOpenId!,
+      }, text, uuid);
+    },
+    onError: (ds, error) => logger.warn(
+      `[session-owner-reminder] send failed session=${ds.session.sessionId}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    ),
+  });
+  let sessionOwnerReminderScanInFlight = false;
+  const scanSessionOwnerReminders = async (): Promise<void> => {
+    if (sessionOwnerReminderScanInFlight) return;
+    sessionOwnerReminderScanInFlight = true;
+    try {
+      const currentConfig = getBot(cfg.larkAppId).config.sessionOwnerReminder
+        ?? DEFAULT_SESSION_OWNER_REMINDER;
+      await sessionOwnerReminder.scan(activeSessions.values(), currentConfig);
+    } catch (error) {
+      logger.warn(`[session-owner-reminder] scan failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      sessionOwnerReminderScanInFlight = false;
+    }
+  };
+  const sessionOwnerReminderTimer = setInterval(() => {
+    void scanSessionOwnerReminders();
+  }, 60_000);
+  sessionOwnerReminderTimer.unref?.();
+  void scanSessionOwnerReminders();
+
   // Periodic sandbox reconciler: the daemon's SIGKILL straggler-reaper (and any
   // worker SIGKILL) bypasses worker-side killCli(), so the pre-created deny-mask
   // mountpoints + per-session tree of a killed-but-still-active sandboxed session
@@ -22402,6 +22450,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     for (const key of [...vcMeetingPendingInvites.keys()]) deleteVcMeetingPendingInvite(key);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
+    clearInterval(sessionOwnerReminderTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     ipcHandle.close().catch(() => { /* swallow */ });
@@ -22613,6 +22662,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setSupervisorShutdownHandler(null);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
+    clearInterval(sessionOwnerReminderTimer);
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);

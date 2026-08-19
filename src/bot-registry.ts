@@ -27,6 +27,10 @@ import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-po
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import {
+  normalizeSessionOwnerReminderConfig,
+  type SessionOwnerReminderConfig,
+} from './core/session-owner-reminder.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -1383,6 +1387,9 @@ export interface BotConfig {
    * sessions are never suspended. See core/idle-worker-sweeper.ts.
    */
   maxLiveWorkers?: number;
+  /** Periodically @ the persisted Session owner while selected actionable
+   * runtime states remain unchanged. Missing means disabled. */
+  sessionOwnerReminder?: SessionOwnerReminderConfig;
   /**
    * When true, THIS bot's daemon watches host load/memory and DMs the bot owner
    * when the machine crosses into (and back out of) an overloaded state — a
@@ -2942,6 +2949,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0
         ? entry.maxLiveWorkers
         : undefined,
+      sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
       overloadAlert: entry.overloadAlert === true || undefined,
       vcMeetingAgent,
