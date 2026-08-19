@@ -209,6 +209,7 @@ import type {
   DisplayMode,
   TermActionKey,
   ScreenStatus,
+  TrustedCaller,
   VcMeetingImTurnOrigin,
 } from './types.js';
 import { t, setDefaultLocale } from './i18n/index.js';
@@ -1544,6 +1545,7 @@ async function prepareCliPluginGenerationAndGateway(
     sessionMcpGatewayHost = await startSessionMcpGatewayHost({
       sessionId: cfg.sessionId,
       dataDir: config.session.dataDir,
+      trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
       onError: error => log(`[mcp-gateway] host error: ${error.message}`),
     });
     log(`[mcp-gateway] trusted host listening for ${manifest.entries.length} plugin server(s)`);
@@ -2487,6 +2489,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
         currentBotmuxTurnId = msg.turnId;
         currentBotmuxDispatchAttempt = undefined;
+        currentGatewayTrustedCaller = undefined;
         currentVcMeetingImTurnOrigin = undefined;
         writeCliPidMarker();
         publishSandboxRelayCapability();
@@ -2595,6 +2598,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
                 msg.followUpTurnId,
                 undefined,
                 undefined,
+                undefined,
                 fence,
               );
               if (result === 'stale-before-write') {
@@ -2641,8 +2645,18 @@ const inflightInputs = new InflightInputTracker();
 let lastPtyActivityAtMs = 0;
 let currentBotmuxTurnId: string | undefined;
 let currentBotmuxDispatchAttempt: number | undefined;
+let currentGatewayTrustedCaller: TrustedCaller | undefined;
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let durableTurnInFlight = false;
+
+function currentGatewayTrustedTurnIdentity() {
+  return {
+    ...(currentGatewayTrustedCaller ? { caller: currentGatewayTrustedCaller } : {}),
+    ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
+    ...(currentBotmuxDispatchAttempt !== undefined ? { dispatchAttempt: currentBotmuxDispatchAttempt } : {}),
+  };
+}
+
 function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boolean {
   const daemonIpcPort = parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT);
   const capability = {
@@ -7200,6 +7214,7 @@ async function writeAdoptMessage(
   turnId: string | undefined,
   dispatchAttempt?: number,
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin,
+  trustedCaller?: TrustedCaller,
   fence?: AdoptWriteFence,
 ): Promise<AdoptWriteResult> {
   const executionFence = fence ?? captureAdoptWriteFence();
@@ -7212,6 +7227,7 @@ async function writeAdoptMessage(
   const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
   currentBotmuxTurnId = turnId;
   currentBotmuxDispatchAttempt = dispatchAttempt;
+  currentGatewayTrustedCaller = trustedCaller;
   currentVcMeetingImTurnOrigin = vcMeetingImTurnOrigin;
   if (dispatchAttempt !== undefined) durableTurnInFlight = true;
   writeCliPidMarker();
@@ -7450,6 +7466,7 @@ async function runAdoptMessageForCapturedGeneration(
       item.turnId,
       item.dispatchAttempt,
       item.vcMeetingImTurnOrigin,
+      item.trustedCaller,
       fence,
     ),
   });
@@ -10465,6 +10482,7 @@ async function flushPending(): Promise<void> {
         renderer?.markNewTurn();
         currentBotmuxTurnId = item.turnId;
         currentBotmuxDispatchAttempt = item.dispatchAttempt;
+        currentGatewayTrustedCaller = item.trustedCaller;
         currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
         // Acquire durable HOL ownership only after this turn owns the backend
         // submission mutex. If an older ZMX recovery debt rejects capture,
@@ -10656,7 +10674,11 @@ async function flushPending(): Promise<void> {
               adapterInputHandle(writeBackend),
               msg,
               item.codexAppInput!,
-              { turnId: item.turnId, ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}) },
+              {
+                turnId: item.turnId,
+                ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
+                ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}),
+              },
             ),
             settleVerifiableSubmissionForJournal,
             prepareNormalWrite,
@@ -10670,7 +10692,11 @@ async function flushPending(): Promise<void> {
             () => writeAdapter.writeInput(
               adapterInputHandle(writeBackend),
               msg,
-              { turnId: item.turnId, ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}) },
+              {
+                turnId: item.turnId,
+                ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
+                ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}),
+              },
             ),
             settleVerifiableSubmissionForJournal,
             prepareNormalWrite,
@@ -10989,6 +11015,7 @@ async function flushPending(): Promise<void> {
       // adjacent IM turns wait for separate idle edges so neither can be
       // HOL-dropped or steered into the other.
       if (rpcLifecycleFailClosedOwners.size > 0) break;
+      if (item.trustedCaller && lastInitConfig?.cliId === 'codex') break;
       if (shouldStopPendingBatch(item, pendingMessages[0])) break;
     }
   } finally {
@@ -11039,6 +11066,7 @@ function sendToPty(
     codexAppSteerable?: true;
     queuedActivationToken?: string;
     replyTurnId?: string;
+    trustedCaller?: import('./types.js').TrustedCaller;
     vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
     /** mojo credential snapshot delivered with this turn; applied at write time. */
     mojoLivePatch?: MojoLivePatch;
@@ -11059,6 +11087,7 @@ function sendToPty(
     ...(opts.queuedActivationToken ? { queuedActivationToken: opts.queuedActivationToken } : {}),
     ...(opts.mojoLivePatch ? { mojoLivePatch: opts.mojoLivePatch } : {}),
     ...(opts.codexAppInput ? { codexAppInput: opts.codexAppInput } : {}),
+    ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(opts.atMostOnce ? { noReplay: true } : {}),
     ...(opts.vcMeetingImTurnOrigin
@@ -14903,6 +14932,7 @@ async function spawnCli(
     isPromptReady = false;
     currentBotmuxTurnId = undefined;
     currentBotmuxDispatchAttempt = undefined;
+    currentGatewayTrustedCaller = undefined;
     if (!intentionalRestart && activeRestartAttemptId) {
       send({
         type: 'restart_result',
@@ -15139,6 +15169,7 @@ function killCli(opts: {
   readIsolationOriginChannelId = null;
   currentBotmuxTurnId = undefined;
   currentBotmuxDispatchAttempt = undefined;
+  currentGatewayTrustedCaller = undefined;
   currentVcMeetingImTurnOrigin = undefined;
   submittedCodexAppReplyTurnIds.clear();
   pendingCodexAppSteerAckIds.clear();
@@ -17067,6 +17098,7 @@ process.on('message', async (raw: unknown) => {
         if (msg.turnId) {
           currentBotmuxTurnId = msg.turnId;
           currentBotmuxDispatchAttempt = msg.dispatchAttempt;
+          currentGatewayTrustedCaller = msg.trustedCaller;
           currentVcMeetingImTurnOrigin = msg.vcMeetingImTurnOrigin;
           writeCliPidMarker();
           publishSandboxRelayCapability();
@@ -17188,6 +17220,7 @@ process.on('message', async (raw: unknown) => {
                 : undefined),
             codexAppInput: entry.codexAppInput,
             vcMeetingImTurnOrigin: entry.vcMeetingImTurnOrigin,
+            trustedCaller: msg.trustedCaller,
           }));
         let initialInputCommitted = false;
         if (shouldQueueInitialPrompt({
@@ -17215,6 +17248,7 @@ process.on('message', async (raw: unknown) => {
             codexAppDispatchId: msg.codexAppDispatchId,
             queuedActivationToken: msg.queuedActivationToken,
             vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
+            trustedCaller: msg.trustedCaller,
             codexAppInput: msg.promptCodexAppInput,
             // Thread the root's steer authorization so ordered pre-final steer can
             // fold follow-ups into THIS turn (the runner's canSteer requires the
@@ -17387,6 +17421,7 @@ process.on('message', async (raw: unknown) => {
           codexAppDispatchId: msg.codexAppDispatchId,
           queuedActivationToken: msg.queuedActivationToken,
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
+          trustedCaller: msg.trustedCaller,
           codexAppInput,
         };
         // process.on('message') does not serialize async listeners. Hold the
@@ -17416,6 +17451,7 @@ process.on('message', async (raw: unknown) => {
           queuedActivationToken: msg.queuedActivationToken,
           replyTurnId: msg.replyTurnId,
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
+          trustedCaller: msg.trustedCaller,
           // Applied when THIS item is written, not on receipt.
           ...(msg.mojoLivePatch ? { mojoLivePatch: msg.mojoLivePatch } : {}),
         });
