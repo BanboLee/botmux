@@ -14,7 +14,7 @@ import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js';
 import { config } from '../config.js';
 import { readGlobalConfig } from '../global-config.js';
@@ -11585,6 +11585,30 @@ function finalOutputDedupeKey(ds: DaemonSession, msg: Extract<WorkerToDaemon, { 
   return `${msg.sessionId ?? ds.session.sessionId}:${msg.lastUuid || msg.turnId}`;
 }
 
+/**
+ * Stable Lark `uuid` idempotency token for an ordinary bridge final_output
+ * delivery. Derived from the same identity as the daemon-side dedupe key, so
+ * every retry of the same answer — and any duplicate IPC/re-emit of the same
+ * turn — collapses into ONE Lark message (the Feishu `uuid` field is
+ * idempotent for 1h and returns the original message_id on repeat).
+ *
+ * Without it, the daemon's own transient-failure retry
+ * (`FINAL_OUTPUT_RETRY_BACKOFF_MS`, up to 3 attempts) is at-least-once: an
+ * ambiguous first attempt whose reply the server accepted but whose response
+ * the client never saw (network error/timeout) creates a brand-new copy on
+ * each retry — the user-visible "the answer repeated 3 times" incident. The
+ * VC-managed (`vcp_*`) and Codex App settlement (`ca_*`) paths already carry
+ * their own stable provider keys; this closes the same gap for the ordinary
+ * thread/chat fallback path.
+ */
+function bridgeFinalOutputUuid(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+): string {
+  const seed = finalOutputDedupeKey(ds, msg);
+  return `bf_${createHash('sha256').update(seed, 'utf8').digest('hex').slice(0, 46)}`;
+}
+
 function shouldDropMismatchedFinalOutput(
   ds: DaemonSession,
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
@@ -12115,7 +12139,7 @@ function deliverFinalOutput(
                 }
               : {}),
           }
-        : codexAppSettlementReply;
+        : codexAppSettlementReply ?? { uuid: bridgeFinalOutputUuid(ds, msg) };
       const messageId = await scopedReply(
         canonicalOutput.content,
         canonicalOutput.msgType,
