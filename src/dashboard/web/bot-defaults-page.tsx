@@ -3902,17 +3902,18 @@ function normalizeP2pMode(value: unknown): 'thread' | 'chat' | 'group' {
  *  - off：不打标签
  *  一键授权 → 新标签页打开飞书授权 → 回跳 dashboard /oauth/callback 自动完成
  *  → 本行轮询到 authorized 后徽标变绿。 */
-function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
+export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
   const tr = useT();
   const [status, setStatus] = useState<{ authorized: boolean; tagMode: string } | null>(null);
   const [authBusy, setAuthBusy] = useState(false);
   const [modeBusy, setModeBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const lifecycle = useRef({ generation: 0, mounted: true });
 
-  const fetchStatus = async (): Promise<boolean> => {
+  const fetchStatus = async (generation = lifecycle.current.generation): Promise<boolean> => {
     try {
       const res = await sendJson('GET', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-status`);
-      if (res.ok && res.body.ok) {
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation && res.ok && res.body.ok) {
         setStatus({ authorized: !!res.body.authorized, tagMode: String(res.body.tagMode ?? 'feed-group') });
         return !!res.body.authorized;
       }
@@ -3920,30 +3921,55 @@ function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
     return false;
   };
 
-  useEffect(() => { void fetchStatus(); }, [props.bot.larkAppId]);
+  useEffect(() => {
+    lifecycle.current.mounted = true;
+    const generation = ++lifecycle.current.generation;
+    // The row instance can survive a bot switch. Clear the previous bot's
+    // in-flight UI state as well as invalidating its polling generation.
+    setStatus(null);
+    setAuthBusy(false);
+    setModeBusy(false);
+    setErr(null);
+    void fetchStatus(generation);
+    return () => {
+      lifecycle.current.mounted = false;
+      lifecycle.current.generation += 1;
+    };
+  }, [props.bot.larkAppId]);
 
   async function saveMode(next: string): Promise<void> {
+    // Capture the row's generation: a bot switch bumps it (see the effect
+    // above), and a slow response for the previous bot must not overwrite the
+    // new bot's row state — drop it silently instead.
+    const generation = lifecycle.current.generation;
     setModeBusy(true);
     setErr(null);
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-config`, { mode: next });
+      if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
       if (res.ok && res.body.ok) {
         setStatus(s => ({ authorized: s?.authorized ?? false, tagMode: String(res.body.tagMode) }));
       } else {
         setErr(responseErrorText(res));
       }
     } catch (e: any) {
-      setErr(caughtErrorText(e));
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+        setErr(caughtErrorText(e));
+      }
     } finally {
-      setModeBusy(false);
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) setModeBusy(false);
     }
   }
 
   async function startAuth(): Promise<void> {
+    const generation = ++lifecycle.current.generation;
     setAuthBusy(true);
     setErr(null);
     try {
       const res = await sendJson('POST', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-auth`, {});
+      // A bot switch while the POST was in flight must neither surface the old
+      // bot's error nor open the old bot's authorization page in a new tab.
+      if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
       if (!res.ok || !res.body.ok || !res.body.authUrl) {
         setErr(responseErrorText(res));
         return;
@@ -3952,13 +3978,18 @@ function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
       // 轮询授权结果：3s × 60 次（授权链接 5 分钟有效期同量级）。
       for (let i = 0; i < 60; i++) {
         await new Promise(r => setTimeout(r, 3000));
-        if (await fetchStatus()) return;
+        if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
+        if (await fetchStatus(generation)) return;
       }
-      setErr(tr('botDefaults.sgTagAuthTimeout'));
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+        setErr(tr('botDefaults.sgTagAuthTimeout'));
+      }
     } catch (e: any) {
-      setErr(caughtErrorText(e));
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+        setErr(caughtErrorText(e));
+      }
     } finally {
-      setAuthBusy(false);
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) setAuthBusy(false);
     }
   }
 

@@ -4,14 +4,18 @@ import {
   applySessionOwnerEnv,
   BOTMUX_INJECTED_ENV_KEYS,
   CLAUDE_SESSION_MARKER_ENV_KEYS,
+  DASHBOARD_H5_ENV_KEYS,
+  DASHBOARD_H5_ENV_PREFIX,
   redactChildEnv,
   REDACTED_CHILD_ENV_KEYS,
   scrubClaudeSessionMarkerEnv,
   scrubSessionCliHomeEnv,
   scrubWorkflowWorkerEnv,
   SESSION_CLI_HOME_ENV_KEYS,
+  stripDashboardH5Env,
   WORKFLOW_WORKER_ENV_KEYS,
 } from '../src/utils/child-env.js';
+import { pm2CallerEnv } from '../src/cli/pm2-env.js';
 import { PM2_GRACEFUL_EXIT_CODE_ENV } from '../src/pm2-graceful-exit.js';
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
 
@@ -91,6 +95,62 @@ describe('redactChildEnv()', () => {
     expect(out.KEEP).toBe('v');
   });
 
+  it('removes the Dashboard Feishu H5 credential family from child env', () => {
+    // BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET is a full Feishu app credential: the
+    // daemon dotenv-loads ~/.botmux/.env wholesale, so before this scrub every
+    // PTY/direct CLI child — and every one-shot the daemon forks, e.g. the
+    // session group-title call — inherited the secret that mints
+    // app_access_token for the Dashboard's login app.
+    const out = redactChildEnv({
+      ...Object.fromEntries(DASHBOARD_H5_ENV_KEYS.map((key) => [key, 'leaked'])),
+      KEEP: 'v',
+    });
+    for (const key of DASHBOARD_H5_ENV_KEYS) {
+      expect(key in out, key).toBe(false);
+    }
+    expect(out.KEEP).toBe('v');
+  });
+
+  it('sweeps the whole H5 prefix, including a knob added after this list', () => {
+    // Minimum exposure: no CLI child consumes anything under the prefix, so a
+    // future BOTMUX_DASHBOARD_FEISHU_H5_* var must be redacted the day it is
+    // added, not the day someone remembers to extend DASHBOARD_H5_ENV_KEYS.
+    const future = `${DASHBOARD_H5_ENV_PREFIX}ENCRYPT_KEY`;
+    const out = redactChildEnv({ [future]: 'leaked', KEEP: 'v' });
+    expect(future in out).toBe(false);
+    expect(out.KEEP).toBe('v');
+  });
+
+  it('keeps the H5 keys listed by name so the tmux pane wrapper unsets them too', () => {
+    // The prefix sweep only covers redactChildEnv (pty/direct + tmux CLIENT
+    // env). On the tmux backend the pane inherits the tmux SERVER's global env,
+    // which the client env cannot override — PANE_ENV_UNSET_CLAUSE is built from
+    // REDACTED_CHILD_ENV_KEYS, and that clause needs literal names.
+    for (const key of DASHBOARD_H5_ENV_KEYS) {
+      expect(REDACTED_CHILD_ENV_KEYS, key).toContain(key);
+    }
+  });
+
+  it('covers every H5 var the dashboard actually reads (drift guard)', () => {
+    // resolveDashboardH5AuthConfig is the single consumer; scrape its source so
+    // adding a knob there without extending the deny list fails here.
+    const h5 = readFileSync(new URL('../src/dashboard/h5-auth.ts', import.meta.url), 'utf-8');
+    const read = new Set(h5.match(/BOTMUX_DASHBOARD_FEISHU_H5_[A-Z0-9_]+/g) ?? []);
+    expect(read.size).toBeGreaterThan(0);
+    for (const key of read) {
+      expect(DASHBOARD_H5_ENV_KEYS as readonly string[], key).toContain(key);
+      expect(key.startsWith(DASHBOARD_H5_ENV_PREFIX), key).toBe(true);
+    }
+  });
+
+  it('leaves non-H5 dashboard settings alone — they are not credentials', () => {
+    // The sweep is scoped to the H5 credential family. Ordinary dashboard
+    // settings that happen to share the BOTMUX_DASHBOARD_ prefix are not
+    // secrets and are not part of this deny list.
+    const out = redactChildEnv({ BOTMUX_DASHBOARD_PORT: '7991' });
+    expect(out.BOTMUX_DASHBOARD_PORT).toBe('7991');
+  });
+
   it('removes the PM2 graceful-exit sentinel so a foreground CLI child exits 0, not 90', () => {
     // pm2 bakes BOTMUX_PM2_GRACEFUL_EXIT_CODE=90 into the daemon env so ONLY the
     // daemon/dashboard cores exit with the sentinel on graceful stop. Left in a
@@ -147,6 +207,57 @@ describe('redactChildEnv()', () => {
       if (prevSentinel === undefined) delete process.env[PM2_GRACEFUL_EXIT_CODE_ENV];
       else process.env[PM2_GRACEFUL_EXIT_CODE_ENV] = prevSentinel;
     }
+  });
+});
+
+describe('stripDashboardH5Env()', () => {
+  it('deletes the whole named family plus any future prefix knob in place, keys absent not undefined', () => {
+    // The daemon dotenv-loads ~/.botmux/.env wholesale, so at boot its env
+    // holds the Dashboard's H5 APP_SECRET (a full Feishu app credential).
+    // index-daemon.ts calls this right after dotenv: the daemon process itself
+    // must hold nothing of the family — redactChildEnv/tmux pane unset stay as
+    // the second layer at the CLI-child boundary. Same node-pty trap as
+    // redactChildEnv: keys must be ABSENT, not present-with-"undefined".
+    const future = `${DASHBOARD_H5_ENV_PREFIX}FUTURE_KNOB`;
+    const env: NodeJS.ProcessEnv = {
+      ...Object.fromEntries(DASHBOARD_H5_ENV_KEYS.map((key) => [key, 'secret'])),
+      [future]: 'secret',
+      KEEP: 'v',
+      PATH: '/usr/bin',
+    };
+
+    stripDashboardH5Env(env);
+
+    for (const key of DASHBOARD_H5_ENV_KEYS) {
+      expect(key in env, key).toBe(false);
+    }
+    expect(future in env).toBe(false);
+    // Non-H5 vars — including non-secret BOTMUX_DASHBOARD_* settings — survive.
+    expect(env.KEEP).toBe('v');
+    expect(env.PATH).toBe('/usr/bin');
+  });
+
+  it('leaves non-H5 dashboard settings alone', () => {
+    const env: NodeJS.ProcessEnv = { BOTMUX_DASHBOARD_PORT: '7991' };
+    stripDashboardH5Env(env);
+    expect(env.BOTMUX_DASHBOARD_PORT).toBe('7991');
+  });
+
+  it('is called by index-daemon.ts after dotenv (source pin)', () => {
+    // The unit test above proves the function; this pins the boundary that
+    // makes it matter: the daemon strips the family it just dotenv-loaded
+    // BEFORE any daemon code (or the session-var scrubs below it) can run.
+    const src = readFileSync(new URL('../src/index-daemon.ts', import.meta.url), 'utf-8');
+    const dotenvAt = src.indexOf('dotenvConfig(');
+    const stripAt = src.indexOf('stripDashboardH5Env(process.env)');
+    expect(dotenvAt).toBeGreaterThan(-1);
+    expect(stripAt).toBeGreaterThan(dotenvAt);
+  });
+
+  it('is called by detachedRestartEnv so a dashboard-spawned restart drops the family (source pin)', () => {
+    const src = readFileSync(new URL('../src/core/maintenance.ts', import.meta.url), 'utf-8');
+    const fn = src.slice(src.indexOf('export function detachedRestartEnv('));
+    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('stripDashboardH5Env(');
   });
 });
 
@@ -243,9 +354,11 @@ describe('session CLI home scrub call sites', () => {
   const read = (rel: string) =>
     readFileSync(new URL(`../src/${rel}`, import.meta.url), 'utf-8');
 
-  it('cli.ts pm2Env scrubs the env handed to pm2', () => {
-    const src = read('cli.ts');
-    const fn = src.slice(src.indexOf('function pm2Env('));
+  it('the pm2 caller env scrubs session CLI homes', () => {
+    // cli.ts pm2Env() delegates to cli/pm2-env.ts; that is where the scrub set
+    // lives (and where pm2CallerEnv() above proves it behaviorally).
+    const src = read('cli/pm2-env.ts');
+    const fn = src.slice(src.indexOf('export function scrubPm2CallerEnv('));
     expect(fn.slice(0, fn.indexOf('\n}'))).toContain('scrubSessionCliHomeEnv(');
   });
 
@@ -261,8 +374,8 @@ describe('session CLI home scrub call sites', () => {
     // Same rationale, same boundaries: a marker that survives pm2's persisted
     // env or a stale dump.pm2 reaches the daemon → the tmux server it forks →
     // every pane on the machine.
-    const cli = read('cli.ts');
-    const fn = cli.slice(cli.indexOf('function pm2Env('));
+    const pm2 = read('cli/pm2-env.ts');
+    const fn = pm2.slice(pm2.indexOf('export function scrubPm2CallerEnv('));
     expect(fn.slice(0, fn.indexOf('\n}'))).toContain('scrubClaudeSessionMarkerEnv(');
     expect(read('index-daemon.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
     expect(read('worker.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
@@ -277,16 +390,33 @@ describe('session CLI home scrub call sites', () => {
   });
 
   it('pm2, daemon, and dashboard boot scrub workflow identity without scrubbing real worker boot', () => {
-    const cli = read('cli.ts');
-    const fn = cli.slice(cli.indexOf('function pm2Env('));
+    const pm2 = read('cli/pm2-env.ts');
+    const fn = pm2.slice(pm2.indexOf('export function scrubPm2CallerEnv('));
     expect(fn.slice(0, fn.indexOf('\n}'))).toContain('scrubWorkflowWorkerEnv(');
     expect(read('index-daemon.ts')).toContain('scrubWorkflowWorkerEnv(process.env)');
     const dashboard = read('dashboard.ts');
     const scrubAt = dashboard.indexOf('scrubWorkflowWorkerEnv(process.env)');
     expect(scrubAt).toBeGreaterThan(-1);
-    expect(scrubAt).toBeLessThan(dashboard.indexOf('function spawnStartBotLive('));
-    expect(scrubAt).toBeLessThan(dashboard.indexOf('function spawnStopBotLive('));
+    // Must land before anything that can fork a host child — the onboarding
+    // manager is wired to the start/stop-bot spawns (dashboard/managed-spawn.ts).
+    expect(scrubAt).toBeLessThan(dashboard.indexOf('new BotOnboardingManager('));
     expect(read('worker.ts')).not.toContain('scrubWorkflowWorkerEnv(process.env)');
+  });
+
+  it('every CLI-child spawn boundary builds its env from redactChildEnv (source pin)', () => {
+    // The H5 secret leak was a missing KEY, not a missing call — but the deny
+    // list only protects boundaries that actually route through it. Pin the
+    // non-obvious ones: the daemon-side one-shot that titles a session group,
+    // and worker.ts's own child/engine envs.
+    const oneShot = read('services/session-group-title.ts');
+    const fn = oneShot.slice(oneShot.indexOf('export function buildOneShotEnv('));
+    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('redactChildEnv(process.env)');
+    const worker = read('worker.ts');
+    expect(worker).toContain('const childEnv = redactChildEnv(process.env)');
+    // The zellij web-terminal viewer used the raw process.env (zellijEnv only
+    // drops ZELLIJ*), unlike the tmux viewer whose tmuxEnv folds in
+    // REDACTED_CHILD_ENV_KEYS.
+    expect(worker).toContain('zellijEnv(redactChildEnv(process.env))');
   });
 
   it('worker-pool strips the PM2 sentinel when forking a worker (source pin)', () => {
@@ -314,5 +444,70 @@ describe('BOTMUX_INJECTED_ENV_KEYS carries the read-isolation markers', () => {
   it('includes BOTMUX_READ_ISOLATION and BOTMUX_API_ONLY', () => {
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_READ_ISOLATION');
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_API_ONLY');
+  });
+});
+
+/**
+ * pm2 invocation boundary (cli.ts pm2Env → cli/pm2-env.ts).
+ *
+ * pm2 copies the CALLER's environment into every managed app and into
+ * dump.pm2, which `pm2 resurrect` replays after a reboot — so whatever survives
+ * this scrub is handed to the whole fleet AND written to disk under
+ * ~/.botmux/pm2, readable via `pm2 describe`/`jlist` for as long as that dump
+ * lives. `botmux restart` is routinely issued from the dashboard process
+ * (update/restart button), which legitimately holds the Feishu H5 login family.
+ */
+describe('pm2CallerEnv()', () => {
+  it('never carries the Dashboard H5 login family into pm2 metadata/dump', () => {
+    const future = `${DASHBOARD_H5_ENV_PREFIX}FUTURE_KNOB`;
+    const base: NodeJS.ProcessEnv = {
+      ...Object.fromEntries(DASHBOARD_H5_ENV_KEYS.map((key) => [key, 'h5-secret'])),
+      [future]: 'h5-secret',
+      PATH: '/usr/bin',
+    };
+
+    const env = pm2CallerEnv(base, '/tmp/pm2-home');
+
+    for (const key of [...DASHBOARD_H5_ENV_KEYS, future]) {
+      expect(key in env, key).toBe(false);
+    }
+    expect(Object.values(env)).not.toContain('h5-secret');
+    expect(env.PATH).toBe('/usr/bin');
+    expect(env.PM2_HOME).toBe('/tmp/pm2-home');
+  });
+
+  it('keeps stripping session CLI homes, Claude markers and workflow identity', () => {
+    const base: NodeJS.ProcessEnv = {
+      CLAUDE_CONFIG_DIR: '/home/bot-a/.botmux/claude',
+      CODEX_HOME: '/home/bot-a/.botmux/codex',
+      CLAUDECODE: '1',
+      CLAUDE_CODE_CHILD_SESSION: '1',
+      BOTMUX_WORKFLOW: '1',
+      BOTMUX_WORKFLOW_RUN_ID: 'run_1',
+      BOTMUX_DASHBOARD_PORT: '7891',
+    };
+
+    const env = pm2CallerEnv(base, '/tmp/pm2-home');
+
+    for (const key of [...SESSION_CLI_HOME_ENV_KEYS, ...CLAUDE_SESSION_MARKER_ENV_KEYS, ...WORKFLOW_WORKER_ENV_KEYS]) {
+      expect(key in env, key).toBe(false);
+    }
+    // Non-secret operator settings still ride through — they are the point of
+    // the baked env block.
+    expect(env.BOTMUX_DASHBOARD_PORT).toBe('7891');
+  });
+
+  it('does not mutate the caller env', () => {
+    const base: NodeJS.ProcessEnv = { BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET: 'h5-secret' };
+    pm2CallerEnv(base, '/tmp/pm2-home');
+    expect(base.BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET).toBe('h5-secret');
+  });
+
+  it('is the env cli.ts pm2Env() actually hands to pm2 (source pin)', () => {
+    // The behavior above only matters if the real pm2 invocations use it: a
+    // hand-rolled `{ ...process.env }` in cli.ts would reopen the hole.
+    const src = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf-8');
+    const fn = src.slice(src.indexOf('function pm2Env('));
+    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('pm2CallerEnv(process.env, home)');
   });
 });

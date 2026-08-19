@@ -18,13 +18,14 @@
  *   botmux device enroll|status|logout — manage the host desktop device credential
  *   botmux list           — interactive session picker (TUI), attach to managed tmux/ZMX sessions
  *   botmux list --plain   — plain table output (for piping / scripts)
+ *   botmux preview <port> — register this session's loopback Web preview
  *   botmux delete <id>    — close a session by ID prefix
  *   botmux delete all     — close all active sessions
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd / Windows Task Scheduler)
  *   botmux whiteboard status|enable|disable|current|list|read|update|write — local project whiteboard
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync, chmodSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, basename, resolve } from 'node:path';
@@ -96,7 +97,7 @@ import { hasProtectedSessionMutationOwnership } from './core/session-mutation-gu
 import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
 import { withFileLock, withFileLockSync } from './utils/file-lock.js';
-import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
+import { pm2CallerEnv } from './cli/pm2-env.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
@@ -168,6 +169,7 @@ import {
   DASHBOARD_COMMAND_USAGE,
   executeDashboardCommand,
   formatDashboardFallbackFailure,
+  formatDashboardSuccessLines,
 } from './cli/dashboard-command.js';
 import { globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
 import {
@@ -356,28 +358,11 @@ function pm2Bin(): string {
   return 'pm2';
 }
 
-/** Env for pm2 invocations with an isolated PM2_HOME. */
+/** Env for pm2 invocations with an isolated PM2_HOME. The scrub set (session
+ *  CLI homes, Claude/workflow markers, Dashboard H5 credentials) lives in
+ *  cli/pm2-env.ts so it stays assertable in a test. */
 function pm2Env(home: string = PM2_HOME): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, PM2_HOME: home };
-  // pm2 persists the caller's env into every managed app (and into dump.pm2
-  // for resurrect), so a `botmux start/restart` invoked from ANY process that
-  // carries a session-level CLI home pointer — most commonly a bot's own
-  // session during self-upgrade, whose env holds its injected
-  // CLAUDE_CONFIG_DIR — would poison ALL workers, making every non-isolated
-  // bot read/write a sibling bot's home. Strip at this boundary so the daemon
-  // stays session-agnostic; daemon/worker boot scrub the same keys against
-  // stale dumps (see SESSION_CLI_HOME_ENV_KEYS for the full story, including
-  // why GROK_HOME is exempt and why deleting beats pinning a default).
-  scrubSessionCliHomeEnv(env);
-  // Claude session markers ride the same pm2 env-persistence vector; baked in
-  // they eventually flip transcript saving off fleet-wide once the tmux server
-  // respawns from a poisoned daemon (see CLAUDE_SESSION_MARKER_ENV_KEYS).
-  scrubClaudeSessionMarkerEnv(env);
-  // Workflow/goal markers identify one short-lived node worker. Persisting
-  // them in PM2 would make every daemon — and then every ordinary chat worker
-  // it forks — run in workflow mode after a restart initiated from that node.
-  scrubWorkflowWorkerEnv(env);
-  return env;
+  return pm2CallerEnv(process.env, home);
 }
 
 function listPm2GodDaemonPids(home: string = PM2_HOME): number[] {
@@ -909,7 +894,11 @@ function ecosystemConfig(
 
   apps.push({
     name: 'botmux-dashboard',
-    script: join(PKG_ROOT, 'dist', 'dashboard.js'),
+    // index-dashboard.ts, NOT dashboard.js: the entry dotenv-loads
+    // ~/.botmux/.env before dynamically importing the dashboard, which is how
+    // the Feishu H5 credential family reaches the dashboard WITHOUT being baked
+    // into this file's shared env block (see DAEMON_ENV_KEYS).
+    script: join(PKG_ROOT, 'dist', 'index-dashboard.js'),
     interpreter,
     cwd: PKG_ROOT,
     autorestart: true,
@@ -936,7 +925,19 @@ function ecosystemConfig(
 
   const cfg = { apps };
   const tmpFile = join(CONFIG_DIR, 'ecosystem.config.json');
-  writeFileSync(tmpFile, JSON.stringify(cfg, null, 2));
+  // Owner-only, same as bots.json — kept as defense in depth. The Dashboard
+  // Feishu H5 app secret is no longer baked into the env block (the dashboard
+  // dotenv-loads it via index-dashboard.ts; DAEMON_ENV_KEYS excludes the
+  // family), but this file still bakes operator-configured hosts/ports/paths,
+  // an older install's copy may still carry the secret until overwritten, and
+  // 0600 keeps any future env-block regression from becoming world-readable.
+  // writeFileSync's `mode` applies only when the file is CREATED — chmod as
+  // well, or an install that already wrote it 0644 keeps the world-readable
+  // mode forever.
+  writeFileSync(tmpFile, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+  if (process.platform !== 'win32') {
+    try { chmodSync(tmpFile, 0o600); } catch { /* best-effort: exotic FS / mounted noperm */ }
+  }
   return tmpFile;
 }
 
@@ -4393,9 +4394,9 @@ async function cmdDashboard(args: string[]): Promise<void> {
 
   const { action, result: r } = execution;
   if (r.ok) {
-    // 首行保持纯 URL（脚本/复制取第一行即可）；走中心化平台时再补一行本地直连兜底。
-    console.log(r.url);
-    if (r.localUrl) console.log(`本地直连(平台异常时可用): ${r.localUrl}`);
+    // 首行保持纯 URL（脚本/复制取第一行即可）；随后依次是工作台直达入口、以及走
+    // 中心化平台时的本地直连兜底。行顺序与首行契约见 formatDashboardSuccessLines。
+    for (const line of formatDashboardSuccessLines(r)) console.log(line);
     return;
   }
   const portFile = join(CONFIG_DIR, '.dashboard-port');
@@ -4501,6 +4502,12 @@ interface SessionData {
   /** Exact persistent host/agent selected by the worker. In particular, Herdr
    * may own one agent inside a shared host session rather than the host itself. */
   persistentBackendTarget?: PersistentBackendTarget;
+  /** Live loopback (host, port) registered via `botmux preview <port>` for the
+   * CURRENT worker generation — routing state, not conversation data. Offline
+   * close must drop it like services/session-store.ts closeSession() does:
+   * a closed session owns no port, and a retained value could proxy a later
+   * reader into an unrelated local server that re-acquired the port. */
+  previewTarget?: import('./core/session-preview.js').SessionPreviewTarget;
   lastCliInput?: string;
   adoptedFrom?: AdoptedFromData;
   /** Deliberately suspended by the resident-session cap. No process/backing
@@ -4661,6 +4668,7 @@ async function abandonSessionOffline(session: SessionData): Promise<OfflineAband
     delete latest.queuedActivationPending;
     delete latest.queuedActivationTail;
     delete latest.pendingRepoSetup;
+    delete latest.previewTarget;
     applied = true;
     return true;
   });
@@ -4679,6 +4687,7 @@ function pruneSessionOfflineIfLedgerEmpty(session: SessionData): boolean {
     current.closedAt = new Date().toISOString();
     delete current.codexAppDispatchLedger;
     delete current.codexAppGenerationCommits;
+    delete current.previewTarget;
     pruned = true;
     return true;
   });
@@ -6014,14 +6023,14 @@ async function cmdSuspend(): Promise<void> {
   if (failed > 0) process.exitCode = 1;
 }
 
-/** 会话级 CLI IPC（slash/cd/close）的 POST：与 postAsk 同款双路径——能读 host secret
+/** 会话级 CLI IPC（slash/cd/close/preview）的 POST：与 postAsk 同款双路径——能读 host secret
  *  （非隔离进程）走 trusted-host HMAC 签名；读不到（沙箱 BOTMUX_SEND_RELAY /
  *  macOS 读隔离 carve-out）改带本会话当前轮换的 origin capability，由 daemon
  *  handler 与活跃记录比对。两条路都不读 bots.json。 */
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'chat-rename',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -6051,6 +6060,82 @@ async function postSessionCliIpc(
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
     : fetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+}
+
+/** `botmux preview <port>` registers a reachable loopback Web service for the
+ * exact current session. There is intentionally no `--session` escape hatch:
+ * ancestry/env resolution plus the rotating session capability prove which
+ * agent is volunteering the port. The daemon performs the authoritative port
+ * validation/probe and persists the result. */
+async function cmdPreview(rest: string[]): Promise<void> {
+  if (rest.length !== 1 || !/^\d+$/.test(rest[0])) {
+    console.error('用法: botmux preview <port>');
+    process.exit(1);
+  }
+  const port = Number(rest[0]);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    console.error('✗ 端口必须是 1-65535 的整数');
+    process.exit(1);
+  }
+  const ctx = findAncestorSessionContext();
+  if (!ctx?.sessionId) {
+    console.error('✗ 无法定位当前会话；preview 只能在 botmux 会话内注册');
+    process.exit(1);
+  }
+
+  let discoveredPort: number | undefined;
+  try {
+    discoveredPort = findDaemon(process.env.BOTMUX_LARK_APP_ID)?.ipcPort;
+  } catch {
+    // Sandboxed/read-isolated sessions cannot enumerate daemon descriptors.
+  }
+  const ipcPort = resolveDaemonIpcPort(discoveredPort, process.env.BOTMUX_DAEMON_IPC_PORT);
+  if (!ipcPort) {
+    console.error('✗ 无法定位当前会话的 daemon；请确认 daemon 正在运行');
+    process.exit(1);
+  }
+
+  let response: Response;
+  try {
+    response = await postSessionCliIpc(ipcPort, ctx.sessionId, 'preview', { port });
+  } catch {
+    console.error('✗ 无法连接当前会话的 daemon');
+    process.exit(1);
+  }
+  const body = await response.json().catch(() => ({})) as {
+    ok?: boolean;
+    error?: string;
+    preview?: { path?: string };
+  };
+  if (response.ok && body.ok && typeof body.preview?.path === 'string') {
+    console.log(`✓ Web 预览已注册: ${body.preview.path}`);
+    return;
+  }
+  const error = body.error ?? `HTTP ${response.status}`;
+  if (error === 'preview_unreachable') {
+    console.error('✗ 端口不可达；请先让 Web 服务监听本机 loopback/0.0.0.0 后再注册');
+  } else if (error === 'preview_owner_unverified') {
+    // P1-12：端口上确实有人在监听，但证明不了那是本会话起的进程。宁可没有预览，
+    // 也不把 Dashboard 用户代理进一个来路不明的本机服务。
+    console.error(
+      '✗ 无法确认该端口由本会话的进程持有；请在会话内直接启动 Web 服务后再注册'
+      + '（不要用 setsid/nohup 脱离进程树，也不要注册别的程序占用的端口）',
+    );
+  } else if (error === 'preview_unsupported') {
+    console.error('✗ 当前会话后端（远端 sandbox）的 Web 服务不在本机，Dashboard 预览不支持');
+  } else if (error === 'preview_generation_changed') {
+    console.error('✗ 注册期间会话已换代或已关闭；请在新一轮里重新注册');
+  } else if (error === 'preview_target_changed') {
+    // P1-3：并发注册（例如同时注册两个端口）时，后到的一方不再无声覆盖先落地的那个。
+    console.error('✗ 注册期间本会话的预览目标已被另一次注册改写；同一时刻只能有一个预览目标，请确认后重试');
+  } else if (error === 'remote_host_forbidden') {
+    console.error('✗ 只允许注册本机 loopback 服务');
+  } else if (error === 'origin_unproven' || error === 'managed_action_required') {
+    console.error('✗ 当前会话归属校验失败');
+  } else {
+    console.error(`✗ 预览注册失败: ${error}`);
+  }
+  process.exit(1);
 }
 
 async function cmdChat(argv: string[]): Promise<void> {
@@ -6906,6 +6991,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   term-link [id]   获取活跃会话的「可操作终端」（带写 token）。不回显链接，改由
                    daemon 把可操作卡片私密发给 owner（群内仅你可见，话题/单聊回退 DM）。
                    单个活跃会话可省略 id
+  preview <port>   （会话内）注册当前会话已启动的本机 Web 服务；Dashboard 登录后通过
+                   同源 /preview/<sessionId>/ 访问，不暴露本机地址或任何 token。
+                   端口必须由本会话的进程持有（在会话内直接启动，别 setsid/nohup
+                   脱离进程树）；换代/关闭后需重新注册，远端 sandbox 后端不支持
   autostart enable     注册开机自启（macOS launchd / Linux user systemd / Windows Task Scheduler，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
@@ -12507,6 +12596,9 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     'bots',
     'skill',
     'hook',
+    // Local-only, session-capability-bound preview registration. It has no chat,
+    // workflow, deployment, or external messaging effect.
+    'preview',
     'session-ready',
     'mcp',
     'ask', // dedicated cmdAsk guard emits the humanGate-specific guidance
@@ -13336,6 +13428,7 @@ switch (command) {
     break;
   }
   case 'term-link': await cmdTermLink(process.argv.slice(3)); break;
+  case 'preview': await cmdPreview(process.argv.slice(3)); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'ask': {
     // `botmux ask buttons --options ...` → sub='buttons', rest=['--options', ...]

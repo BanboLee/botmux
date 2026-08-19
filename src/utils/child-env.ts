@@ -84,10 +84,71 @@ export function scrubClaudeSessionMarkerEnv(env: NodeJS.ProcessEnv): void {
 }
 
 /**
+ * Dashboard-only Feishu/Lark H5 passwordless-login configuration. Every key in
+ * this family is read by ONE consumer — resolveDashboardH5AuthConfig() in
+ * src/dashboard/h5-auth.ts, inside the dashboard process — and by nothing else
+ * in the fleet. A session's CLI child has no reason to see any of it, and
+ * `..._APP_SECRET` is a full Feishu app credential: whoever holds it can mint
+ * app_access_token for the H5 login app, i.e. forge the identity the Dashboard
+ * authenticates on. The daemon loads ~/.botmux/.env wholesale (index-daemon.ts
+ * dotenv), so without this scrub the secret rode into every PTY/direct CLI
+ * child and every one-shot the daemon forks (session group-title).
+ *
+ * Redaction is BOTH belt and braces:
+ *  - these exact names sit in REDACTED_CHILD_ENV_KEYS, which also drives the
+ *    tmux pane wrapper's `unset` clause and the tmux client-env strip;
+ *  - redactChildEnv() additionally sweeps the whole
+ *    {@link DASHBOARD_H5_ENV_PREFIX}, so a future H5 knob is redacted the day
+ *    it is added rather than the day someone remembers this list.
+ */
+export const DASHBOARD_H5_ENV_PREFIX = 'BOTMUX_DASHBOARD_FEISHU_H5_';
+
+export const DASHBOARD_H5_ENV_KEYS = [
+  'BOTMUX_DASHBOARD_FEISHU_H5_ENABLED',
+  'BOTMUX_DASHBOARD_FEISHU_H5_BRAND',
+  'BOTMUX_DASHBOARD_FEISHU_H5_APP_ID',
+  'BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET',
+  'BOTMUX_DASHBOARD_FEISHU_H5_ALLOWED_OPEN_IDS',
+  'BOTMUX_DASHBOARD_FEISHU_H5_ENTRY_PATH',
+  'BOTMUX_DASHBOARD_FEISHU_H5_SESSION_TTL_MS',
+  'BOTMUX_DASHBOARD_FEISHU_H5_SECURE_COOKIE',
+  'BOTMUX_DASHBOARD_FEISHU_H5_TRUSTED_PROXY_HOPS',
+] as const;
+
+/**
+ * Delete the entire Dashboard-only Feishu H5 login family from `env` IN PLACE:
+ * every named key in {@link DASHBOARD_H5_ENV_KEYS} plus a
+ * {@link DASHBOARD_H5_ENV_PREFIX} sweep, so a knob added tomorrow is stripped
+ * the day it ships rather than the day someone extends the list.
+ *
+ * The Dashboard is the family's ONLY consumer, and it receives the values by
+ * dotenv-loading ~/.botmux/.env itself (index-dashboard.ts) — NOT through the
+ * shared PM2 env block (the H5 keys are deliberately absent from
+ * DAEMON_ENV_KEYS). Every other botmux-owned process must therefore hold none
+ * of it. Call sites:
+ *  - index-daemon.ts boot: the daemon dotenv-loads the same .env wholesale, so
+ *    it must drop the family right after dotenv — a daemon holding the H5
+ *    APP_SECRET can mint app_access_token for the Dashboard's login app.
+ *  - core/maintenance.ts detachedRestartEnv(): the detached `botmux restart`
+ *    the DASHBOARD spawns (update/restart button) inherits the dashboard's env,
+ *    which legitimately holds the secrets; the restart driver does not need
+ *    them and must not carry them toward pm2.
+ * redactChildEnv() keeps its own equivalent strip as the second line of
+ * defense at every CLI-child boundary (PTY/tmux pane unset/one-shot).
+ */
+export function stripDashboardH5Env(env: NodeJS.ProcessEnv): void {
+  for (const key of DASHBOARD_H5_ENV_KEYS) delete env[key];
+  for (const key of Object.keys(env)) {
+    if (key.startsWith(DASHBOARD_H5_ENV_PREFIX)) delete env[key];
+  }
+}
+
+/**
  * Env vars that must never reach a spawned CLI child. The bot's IM-app creds
  * (a child CLI's own Lark OAuth reads `process.env.LARK_APP_ID` as the app to
  * authorize and gets hijacked by the botmux IM app → no docs scopes → 403
- * loop), daemon-side GitHub API tokens, and claude-code's session markers
+ * loop), daemon-side GitHub API tokens, the Dashboard-only Feishu H5 login
+ * credentials (DASHBOARD_H5_ENV_KEYS), and claude-code's session markers
  * (CLAUDE_SESSION_MARKER_ENV_KEYS). The
  * child resolves Lark via the namespaced `BOTMUX_LARK_APP_ID` or via bots.json
  * on disk (im/lark/client.ts); the worker keeps its own bare creds
@@ -104,6 +165,12 @@ export const REDACTED_CHILD_ENV_KEYS = [
   'LARK_APP_SECRET',
   'GITHUB_TOKEN',
   'GH_TOKEN',
+  // Dashboard-only Feishu H5 login config/credential family — see
+  // DASHBOARD_H5_ENV_KEYS. Listed by exact name (not only swept by prefix in
+  // redactChildEnv) so the tmux pane wrapper `unset`s them too: on that backend
+  // the pane inherits the tmux SERVER's global env, which the client env cannot
+  // override.
+  ...DASHBOARD_H5_ENV_KEYS,
   ...CLAUDE_SESSION_MARKER_ENV_KEYS,
   // Parent-tmux client vars: when the daemon itself was started inside a tmux
   // session, process.env carries TMUX (server socket path) + TMUX_PANE. Leaking
@@ -381,5 +448,11 @@ export function isBotmuxManagedTmuxServerGlobalEnvKey(key: string): boolean {
 export function redactChildEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   for (const key of REDACTED_CHILD_ENV_KEYS) delete env[key];
+  // Minimum-exposure sweep for the Dashboard-only H5 login family: the named
+  // keys above are already gone, this also catches any BOTMUX_DASHBOARD_FEISHU_H5_*
+  // knob added later. No CLI child ever consumes one, so a prefix-wide strip
+  // cannot break a supported configuration channel. Same implementation as the
+  // daemon-boot / detached-restart strip so the two layers cannot drift.
+  stripDashboardH5Env(env);
   return env;
 }

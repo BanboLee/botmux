@@ -133,12 +133,19 @@ import {
 } from './bot-registry.js';
 import { readGlobalConfig } from './global-config.js';
 import {
-  deriveTerminalViewToken,
   deriveTerminalWriteToken,
   resolveTerminalAccessForRequest,
   safeTerminalTokenEqual,
   type TerminalAccessDecision,
 } from './core/terminal-write-auth.js';
+import {
+  deriveWorkerViewGeneration,
+  looksLikeTerminalControlGrant,
+  TERMINAL_VIEW_FORWARD_HEADER,
+  verifyTerminalControlGrant,
+  verifyTerminalViewForward,
+} from './core/terminal-control-grant.js';
+import { appendControlAudit, controlAuditRecord } from './dashboard/control-audit.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { loadDashboardSecret, loadPersistedToken } from './dashboard/auth.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
@@ -1830,8 +1837,14 @@ const readOnlyRemoteScrollLimiter = new ReadOnlyRemoteScrollLimiter({
 // daemon restart re-forks every worker — a per-process random token would 403
 // every previously-issued operate link).
 let writeToken = randomBytes(16).toString('hex');
-// Standalone/test fallback. Production replaces this after init with a stable
-// per-session HMAC derived from the host-only dashboard secret.
+// Per-BOOT random read capability, reported to the daemon in `ready` and
+// embedded in Feishu card 「打开 Web 终端」 links. Deliberately NOT the stable
+// per-session HMAC any more (P1-5): a stable view token could never be revoked
+// — a viewer who fetched it once kept terminal read access forever, across
+// worker restarts included. Per-boot randomness bounds every card link to this
+// worker generation (restart ⇒ all previously issued view tokens die), and the
+// dashboard view-link API mints its own short-lived signed read grants instead
+// of ever handing this value out (see resolveTerminalAccessForReq).
 let viewToken = randomBytes(32).toString('base64url');
 
 // Active dashboard token, persisted by the dashboard process at this stable
@@ -1840,11 +1853,6 @@ let viewToken = randomBytes(32).toString('base64url');
 // proves a request traversed the platform's authenticated front door.
 const DASHBOARD_TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
 const DASHBOARD_SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
-
-function refreshTerminalViewToken(): void {
-  const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
-  if (secret && sessionId) viewToken = deriveTerminalViewToken(secret, sessionId);
-}
 
 /** Re-derive the stable write (operate) token from the host-only dashboard
  *  secret so a restarted worker mints the SAME token — keeping already-issued
@@ -1869,14 +1877,101 @@ function refreshTerminalWriteToken(): void {
  * `botmux bind`/unbind and dashboard token rotation are hot-reloaded without
  * restarting this worker, so a cached value would go stale.
  */
-function resolveTerminalAccessForReq(req: IncomingMessage, url: URL): TerminalAccessDecision {
-  return resolveTerminalAccessForRequest(
+interface WorkerTerminalAccess extends TerminalAccessDecision {
+  /** Signed Dashboard identity used only for content-free input audit rows. */
+  auditUser?: string;
+  /** Fixed grant expiry. Writable WS connections are closed at this boundary. */
+  controlExpiresAt?: number;
+}
+
+function resolveTerminalAccessForReq(req: IncomingMessage, url: URL): WorkerTerminalAccess {
+  // P1-6 invariant: an explicit, matching write-link `?token=` is an
+  // independent capability with the HIGHEST priority. It wins outright — before
+  // the internal control-grant header is even looked at — so a central proxy
+  // that attaches a read-scope grant can never silently downgrade an explicitly
+  // issued 「操作链接」 to read-only for a viewer the platform authenticated as
+  // teammate/guest. (The front proxy additionally refrains from injecting a
+  // grant next to explicit query capabilities; this ordering makes the
+  // guarantee hold regardless of proxy behavior, not by accident of it.)
+  if (safeTerminalTokenEqual(url.searchParams.get('token'), writeToken)) {
+    return { hasRead: true, hasWrite: true, platformReadonly: false };
+  }
+  // `?viewToken=` read capability, two accepted forms (P1-5):
+  //   • this worker's per-boot random token (Feishu card links) — plain
+  //     equality; dies with the worker generation;
+  //   • a short-lived signed read grant minted by the dashboard view-link API.
+  // The retired stable per-session HMAC matches neither form, so every
+  // previously issued stable view token fails closed on this worker.
+  //
+  // The signed form is accepted ONLY when all four hold, because this worker
+  // has no view of dashboard logout state and a URL is trivially copied:
+  //   1. signature + expiry + session binding verify (stateless base check);
+  //   2. scope is `read` — a leaked write-scope loopback grant must never
+  //      double as a browser-shareable capability;
+  //   3. audience is `central` AND the central front proxy countersigned THIS
+  //      capability (X-Botmux-Terminal-View). That header is computed from the
+  //      host-only dashboard secret and is only emitted after the proxy checked
+  //      the capability's auth session is still live, so a raw view URL replayed
+  //      against this port — or against the daemon's own network-bound `/s/`
+  //      reverse proxy — cannot produce it and dies here;
+  //   4. the pinned worker generation matches this boot. A restart re-randomizes
+  //      `viewToken`, so grants minted for the previous boot fail closed even
+  //      though `.dashboard-secret` is unchanged.
+  // The WebSocket is additionally closed at the grant's expiresAt.
+  const viewParam = url.searchParams.get('viewToken');
+  let viewTokenMatches = safeTerminalTokenEqual(viewParam, viewToken);
+  let viewGrantUser: string | undefined;
+  let viewGrantExpiresAt: number | undefined;
+  if (!viewTokenMatches && looksLikeTerminalControlGrant(viewParam) && sessionId) {
+    const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
+    if (secret && verifyTerminalViewForward(secret, viewParam, req.headers[TERMINAL_VIEW_FORWARD_HEADER])) {
+      const viewGrant = verifyTerminalControlGrant(secret, viewParam, sessionId);
+      if (viewGrant.ok
+        && viewGrant.claims.scope === 'read'
+        && viewGrant.claims.audience === 'central'
+        && viewGrant.claims.workerGeneration === deriveWorkerViewGeneration(secret, viewToken)) {
+        viewTokenMatches = true;
+        viewGrantUser = viewGrant.claims.userId;
+        viewGrantExpiresAt = viewGrant.claims.expiresAt;
+      }
+    }
+  }
+  const legacy: WorkerTerminalAccess = resolveTerminalAccessForRequest(
     req.headers,
-    safeTerminalTokenEqual(url.searchParams.get('token'), writeToken),
-    safeTerminalTokenEqual(url.searchParams.get('viewToken'), viewToken),
+    false,
+    viewTokenMatches,
     () => readPlatformBinding() !== null,
     () => loadPersistedToken(DASHBOARD_TOKEN_PATH),
   );
+  if (viewGrantExpiresAt !== undefined && legacy.hasRead && !legacy.hasWrite) {
+    legacy.auditUser = viewGrantUser;
+    legacy.controlExpiresAt = viewGrantExpiresAt;
+  }
+  // Most terminal HTTP/WS requests use the query capabilities above. Avoid a
+  // second synchronous secret-file read on that hot path; only the central
+  // front proxy supplies this internal header.
+  if (req.headers['x-botmux-terminal-control'] === undefined) return legacy;
+  const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
+  if (!secret || !sessionId) return legacy;
+  const grant = verifyTerminalControlGrant(
+    secret,
+    req.headers['x-botmux-terminal-control'],
+    sessionId,
+  );
+  if (!grant.ok) return legacy;
+  return {
+    hasRead: true,
+    hasWrite: grant.claims.scope === 'write',
+    platformReadonly: grant.claims.scope === 'read',
+    auditUser: grant.claims.userId,
+    controlExpiresAt: grant.claims.expiresAt,
+  };
+}
+
+function auditTerminalInput(user: string | undefined, data: string): void {
+  appendControlAudit(controlAuditRecord(user ?? 'legacy-capability', sessionId, 'terminal.input', {
+    bytes: Buffer.byteLength(data),
+  }));
 }
 
 /** Lazily-written locked-mode zellij config for per-WS web-terminal attach
@@ -15302,21 +15397,59 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
     });
 
     wss.on('connection', (ws, req: IncomingMessage) => {
-      wsClients.add(ws);
-
-      // Read access was already checked before the WebSocket handshake. Resolve
-      // again here only to decide whether this client may write.
+      // P1-3 — the pre-handshake verdict is a SNAPSHOT, and this callback runs
+      // strictly after it: ws only completes the upgrade once verifyClient
+      // called back, and re-resolving access here re-reads `.dashboard-secret`
+      // synchronously. A capability whose expiry — or the worker generation it
+      // is pinned to, or the host secret it is signed under — turns over inside
+      // that window was authorized by the FIRST check and is already dead by
+      // this one. This callback used to recompute `access` but consume only
+      // `hasWrite`, so such a socket was registered in `wsClients`, seeded with
+      // the terminal scrollback, and — the second resolution carrying no
+      // controlExpiresAt — never given an expiry timer at all: an unbounded
+      // read-only stream outliving its own credential.
+      //
+      // FAIL CLOSED on the SECOND result instead. A socket that no longer
+      // resolves to read authority is closed before any registration, so it
+      // never joins a broadcast set and never receives the history seed; and
+      // the expiry timer below is armed from THIS resolution's expiresAt —
+      // never inherited from the handshake and never skipped.
       const url = parseWorkerRequestUrl(req);
       if (!url) {
         log(`Bad worker WS URL rejected: ${JSON.stringify(req.url ?? '')}`);
-        wsClients.delete(ws);
         ws.close(1008, 'Bad Request');
         return;
       }
-      const { hasWrite } = resolveTerminalAccessForReq(req, url);
+      const access = resolveTerminalAccessForReq(req, url);
+      const { hasRead, hasWrite, auditUser, controlExpiresAt } = access;
+      if (!hasRead || (controlExpiresAt !== undefined && controlExpiresAt <= Date.now())) {
+        log('WS client refused at the connection re-check: capability no longer valid');
+        ws.close(4003, 'authorization expired');
+        return;
+      }
+      wsClients.add(ws);
       const allowReadOnlyRemoteScroll = canHandleReadOnlyRemoteScroll();
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
+      // A signed Dashboard grant is fixed-expiry — for READ scope as much as
+      // for write (P1-5). Even if the central proxy's socket invalidation is
+      // delayed or bypassed, the worker independently removes any granted
+      // authority and closes this connection at the signed boundary; a
+      // reconnect must then present a still-valid credential. Read-only
+      // sockets used to outlive their authentication here; now they cannot.
+      let controlExpiryTimer: NodeJS.Timeout | undefined;
+      if (controlExpiresAt !== undefined) {
+        const expiredReason = hasWrite ? 'control expired' : 'view expired';
+        controlExpiryTimer = setTimeout(() => {
+          authedClients.delete(ws);
+          if (ws.readyState === WebSocket.OPEN) ws.close(4003, expiredReason);
+        }, Math.max(0, controlExpiresAt - Date.now()));
+        controlExpiryTimer.unref();
+      }
+      ws.once('close', () => {
+        if (controlExpiryTimer) clearTimeout(controlExpiryTimer);
+        authedClients.delete(ws);
+      });
 
       if (isTmuxMode && !isPipeMode && sessionId) {
         // ── Tmux-attach mode: per-client attach ──
@@ -15397,6 +15530,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // a mouse-aware TUI may bind any of them to approvals/actions.
               // A view capability therefore forwards no input bytes at all.
               if (!authedClients.has(ws)) return;
+              auditTerminalInput(auditUser, msg.data);
               if (cp) cp.write(msg.data);
               else pendingInput.push(msg.data);
             }
@@ -15441,7 +15575,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
             name: 'xterm-256color',
             cols,
             rows,
-            env: zellijEnv() as { [key: string]: string },
+            // redactChildEnv first, matching the tmux viewer above (tmuxEnv()
+            // folds REDACTED_CHILD_ENV_KEYS into its own strip set, zellijEnv()
+            // only drops ZELLIJ*). A viewer client needs none of the daemon's
+            // secrets — bare IM-app creds, GitHub tokens, or the Dashboard H5
+            // credentials — so it must not carry them into a pty it owns.
+            env: zellijEnv(redactChildEnv(process.env)) as { [key: string]: string },
           });
           attachStarted = true;
           observeBe?.setLiveAttach(true);
@@ -15467,6 +15606,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               else cp.resize(msg.cols, msg.rows);
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               if (!authedClients.has(ws)) return;
+              auditTerminalInput(auditUser, msg.data);
               if (cp) cp.write(msg.data);
               else pendingInput.push(msg.data);
             }
@@ -15543,6 +15683,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // Mouse protocols can encode approvals/actions as well as wheel input.
               // A read-only view capability must never forward bytes to the backend.
               if (!authedClients.has(ws)) return;
+              auditTerminalInput(auditUser, msg.data);
               if (usesHerdrSnapshotWebHistory()) {
                 if (msg.data.includes('\x1b[<64;')) herdrWebScrollDirection = 'up';
                 else if (msg.data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';
@@ -15731,12 +15872,46 @@ if(!hasToken){
   else{var _rb=document.getElementById('readonly-banner');_rb.classList.add('show');_rb.addEventListener('click',function(){_rb.classList.remove('show')});}
 }
 
+// ── 终端字号按容器宽度自适应 ─────────────────────────────────────────────────
+// xterm 的 fontSize 是这一页唯一的几何输入：字号写死，列数就只能被容器宽度被动
+// 决定。14px 是照桌面宽度调的，手机把这一页直嵌进 390px 宽的 iframe 之后一行只
+// 剩约 44 列 —— 字大得离谱，CLI 的 TUI 还被迫在 44 列上硬折行，逻辑行换行稀碎。
+// 这里把因果反过来：先定一个可读的目标列数，再由容器实际宽度反推字号。
+//
+// _WB_FONT_ADVANCE 是等宽字体的标称「字宽 / 字号」比（JetBrains Mono、Fira Code、
+// Menlo、DejaVu Sans Mono 都是 0.6），只用于估算；真实列数仍由 xterm 量完字体后
+// 自己 fit() 出来，估算偏一点最多让列数在目标附近浮动，不会错位。
+// 只缩不放：算出来比 _WB_FONT_BASE 大一律按 base 走，所以宽度够（约 521px 以上）
+// 的桌面一律还是 14px，存量渲染零变化；窄容器才往下缩，最低到 _WB_FONT_MIN。
+//
+// 注意：这一整段在 worker.ts 的模板字符串里，注释和代码都不能出现反引号，
+// 也不能出现「美元号 + 左花括号」的插值起始序列，否则会把模板字符串截断。
+var _WB_FONT_MIN=9,_WB_FONT_MAX=15,_WB_FONT_BASE=14,_WB_FONT_ADVANCE=.6,_WB_TARGET_COLS=62;
+function _wbAutoFontSize(width){
+  if(!(width>0))return _WB_FONT_BASE;
+  var ideal=width/(_WB_TARGET_COLS*_WB_FONT_ADVANCE);
+  var capped=ideal>_WB_FONT_BASE?_WB_FONT_BASE:ideal;
+  // 半档取整：比整数细一档，又不会停在容易糊掉的亚像素字号上。
+  var stepped=Math.round(capped*2)/2;
+  // 硬边界：字号是这一页唯一的几何输入，任何异常宽度都不许把它推到读不了的档位。
+  if(stepped<_WB_FONT_MIN)return _WB_FONT_MIN;
+  if(stepped>_WB_FONT_MAX)return _WB_FONT_MAX;
+  return stepped;
+}
+function _wbTerminalWidth(){
+  var host=document.getElementById('terminal');
+  var w=host?host.clientWidth:0;
+  if(w>0)return w;
+  // 容器还没布局出宽度（隐藏面板、刚插进 DOM 的 iframe）时退回视口宽；再量不到就
+  // 返回 0，_wbAutoFontSize 保持基准字号，等尺寸事件到了再纠正。
+  return window.innerWidth||0;
+}
 var term=new Terminal({
   theme:{background:'#1a1b26',foreground:'#a9b1d6',cursor:'#c0caf5',
     selectionBackground:'#33467c',black:'#15161e',red:'#f7768e',
     green:'#9ece6a',yellow:'#e0af68',blue:'#7aa2f7',magenta:'#bb9af7',
     cyan:'#7dcfff',white:'#a9b1d6'},
-  fontSize:14,fontFamily:"'JetBrains Mono','Fira Code',monospace",
+  fontSize:_wbAutoFontSize(_wbTerminalWidth()),fontFamily:"'JetBrains Mono','Fira Code',monospace",
   cursorBlink:!isTouch,scrollback:50000,allowProposedApi:true
 });
 var fit=new FitAddon.FitAddon();
@@ -15756,7 +15931,53 @@ try{
 }catch(_e){
   try{term.loadAddon(new CanvasAddon.CanvasAddon())}catch(_e2){}
 }
+// 首帧字号已经在 new Terminal 里按容器宽度定好了；这个函数负责后续尺寸变化
+// （转屏、iframe 改宽、分屏、地址栏收放）时复算。返回 true 表示字号真的换了档。
+function _wbApplyAutoFontSize(){
+  var next=_wbAutoFontSize(_wbTerminalWidth());
+  if(term.options.fontSize===next)return false;
+  term.options.fontSize=next;
+  return true;
+}
 fit.fit();
+// 工作台下发的终端外观（消息类型 botmux:wb-appearance）。终端画布住在这个跨文档
+// iframe 里，父页换 class / 换 CSS 变量都传不进来，配色只能靠 postMessage 递过来。
+// 注意：这一整段在 worker.ts 的模板字符串里，注释和代码都不能出现反引号，
+// 也不能出现「美元号 + 左花括号」的插值起始序列，否则会把模板字符串截断。
+// 安全边界：这个页面会被跨 origin 嵌入，因此只认 window.parent 发来的、结构完全
+// 对得上的消息，且每个颜色都必须是 #rgb / #rrggbb 十六进制字面量；少一个键、多一个
+// 非法值，整条消息丢弃（宁可保持现状，也不要把半套主题刷到画布上）。
+var _WB_THEME_KEYS=['background','foreground','cursor','selectionBackground',
+  'black','red','green','yellow','blue','magenta','cyan','white'];
+function _wbSanitizeTheme(raw){
+  if(!raw||typeof raw!=='object')return null;
+  var out={};
+  for(var _i=0;_i<_WB_THEME_KEYS.length;_i++){
+    var _k=_WB_THEME_KEYS[_i],_v=raw[_k];
+    if(typeof _v!=='string'||!/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(_v))return null;
+    out[_k]=_v;
+  }
+  return out;
+}
+window.addEventListener('message',function(_ev){
+  if(_ev.source===window||_ev.source!==window.parent)return;
+  var _d=_ev.data;
+  if(!_d||_d.type!=='botmux:wb-appearance')return;
+  var _theme=_wbSanitizeTheme(_d.theme);
+  if(!_theme)return;
+  try{
+    term.options.theme=_theme;
+    // 阅读风是大行距 1.3；经典保持 xterm 默认的 1，「经典 = 原样」的一部分。
+    // 经典那套色值与上面写死的字面量逐色相同，所以没开阅读风的用户零变化。
+    // 这两个数字的唯一出处是 WORKBENCH_TERM_LINE_HEIGHTS（agent-workbench-appearance.ts），
+    // 接缝测试按那张表比对这一行的字面量：改一处必须两处一起改。
+    // 曾经是 1.55，单元格高约 24.5px，CLI 底部那块固定 8 行的 chrome（提示 + 输入框 +
+    // 状态条）就要占掉约 196px —— 一屏四分之一全是 chrome，正文被挤走。
+    term.options.lineHeight=_d.termStyle==='reader'?1.3:1;
+    // 行距变了可视行数就变，必须复算一次。几何契约不动：只有画布内重绘。
+    fit.fit();
+  }catch(_e){}
+});
 // xterm parses writes asynchronously.  On a brand-new page the first tmux /
 // zellij frame (or relay history seed) can therefore finish after the browser
 // has initialised the viewport scrollbar, leaving that viewport at scrollTop=0
@@ -15973,9 +16194,25 @@ function sendResize(){
 // text re-wraps, i.e. the reported flicker. Coalesce to the settled size.
 function onViewportResize(){
   clearTimeout(_rzT);
-  _rzT=setTimeout(function(){if(!fixedSize){try{fit.fit()}catch(e){}}sendResize()},250);
+  _rzT=setTimeout(function(){
+    // 先复算字号再 fit：字号换档字宽就变，反过来 fit 出来的是旧字号下的列数。
+    // 只动画布内的渲染几何，与后端的 resize 语义一如既往由下面的 sendResize 决定。
+    try{_wbApplyAutoFontSize()}catch(e){}
+    if(!fixedSize){try{fit.fit()}catch(e){}}
+    sendResize();
+  },250);
 }
 window.addEventListener('resize',onViewportResize);
+// 转屏：部分 iOS 版本只发 orientationchange 或先于 resize 发，重复触发被防抖吃掉。
+window.addEventListener('orientationchange',onViewportResize);
+// 嵌入方（工作台终端面板、会话坞）单独改 iframe 宽度时，窗口 resize 未必可靠地传
+// 进来。直接盯容器自己的尺寸，这一页才真正自包含 —— 任何嵌入方都跟着受益。
+if(typeof ResizeObserver!=='undefined'){
+  try{
+    var _wbHost=document.getElementById('terminal');
+    if(_wbHost)new ResizeObserver(onViewportResize).observe(_wbHost);
+  }catch(_e){}
+}
 (function connect(){
   // Derive base from the current path so the WS connects to the same prefix the
   // page was served under — works both directly (path '/') and behind the
@@ -16727,7 +16964,8 @@ process.on('message', async (raw: unknown) => {
       initialInputOwnershipPending = !!msg.prompt;
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
-      refreshTerminalViewToken();
+      // The view token intentionally stays per-boot random (no refresh): a
+      // worker restart must invalidate every previously issued read link.
       refreshTerminalWriteToken();
       applySessionOwnerEnv(process.env, msg.ownerOpenId);
       // Pin this worker's i18n locale early so every t() call below resolves
