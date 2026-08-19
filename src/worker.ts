@@ -28,6 +28,16 @@ import {
   buildSeatbeltProfile,
   isolatedPaneOriginChannel,
   isolatedPaneReattachSafe,
+  evaluatePersistentPaneMigration,
+  executePersistentPaneMigration,
+  type PersistentPaneMigrationEffects,
+  persistentTeardownKillKind,
+  isolationPaneMarkerPath,
+  policyOffTombstonePath,
+  policyOffTombstoneContent,
+  policyOffTombstoneValid,
+  provenancePendingContent,
+  provenancePendingNonce,
   sendCredFilePath,
   botHomePath,
   buildCliExecutableReadCarveOuts,
@@ -12179,17 +12189,65 @@ async function spawnCli(
   // so the probe below sees no pane and we cold-spawn fresh isolated. A pane from
   // this lifetime (suspend→resume) keeps its marker → reattaches normally (it is
   // still the isolated process). This lets isolated bots use tmux/zellij/herdr.
+  //
+  // The MIRROR case is just as load-bearing: policy is now OFF (no sandbox, not
+  // enrolled → appliedIsolationCapabilities empty), but a pane spawned by an OLDER
+  // build under the previous FORCED no-transport isolation is still alive AND still
+  // stamped. That pane runs confined against a policy we no longer want; a bare
+  // `capabilities.length > 0` gate would skip the check entirely and warm-reattach
+  // the still-isolated process, silently contradicting "read scope follows local
+  // config" on resume/restart (the 2026-08 no-transport放宽 upgrade path). So we
+  // also enter when a boot marker is present on disk for THIS session — then the
+  // policy-off arm below (no expected capabilities) demands the marker be truly
+  // absent to reattach, else kills + cold-spawns unconfined. Presence is checked
+  // by the no-follow existence probe (a planted/tampered leaf that reads as null
+  // still counts as present, so it cannot be used to force a silent reattach).
   let persistentPaneOriginChannelId: string | undefined;
-  if (appliedIsolationCapabilities.length > 0 && persistentSessionName && effectiveBackendType !== 'pty') {
+  const stalePaneMarkerPath = isolationPaneMarkerPath(isolationRuntimeDataDir, cfg.sessionId);
+  const policyOffTombstoneFilePath = policyOffTombstonePath(isolationRuntimeDataDir, cfg.sessionId);
+  // no-transport (apiOnly bot OR HTTP virtual chat) is the ONLY session shape the
+  // removed force-isolation rule ever confined; the policy-off migration arm is
+  // scoped to it so an ordinary transport-enabled chat is never subjected to the
+  // tombstone requirement (no false kills). Computed locally — the merge-scoped
+  // `noTransport` above is out of scope here.
+  const noTransportSession = cfg.apiOnly === true
+    || cfg.chatId?.startsWith('http_async_') === true
+    || cfg.chatId?.startsWith('http_wait_') === true;
+  const isolationCapableBackend = effectiveBackendType === 'tmux';
+  // Existence via no-follow probes so a planted/tampered leaf still counts as
+  // present (→ triggers cleanup / conservative kill) and can never be used to
+  // force a silent reattach.
+  const stalePaneMarkerPresent = hostEntryExistsNoFollow(stalePaneMarkerPath);
+  const policyOffTombstonePresent = hostEntryExistsNoFollow(policyOffTombstoneFilePath);
+  // The guard must ENTER the state machine whenever it could have anything to
+  // decide, WITHOUT depending on provenance already being present for the live-
+  // pane arms — else a no-transport pane whose best-effort isolation marker write
+  // was lost would (NEITHER file) skip the guard and warm-reattach still confined.
+  // Enter for:
+  //   · any policy-ON spawn (capability check runs on every persistent backend,
+  //     incl. credential-only zellij/herdr/zmx), OR
+  //   · a policy-OFF no-transport tmux session (the file-sandbox migration scope), OR
+  //   · ANY session (incl. transport-enabled, any backend) that has stale
+  //     provenance on disk — so a dead pane's leftover marker/tombstone is cleared
+  //     before cold-spawn on EVERY backend. Otherwise a transport chat that turned
+  //     sandbox OFF leaves a matching marker that would later warm-reattach a fresh
+  //     UNisolated pane as "isolated" when sandbox is re-enabled.
+  const persistentPaneGuardApplies = appliedIsolationCapabilities.length > 0
+    || (noTransportSession && isolationCapableBackend)
+    || stalePaneMarkerPresent || policyOffTombstonePresent;
+  if (persistentSessionName && effectiveBackendType !== 'pty' && persistentPaneGuardApplies) {
     const persistentTarget = selectedBackend.persistentBackendTarget;
     // ZMX ownership is verified against the frozen PID, not just the name — a
     // same-named session may belong to the user or to a newer generation.
     const zmxOwnedProbe = effectiveBackendType === 'zmx'
       ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid)
       : undefined;
-    // ZMX ownership is label/PID-sensitive, so an inconclusive ZMX probe must
-    // fail closed. Other persistent backends retain the upstream semantics:
-    // their target probe returning unknown is not proof that a pane exists.
+    // ZMX ownership is label/PID-sensitive, so an inconclusive ZMX probe is not
+    // proof of anything. Other persistent backends: their target probe returning
+    // unknown is likewise not proof that a pane exists. Liveness is passed TRI-STATE
+    // (paneProbe) into the state machine, which fail-closes on `unknown` for EVERY
+    // backend (refuse-inconclusive-probe) — no longer only ZMX, and no longer
+    // collapsed into "dead" (which would clear a still-confined pane's provenance).
     const paneProbe = zmxOwnedProbe?.probe
       ?? (persistentTarget ? probePersistentBackendTarget(persistentTarget) : 'missing');
     if (
@@ -12202,91 +12260,119 @@ async function spawnCli(
         'ZMX session appeared after the frozen launch probe',
       );
     }
-    if (effectiveBackendType === 'zmx' && paneProbe === 'unknown') {
-      throw new Error(
-        `[read-isolation] refusing to start session ${cfg.sessionId}: ` +
-        `could not verify existing ${effectiveBackendType} pane`,
-      );
-    }
     const paneLive = paneProbe === 'exists';
-    if (paneLive) {
-      const markerPath = join(
-        isolationRuntimeDataDir, 'read-isolation', `${cfg.sessionId}.boot`,
-      );
-      const marker = readManagedOriginAuthorityFile(markerPath);
-      const originChannelPolicyExpected = !!managedOriginChannelPolicyDigest;
-      // A stamped pane must match even when the new policy is OFF. Otherwise a
-      // disable followed by restart could reattach the still-confined process
-      // without rebuilding its authority/profile. An unsafe planted marker
-      // leaf is treated as stamped/unknown by the no-follow existence check.
-      const policyMatches = appliedIsolationCapabilities.length > 0
-        ? isolatedPaneReattachSafe(marker, {
-            requiredCapabilities: appliedIsolationCapabilities,
-            exactCapabilities: true,
-            ...(originChannelPolicyExpected ? {
-              readIsolation: willReadIsolate,
-              writeSandbox: willWriteSandbox,
-              requireOriginChannel: true,
-              policyDigest: managedOriginChannelPolicyDigest,
-            } : {}),
-          })
-        : marker === null && !hostEntryExistsNoFollow(markerPath);
-      if (policyMatches) {
-        if (originChannelPolicyExpected) {
-          persistentPaneOriginChannelId = isolatedPaneOriginChannel(marker);
-        }
-        // Pane was spawned under the current isolation policy → still confined
-        // on the running process across daemon restarts; warm reattach preserves
-        // resume/context + tmux idle-suspend.
-        log(`[read-isolation] reattaching isolated persistent pane (${cfg.sessionId})`);
-      } else {
-        // Missing/legacy marker → pane predates the current policy and may retain
-        // obsolete permissions. Kill it before publishing any new capability.
-        log(`[read-isolation] legacy/unmarked persistent pane for ${cfg.sessionId} — killing + cold-spawning with current policy`);
-        // Capture the name before re-selection: `persistentSessionName` is
-        // reassigned from the new selection below and widens back to
-        // `string | undefined`, but the backing name we are tearing down is
-        // this one and does not change.
-        const staleSessionName = persistentSessionName;
-        const stalePersistentTarget = selectedBackend.persistentBackendTarget;
+    const markerPath = stalePaneMarkerPath;
+    const marker = paneLive ? readManagedOriginAuthorityFile(markerPath) : null;
+    const originChannelPolicyExpected = !!managedOriginChannelPolicyDigest;
+    // isolatedPaneReattachSafe only means anything under a policy-ON spawn; the
+    // state machine consults it only in that arm.
+    const isolationMarkerReattachSafe = appliedIsolationCapabilities.length > 0
+      && isolatedPaneReattachSafe(marker, {
+        requiredCapabilities: appliedIsolationCapabilities,
+        exactCapabilities: true,
+        ...(originChannelPolicyExpected ? {
+          readIsolation: willReadIsolate,
+          writeSandbox: willWriteSandbox,
+          requireOriginChannel: true,
+          policyDigest: managedOriginChannelPolicyDigest,
+        } : {}),
+      });
+    // Tombstone authorizes a policy-off warm reattach ONLY when it passes a SECURE
+    // read (real 0600 regular file, right owner) + schema/version validation — a
+    // bare lstat "present" (empty / dir / symlink / garbage) must NOT authorize.
+    // Presence (above) still drives cleanup; validity drives authorization.
+    const policyOffTombstoneIsValid = paneLive && policyOffTombstonePresent
+      && policyOffTombstoneValid(readManagedOriginAuthorityFile(policyOffTombstoneFilePath));
+    // PENDING provenance: a present marker OR tombstone whose secure-read body is a
+    // `state:'pending'` record. This is a generation whose fresh-attribution never
+    // completed (crash between pending-write and commit, or an uncommitted
+    // late-flip/collision). It DOMINATES the state machine (all backends, both
+    // policy directions) — see evaluatePersistentPaneMigration. Secure-read (not
+    // lstat) because only a real 0600 file we wrote can be a trusted pending
+    // record; a planted/garbage leaf reads as null → not pending → falls through
+    // to the normal presence-but-invalid handling (still conservative).
+    const pendingProvenancePresent =
+      (stalePaneMarkerPresent
+        && provenancePendingNonce(readManagedOriginAuthorityFile(stalePaneMarkerPath)) !== null)
+      || (policyOffTombstonePresent
+        && provenancePendingNonce(readManagedOriginAuthorityFile(policyOffTombstoneFilePath)) !== null);
+    const migration = evaluatePersistentPaneMigration({
+      appliedIsolationCapabilities,
+      isolationCapableBackend,
+      noTransport: noTransportSession,
+      isolationMarkerPresent: stalePaneMarkerPresent,
+      policyOffTombstonePresent,
+      policyOffTombstoneValid: policyOffTombstoneIsValid,
+      paneProbe,
+      pendingProvenancePresent,
+      isolationMarkerReattachSafe,
+    });
+    // Verified removal of a provenance file: unlink then confirm it is truly gone
+    // (no-follow). A leaf we cannot remove (directory / planted / perm) must FAIL
+    // CLOSED — never fall through to publish a new generation, or a later restart
+    // re-reads the stale proof and mis-kills the fresh pane in a loop.
+    const removeProvenanceOrThrow = (path: string, label: string): void => {
+      try { unlinkSync(path); } catch { /* may already be absent — verified below */ }
+      if (hostEntryExistsNoFollow(path)) {
+        throw new Error(
+          `[read-isolation] refusing to start session ${cfg.sessionId}: `
+          + `could not remove stale ${label} at ${path}`,
+        );
+      }
+    };
+    // Capture the stale name/target BEFORE any re-selection below (reselect
+    // reassigns persistentSessionName and widens it back to string | undefined).
+    const staleSessionName = persistentSessionName;
+    const stalePersistentTarget = selectedBackend.persistentBackendTarget;
+    const migrationEffects: PersistentPaneMigrationEffects = {
+      killStalePane: () => {
         try {
           // ZMX keeps its own call here rather than going through the target
           // helper: only this path holds the frozen PID, which makes the
           // ownership check stricter than the name+label check.
           if (effectiveBackendType === 'zmx') {
-            ZmxBackend.killManagedSession(
-              persistentSessionName,
-              cfg.sessionId,
-              resolvedZmxSessionPid,
-            );
+            ZmxBackend.killManagedSession(staleSessionName, cfg.sessionId, resolvedZmxSessionPid);
+          } else if (stalePersistentTarget) {
+            killPersistentBackendTarget(stalePersistentTarget, cfg.sessionId);
           } else {
-            if (stalePersistentTarget) killPersistentBackendTarget(stalePersistentTarget, cfg.sessionId);
-            else killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName, cfg.sessionId);
+            killPersistentSession(effectiveBackendType as PersistentBackendType, staleSessionName, cfg.sessionId);
           }
         } catch (e) {
           throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: could not kill stale persistent pane (${(e as Error).message})`);
         }
+      },
+      confirmPaneGone: () => {
         const postKillProbe = effectiveBackendType === 'zmx'
           ? probeOwnedZmxSession(staleSessionName, cfg.sessionId).probe
           : (stalePersistentTarget
             ? probePersistentBackendTarget(stalePersistentTarget)
-            : probePersistentSession(
-                effectiveBackendType as PersistentBackendType,
-                staleSessionName,
-              ));
-        if (shouldRejectPersistentPostKillProbe(
-          effectiveBackendType as PersistentBackendType,
-          postKillProbe,
-        )) {
+            : probePersistentSession(effectiveBackendType as PersistentBackendType, staleSessionName));
+        // Migration teardown fail-closes on ANY non-`missing` post-kill probe for
+        // EVERY backend — not just ZMX. `exists` (kill didn't take) and `unknown`
+        // (kill unconfirmed: tmux swallows kill errors incl. timeout, zellij does
+        // not check its spawnSync exit) both mean "the confined pane may still be
+        // alive", so publishing a new generation around it would silently keep the
+        // old confinement. Only an authoritative `missing` confirms termination.
+        // (This is STRICTER than the shared shouldRejectPersistentPostKillProbe,
+        // which the separate mcp-gateway gate still uses with its own semantics.)
+        if (postKillProbe !== 'missing') {
           throw new Error(
-            `[read-isolation] refusing to start session ${cfg.sessionId}: ` +
-            `could not confirm stale ${effectiveBackendType} pane termination`,
+            `[read-isolation] refusing to start session ${cfg.sessionId}: `
+            + `could not confirm stale ${effectiveBackendType} pane termination `
+            + `(post-kill probe: ${postKillProbe})`,
           );
         }
         if (effectiveBackendType === 'zmx') {
           resolvedZmxSessionProbe = postKillProbe;
           resolvedZmxSessionPid = undefined;
         }
+      },
+      clearProvenanceVerified: () => {
+        // Clear BOTH files (verified). Order-independent — both must end absent.
+        if (stalePaneMarkerPresent) removeProvenanceOrThrow(stalePaneMarkerPath, 'isolation marker');
+        if (policyOffTombstonePresent) removeProvenanceOrThrow(policyOffTombstoneFilePath, 'policy-off tombstone');
+      },
+      reselectBackend: () => {
         // ZMX backend selection consumes the frozen probe. Refresh it before
         // re-selecting or the replacement keeps isReattach=true for the pane
         // that this gate just proved was removed.
@@ -12297,8 +12383,39 @@ async function spawnCli(
         backend = selectedBackend.backend;
         cliLifetimeNonce++;
         persistentSessionName = selectedBackend.persistentSessionName;
+      },
+      refuseInconclusiveProbe: (): never => {
+        // The liveness probe was `unknown` where acting would be unsafe (the pane
+        // may still be alive AND still confined under an obsolete policy). No
+        // provenance is touched, no reselect — fail closed and let the next launch
+        // re-probe once the backend is answering again.
+        throw new Error(
+          `[read-isolation] refusing to start session ${cfg.sessionId}: `
+          + `could not verify existing ${effectiveBackendType} pane `
+          + `(liveness probe: ${paneProbe})`,
+        );
+      },
+    };
+    if (migration.action === 'reattach') {
+      if (originChannelPolicyExpected) {
+        persistentPaneOriginChannelId = isolatedPaneOriginChannel(marker);
       }
+      // Pane matches the current policy (isolated pane stamped under it, or a
+      // no-transport pane with a VALIDATED policy-off tombstone) → still valid on
+      // the running process across daemon restarts; warm reattach preserves
+      // resume/context + tmux idle-suspend.
+      log(`[read-isolation] reattaching persistent pane under current policy (${cfg.sessionId})`);
+    } else if (migration.action === 'clear-stale-then-cold-spawn') {
+      log(`[read-isolation] clearing stale provenance for dead pane before cold-spawn (${cfg.sessionId})`);
+    } else if (migration.action === 'kill-then-cold-spawn') {
+      log(`[read-isolation] persistent pane provenance mismatch for ${cfg.sessionId} — killing + cold-spawning with current policy`);
+    } else if (migration.action === 'refuse-inconclusive-probe') {
+      log(`[read-isolation] inconclusive liveness probe (${paneProbe}) for ${cfg.sessionId} — refusing to start rather than clear/cold-spawn around a possibly-live confined pane`);
     }
+    // Ordered, fail-closed side effects (kill → confirm → clear → reselect) live
+    // in executePersistentPaneMigration so the ordering + stop-on-failure
+    // guarantees are unit-testable with injected mocks.
+    executePersistentPaneMigration(migration, migrationEffects);
   }
   readIsolationOriginChannelId = managedOriginChannelRequired
     ? (persistentPaneOriginChannelId ?? randomBytes(32).toString('hex'))
@@ -13485,16 +13602,53 @@ async function spawnCli(
       log(`Sandbox ON (${cfg.cliId}, fs-policy ${policy.rules.length} rules): outbox=${sbx.outbox}`);
     }
   }
-  // Fresh sandboxed spawn on a persistent backend: stamp the pane with this
-  // daemon's boot id so a later reattach can be trusted (see the stale-pane
-  // guard above). pty needs no marker (never reattached).
+  // Fresh spawn on a persistent backend: write a PENDING generation proof BEFORE
+  // the pane is created, then COMMIT it after spawn only once the fresh generation
+  // is attributably established (see the post-spawn commit below). pty needs no
+  // marker (never reattached).
+  //
+  // Why pending-then-commit and not a single pre-spawn write: `backend.spawn()` may
+  // bind this launch to a LATE-ARRIVING same-named pane (zellij/TmuxBackend
+  // dynamically flip fresh→reattach; TmuxPipe/herdr/zmx throw on collision). A
+  // committed proof written before spawn would then "certify" a foreign/unknown-
+  // confinement pane the worker never actually created fresh — a circular,
+  // self-written proof. So we write PENDING first (both validators reject it, its
+  // presence drives the conservative guard), and only rewrite it to committed after
+  // spawn confirms a genuine fresh generation.
+  //
+  // Policy ON → ISOLATION marker; policy OFF on a no-transport isolation-capable
+  // (tmux) session → POLICY-OFF TOMBSTONE. The tombstone is tmux-only
+  // (isolationCapableBackend === tmux), so the policy-off circular-proof concern is
+  // fully closed synchronously. See PersistentPaneCommit below for the ZELLIJ
+  // exception (option B: isolation-capable zellij stays pending → always cold-spawn).
+  type PersistentPaneCommit = {
+    path: string;
+    nonce: string;
+    committedContent: string;
+    /** Also clear this sibling proof (mutual exclusivity) at commit time, verified. */
+    clearSiblingPath?: string;
+    label: string;
+  };
+  let pendingProvenanceCommit: PersistentPaneCommit | null = null;
   if (appliedIsolationCapabilities.length > 0 && persistentSessionName && !willReattachPersistent) {
+    // Policy-ON isolation marker. The PENDING write is a spawn-time ADMISSION
+    // PRECONDITION, NOT best-effort: if we cannot durably record the pending proof
+    // and then backend.spawn() dynamically reattaches a late-arriving same-named
+    // pane (zellij/TmuxBackend flip), the whole commit/teardown block below —
+    // gated on pendingProvenanceCommit — would be SKIPPED, so the late-flip
+    // teardown never runs and this launch keeps running attached to an
+    // unattributed generation. "No committed proof → next launch cold-spawns" only
+    // protects the NEXT launch, not THIS one. So a write failure must FAIL CLOSED
+    // here (throw before spawn), exactly like the policy-off arm.
     try {
-      const markerDir = join(isolationRuntimeDataDir, 'read-isolation');
-      mkdirSync(markerDir, { recursive: true });
-      replaceManagedOriginCapabilityFile(
-        join(markerDir, `${cfg.sessionId}.boot`),
-        isolationPaneMarkerContent(
+      mkdirSync(join(isolationRuntimeDataDir, 'read-isolation'), { recursive: true });
+      const nonce = randomBytes(32).toString('hex');
+      const markerPath = isolationPaneMarkerPath(isolationRuntimeDataDir, cfg.sessionId);
+      replaceManagedOriginCapabilityFile(markerPath, provenancePendingContent(nonce));
+      pendingProvenanceCommit = {
+        path: markerPath,
+        nonce,
+        committedContent: isolationPaneMarkerContent(
           cfg.daemonBootId ?? '',
           appliedIsolationCapabilities,
           managedOriginChannelPolicyDigest
@@ -13506,8 +13660,43 @@ async function spawnCli(
               }
             : undefined,
         ),
+        // A committed policy-ON generation must not carry a stale policy-off
+        // tombstone (a later flip to policy-off could read it as a no-sandbox gen).
+        clearSiblingPath: policyOffTombstonePath(isolationRuntimeDataDir, cfg.sessionId),
+        label: 'isolation marker',
+      };
+    } catch (e) {
+      throw new Error(
+        `[read-isolation] refusing to start session ${cfg.sessionId}: `
+        + `could not record pending isolation-marker generation proof (${(e as Error).message})`,
       );
-    } catch { /* non-fatal: worst case a same-lifetime reattach cold-spawns instead */ }
+    }
+  } else if (appliedIsolationCapabilities.length === 0 && persistentSessionName
+      && !willReattachPersistent && noTransportSession && isolationCapableBackend) {
+    // Policy-OFF generation proof (tmux-only: isolationCapableBackend === tmux).
+    // NOT best-effort: if we cannot durably record the PENDING proof we must fail
+    // closed rather than spawn a pane we can never prove. The committed tombstone
+    // is written post-spawn only on a confirmed fresh generation.
+    try {
+      mkdirSync(join(isolationRuntimeDataDir, 'read-isolation'), { recursive: true });
+      const nonce = randomBytes(32).toString('hex');
+      const tombstonePath = policyOffTombstonePath(isolationRuntimeDataDir, cfg.sessionId);
+      replaceManagedOriginCapabilityFile(tombstonePath, provenancePendingContent(nonce));
+      pendingProvenanceCommit = {
+        path: tombstonePath,
+        nonce,
+        committedContent: policyOffTombstoneContent(cfg.daemonBootId ?? ''),
+        // A committed policy-off generation must not be shadowed by a stale
+        // isolation marker (which DOMINATES the tombstone in the guard).
+        clearSiblingPath: isolationPaneMarkerPath(isolationRuntimeDataDir, cfg.sessionId),
+        label: 'policy-off tombstone',
+      };
+    } catch (e) {
+      throw new Error(
+        `[read-isolation] refusing to start session ${cfg.sessionId}: `
+        + `could not record pending policy-off generation proof (${(e as Error).message})`,
+      );
+    }
   }
 
   // 通用启动前缀（wrapperCli）：把启动命令重写成 `<wrapperCli> <CLI 参数>`（首 token 当
@@ -13816,6 +14005,118 @@ async function spawnCli(
   }
   const actuallyReattachedPersistent = 'isReattach' in backend
     && backend.isReattach === true;
+  // ── Generational-race commit/teardown for the read-isolation provenance proof ──
+  // We wrote a PENDING proof before spawn (pendingProvenanceCommit). Now that spawn
+  // has returned we know whether a FRESH generation was actually established.
+  if (pendingProvenanceCommit) {
+    const commit = pendingProvenanceCommit;
+    // Verified removal of a proof file: unlink then confirm truly gone (no-follow).
+    // A leaf we cannot remove must FAIL CLOSED — never leave an ambiguous proof.
+    const removeProofOrThrow = (path: string, label: string): void => {
+      try { unlinkSync(path); } catch { /* may already be absent — verified below */ }
+      if (hostEntryExistsNoFollow(path)) {
+        throw new Error(
+          `[read-isolation] refusing to start session ${cfg.sessionId}: `
+          + `could not remove ${label} at ${path}`,
+        );
+      }
+    };
+    // Teardown the exact just-launched target, confirm authoritative `missing`,
+    // and only THEN keep/clear the pending proof per the tri-state result. On a
+    // non-missing (exists/unknown) post-kill probe we KEEP the pending proof and
+    // refuse — never erase evidence of a possibly-live pane.
+    //
+    // CRITICAL: kill the EXACT backend target, NOT the session name. An isolated /
+    // MCP herdr task lives as an agent on the SHARED host session `botmux`
+    // (target = {sessionName:'botmux', agentName:<this topic>}); a name-only
+    // killPersistentSession('herdr','botmux') would tear down the whole shared host
+    // (every bot/topic agent). Mirror the migration effects' killStalePane /
+    // confirmPaneGone: target helper for herdr's agent scope, frozen-PID path for
+    // ZMX identity, name only as the last-resort fallback when no target exists.
+    const teardownTarget = selectedBackend.persistentBackendTarget;
+    const tearDownAndRefuse = (why: string): never => {
+      if (persistentSessionName) {
+        // Pure policy (behaviorally tested): herdr's shared-host agent MUST be
+        // killed via its target, never by the 'botmux' session name.
+        const killKind = persistentTeardownKillKind({
+          backendType: effectiveBackendType,
+          hasBackendTarget: !!teardownTarget,
+        });
+        try {
+          if (killKind === 'zmx') {
+            ZmxBackend.killManagedSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid);
+          } else if (killKind === 'target') {
+            killPersistentBackendTarget(teardownTarget!, cfg.sessionId);
+          } else {
+            killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName, cfg.sessionId);
+          }
+        } catch (killErr: any) {
+          throw new Error(
+            `[read-isolation] refusing to start session ${cfg.sessionId}: ${why}; `
+            + `could not kill the exact target (${killErr?.message ?? killErr}) — pending proof retained`,
+          );
+        }
+        const postKill = killKind === 'zmx'
+          ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId).probe
+          : (killKind === 'target'
+            ? probePersistentBackendTarget(teardownTarget!)
+            : probePersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName));
+        if (postKill !== 'missing') {
+          throw new Error(
+            `[read-isolation] refusing to start session ${cfg.sessionId}: ${why}; `
+            + `post-kill probe ${postKill} (not missing) — pending proof retained`,
+          );
+        }
+      }
+      throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: ${why}`);
+    };
+
+    // Condition #2: a predicted-fresh launch that backend.spawn() dynamically
+    // flipped into a reattach (a same-named pane arrived before the in-spawn probe)
+    // must NOT keep running — the live pane is a foreign/unknown generation. Tear
+    // it down and refuse rather than "don't commit but keep running".
+    if (actuallyReattachedPersistent) {
+      tearDownAndRefuse('predicted-fresh persistent launch dynamically reattached a late-arriving pane');
+    } else if (effectiveBackendType === 'zellij') {
+      // Option B: zellij's session is created ASYNCHRONOUSLY inside the pty child,
+      // so a synchronous `!isReattach` here does NOT prove a fresh generation
+      // attributable to THIS launch (a late collision can still occur after the
+      // last in-spawn hasSession probe). We have no synchronous attributable
+      // signal, so we DELIBERATELY do not commit: the pending proof is left on
+      // disk, and this isolation-capable zellij pane will always cold-spawn on the
+      // next daemon restart/suspend-resume (no warm-reattach). The attributable-ack
+      // protocol that would restore zellij warm-reattach is a separate follow-up.
+      log(`[read-isolation] zellij persistent pane ${cfg.sessionId}: leaving PENDING proof (isolation-capable zellij does not warm-reattach; cold-spawn on next launch)`);
+    } else {
+      // tmux(-pipe) / herdr / zmx: attributable-fresh at the synchronous spawn
+      // return — TmuxPipe throws on new-session collision, herdr/zmx throw on a
+      // name collision / verify their own bootstrap+launchPid handshake. So a
+      // returned spawn + !isReattach here IS a fresh generation created by THIS
+      // launch. COMMIT with compare-before-replace + generation fence.
+      try {
+        // F1 generation fence: a superseded spawn must not let this commit run.
+        if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
+        // F2 compare-before-replace: the pending file on disk must STILL be our
+        // nonce (a same-worker restart / backend replacement between the pending
+        // write and here could have replaced it with a newer generation's pending).
+        const current = provenancePendingNonce(readManagedOriginAuthorityFile(commit.path));
+        if (current !== commit.nonce) {
+          throw new Error(`pending proof nonce mismatch (superseded generation) at ${commit.path}`);
+        }
+        // Mutual exclusivity: clear the sibling proof (verified) BEFORE committing,
+        // so the committed generation is never shadowed by a stale sibling.
+        if (commit.clearSiblingPath) removeProofOrThrow(commit.clearSiblingPath, `stale ${commit.label} sibling`);
+        // Atomic replace pending → committed.
+        replaceManagedOriginCapabilityFile(commit.path, commit.committedContent);
+      } catch (err) {
+        if (err instanceof CliSpawnSupersededError) throw err;
+        // Condition #3: a commit-write failure must not leave an ambiguous started
+        // pane running as if successful — tear down the exact target and refuse.
+        // (The pending proof, if it survived, keeps the next launch fail-closed.)
+        tearDownAndRefuse(`could not commit ${commit.label} generation proof (${(err as Error).message})`);
+      }
+    }
+  }
   try {
     finalizeCodexAppControlGeneration(
       cfg,
