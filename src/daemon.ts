@@ -18233,6 +18233,15 @@ async function handleBotAdded(
       anchor = chatId;
       scope = 'chat';
     }
+    // bot.added 是成员变更事件，没有用户 message_id 可作首轮 turn 身份。非 shared
+    // 路径没有 shared reply seed 兜底，若以 pendingTurnId=undefined 直接 fork，
+    // worker 发布的 managed_turn_origin 不含 turnId，CLI 首轮 `botmux send` 的
+    // managed-origin attestation 会被 daemon 以 origin_unproven 拒绝——首轮回复
+    // 发不回飞书。这里自行铸造首轮 turn 身份：
+    //   - thread scope：seed 消息本身就是可见锚点且是真实 om_ id，直接复用；
+    //   - chat scope：没有任何消息存在，铸造 daemon-owned 合成 turn id（同 trigger
+    //     会话的 trg_ 约定），仅作身份标识，不冒充用户消息 id。
+    const joinTurnId = scope === 'thread' ? anchor : `join_${randomUUID()}`;
     const dsKey = sessionKey(anchor, larkAppId);
     if (activeSessions.has(dsKey)) {
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 锚点已有会话，跳过`);
@@ -18277,7 +18286,9 @@ async function handleBotAdded(
       ownerOpenId: operatorOpenId,
       currentTurnTitle: title,
       workingDir: pinnedWorkingDir,
-      pendingTurnId: undefined,
+      // 非 shared 路径的首轮 turn 身份（joinTurnId）；shared 路径由
+      // armSharedReplyTarget 用 shared seed id 覆盖。
+      pendingTurnId: needsSharedReply ? undefined : joinTurnId,
     };
     const registration = await claimNewDaemonSession(activeSessions, ds);
     if (!registration.accepted) {
@@ -18290,7 +18301,9 @@ async function handleBotAdded(
       stageClaimedPendingRepoSetup(activeSessions, ds, {
         mode: autoWt ? 'auto_worktree' : 'picker',
         ...(autoWt && pinnedWorkingDir ? { baseDir: pinnedWorkingDir } : {}),
-        turnId: anchor,
+        // 非 shared 路径复用首轮 turn 身份；shared 路径保留 anchor（随后被
+        // armSharedReplyTarget 的 shared seed id 覆盖，此处仅作未 arm 时的兜底）。
+        turnId: needsSharedReply ? anchor : joinTurnId,
       });
     }
     const joinBootstrapExternallyTakenOver = (): boolean => (
@@ -18343,6 +18356,10 @@ async function handleBotAdded(
       // slow best-effort cleanup cannot block a retry or erase a replacement.
       const closing = closeSessionHelper(session.sessionId);
       if (activeSessions.get(dsKey) === ds) activeSessions.delete(dsKey);
+      // 入群去重锚点同样只清自己登记的那条：shared 路径在登记锚点之前就可能
+      // 回滚（此时 get 为 undefined，no-op）；非 shared 路径在锚点登记之后
+      // 回滚，不清掉会让后续 bot.added 带着 stale 锚点走进来。
+      if (groupJoinAnchorByChat.get(chatLiveKey) === dsKey) groupJoinAnchorByChat.delete(chatLiveKey);
       await closing;
     };
 
@@ -18396,6 +18413,35 @@ async function handleBotAdded(
     // Register the anchor so a later duplicate bot.added for this chat is deduped
     // even in 话题群 (where dsKey is the seed id, not chatId).
     groupJoinAnchorByChat.set(chatLiveKey, dsKey);
+
+    // 持久化非 shared 首轮的 turn provenance（shared 路径已由 armSharedReplyTarget
+    // 写入）。thread scope 以 seed 为 reply root；chat scope 无根，落 plain chat
+    // 目标且不写 sender——首轮无真人发送者，--mention 回指天然走 incomplete →
+    // 显式指定的安全方向。没有这条记录，worker 虽带 turnId fork，daemon 侧的
+    // 首轮回复目标/参与者窗口仍无据可查。
+    if (!needsSharedReply) {
+      try {
+        beginReplyTargetTurn(
+          ds,
+          scope === 'thread' ? anchor : undefined,
+          joinTurnId,
+          new Date(now).toISOString(),
+        );
+        sessionStore.updateSession(ds.session);
+      } catch (err) {
+        // 持久化失败（文件系统/数据库瞬态错误）时必须回滚已发布的会话：此时
+        // 会话已进 activeSessions 且 groupJoinAnchorByChat 已登记，finally 只
+        // settle barrier 和释放 in-flight 锁——留下 active 但 worker-null 的会话
+        // 会让后续 bot.added 被无限去重，自动开工无法重试。同
+        // stageClaimedPendingRepoSetup 的 unpublish/close 回滚。
+        logger.warn(
+          `[auto-start:入群] ${chatId.substring(0, 12)} 首轮 turn provenance 持久化失败，回滚会话注册：`
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+        await rollbackRegisteredJoinSession();
+        return;
+      }
+    }
 
     // Auto-worktree: register PENDING, build worktree off-path, commit+fork later.
     if (pinnedWorkingDir && autoWt) {
