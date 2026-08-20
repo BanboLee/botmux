@@ -35,6 +35,7 @@ import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '.
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
+import { cleanupMojoIsolatedWorkspace } from '../adapters/backend/mojo-isolated-workspace.js';
 import { hasUnprovenContainment } from './mojo-containment.js';
 import { MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS } from '../adapters/backend/mojo-budgets.js';
 import {
@@ -1550,6 +1551,41 @@ export function sessionMojoConfig(
     const value = (frozen as Record<string, unknown>)[key];
     if (value === undefined) delete merged[key];
     else merged[key] = value;
+  }
+  // Upgrade guard (review F1): an identity frozen by a pre-host-default build
+  // recorded "localDaemon unset" while double-unset still MEANT the cloud
+  // sandbox. Resuming it through the new default would silently flip the
+  // session cloud→host — the exact transition the freeze exists to prevent,
+  // and the drift log stays silent because frozen and live are both `{}`.
+  // Pin those rows to the legacy behaviour; a new session adopts the new
+  // default and gets stamped mojoIdentityHostDefault by the freeze helper.
+  if ((frozen as Record<string, unknown>).localDaemon === undefined
+      && ds.session.mojoIdentityHostDefault !== true) {
+    merged.localDaemon = false;
+    logger.warn(
+      `[${tag(ds)}] mojo identity predates the host-execution default; pinning `
+      + 'localDaemon=false (legacy sandbox behaviour) for this session. '
+      + 'Close and reopen the session to adopt the new default.',
+    );
+    // A daemon-log line alone leaves the USER staring at a session where tools
+    // and replies silently fail (observed live: the operator retried a pinned
+    // session twice believing the new build was broken). Queue the in-chat
+    // notice; the next turn with a reply context delivers it once.
+    if (ds.session.mojoLegacyPinNoticePending === undefined) {
+      ds.session.mojoLegacyPinNoticePending = true;
+      // Best-effort persistence: sessionMojoConfig sits on paths that MUST
+      // survive an unwritable store (the workerless orphan-cancel chain is
+      // explicitly tested for it). A failed save only costs notice dedupe
+      // across a restart — the in-memory flag still delivers this run.
+      try {
+        sessionStore.updateSession(ds.session);
+      } catch (err) {
+        logger.warn(
+          `[${tag(ds)}] could not persist the mojo legacy-pin notice flag `
+          + `(will still deliver this run): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
   }
   // Quarantine is bound to a specific ID, not to the session.
   //
@@ -4629,6 +4665,11 @@ async function prepareMojoExplicitClose(
   // repeat-cancel is suppressed with an explicit flag rather than by mutating
   // shared state early.
   logger.info(`[${tag(ds)}] mojo session ${remoteId} cancelled for explicit close`);
+  // Workerless twin of MojoBackend.destroySession()'s reap: the close verdict
+  // above is already decided, so a reaping failure only leaks an idle daemon
+  // (logged inside), never fails the close. Host-mode gating lives inside the
+  // helper via the isolated dir's existence — a cloud session never created one.
+  void cleanupMojoIsolatedWorkspace(session.sessionId).catch(() => undefined);
   // Cancelling the ACTIVE lineage says nothing about a previously parked one: a row
   // can carry both (restore parked the old id, the session then created a new one).
   // Reporting a plain success here would hide the parked remote session entirely.
@@ -7957,6 +7998,7 @@ export function sendWorkerInput(
   };
   // First moment with a reply context after a restore/resume-time quarantine.
   deliverPendingMojoQuarantineNotice(ds, turnId, opts.dispatchAttempt);
+  deliverPendingMojoLegacyPinNotice(ds, turnId, opts.dispatchAttempt);
   // #597: the accept-ledger entry is already appended above; if the IPC send
   // fails (returns false or throws) we MUST roll it back or the dispatch ledger
   // keeps a phantom accepted turn. master's ordinary-IM-delivery tracking runs
@@ -8145,6 +8187,62 @@ function deliverPendingMojoQuarantineNotice(
     logger.warn(`[${tag(ds)}] failed to deliver mojo quarantine notice (will retry): ${err}`);
   }).finally(() => {
     mojoQuarantineNoticeInFlight.delete(ds.session.sessionId);
+  });
+}
+
+const mojoLegacyPinNoticeInFlight = new Set<string>();
+
+/** In-chat twin of the sessionMojoConfig legacy pin's daemon-log warn: without
+ *  it the user keeps retrying a session whose tools and replies silently fail
+ *  (observed live). Same pending/delivered protocol and suppression rules as
+ *  deliverPendingMojoQuarantineNotice above. */
+function deliverPendingMojoLegacyPinNotice(
+  ds: DaemonSession,
+  turnId?: string,
+  dispatchAttempt?: number,
+): void {
+  if (ds.session.mojoLegacyPinNoticePending !== true) return;
+  if (mojoLegacyPinNoticeInFlight.has(ds.session.sessionId)) return;
+  let botCfg;
+  try {
+    botCfg = getBot(ds.larkAppId).config;
+  } catch {
+    return; // Bot deregistered — retry once it is back.
+  }
+  if (auxUiSuppressedFor(ds, turnId, dispatchAttempt)) {
+    logger.info(
+      `[${tag(ds)}] mojo legacy-pin notice deferred — no authorized output channel `
+      + 'for this turn; still pending',
+    );
+    return;
+  }
+  mojoLegacyPinNoticeInFlight.add(ds.session.sessionId);
+  const message = tr('worker.mojo_legacy_pinned', {}, botLocale(botCfg));
+  void callbacks?.sessionReply(
+    sessionAnchorId(ds),
+    message,
+    'text',
+    ds.larkAppId,
+    turnId,
+    ds.session.vcMeetingReceiver ? { sourceSessionId: ds.session.sessionId } : undefined,
+  ).then(() => {
+    ds.session.mojoLegacyPinNoticePending = false;
+    // Best-effort, same as the queueing side (review N2): the notice IS
+    // delivered at this point — a failed persist only risks one duplicate
+    // send after a restart, and must not surface as a delivery failure.
+    try {
+      sessionStore.updateSession(ds.session);
+    } catch (err) {
+      logger.warn(
+        `[${tag(ds)}] mojo legacy-pin notice delivered but the delivered marker could not be `
+        + `persisted (may re-send once after a restart): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }).catch((err) => {
+    // Flag intentionally left set: the next turn retries.
+    logger.warn(`[${tag(ds)}] failed to deliver mojo legacy-pin notice (will retry): ${err}`);
+  }).finally(() => {
+    mojoLegacyPinNoticeInFlight.delete(ds.session.sessionId);
   });
 }
 
@@ -9849,6 +9947,19 @@ function setupWorkerHandlers(
         }
         startupState.ready = true;
         ds.workerReady = true;
+        // Restore the daemon-owned display mode BEFORE any card handling: a
+        // fresh worker always boots with displayMode='hidden', and every early
+        // break below (managed / replyAlreadySent / streamingCardDisabled /
+        // CARD_POSTING_SENTINEL) used to skip the re-sync entirely. The
+        // sentinel break is not even rare: a headless backend (mojo) reaches
+        // prompt-ready synchronously on spawn, so screen_update reliably wins
+        // the card-POST race and `ready` breaks at the sentinel — the worker
+        // then never starts its screenshot loop while the daemon keeps
+        // rendering "waiting for first screenshot" forever. Sending before the
+        // card exists is safe: at worst the first screenshot_uploaded is
+        // dropped by the streamCardPending gate and the next 10s cycle
+        // delivers a fresh frame.
+        syncWorkerDisplayMode(ds);
         // A live CLI is up again: the parked-diagnostic recovery is over, so the
         // per-message launch-model refresh (see sendWorkerInput) stops here and
         // ordinary restart/refork paths take over again.
@@ -9940,7 +10051,6 @@ function setupWorkerHandlers(
         // (if any) is left untouched. The next real user turn clears this flag
         // (rememberLastCliInput) and the normal card flow resumes.
         if (ds.suppressRecoveryCard) {
-          syncWorkerDisplayMode(ds);
           logger.info(`[${t}] Restored session — suppressing recovery streaming card (silent restart)`);
           break;
         }
@@ -10001,8 +10111,6 @@ function setupWorkerHandlers(
               scheduleCodexServiceTierPatch(ds);
             }
             persistStreamCardState(ds);
-            // Re-sync worker's display mode (it starts fresh in 'hidden')
-            syncWorkerDisplayMode(ds);
             // The restored card is now the active one — withdraw any cards
             // frozen before the daemon went down so they don't pile up in the
             // thread on each restart.
@@ -10090,8 +10198,6 @@ function setupWorkerHandlers(
           }
           ds.parkedStreamCardNonce = undefined;
           persistStreamCardState(ds);
-          // Re-sync worker's display mode (it starts fresh in 'hidden')
-          syncWorkerDisplayMode(ds);
           // New card is live — recall any cards frozen by previous turns.
           // Done after `streamCardId` is committed so we never delete the old
           // card without a successor visible to the user.
@@ -10576,7 +10682,6 @@ function setupWorkerHandlers(
         // Drop uploads that arrived during a new-turn handoff — the image_key may
         // reflect previous turn's content. Next 10s cycle picks up fresh content.
         if (ds.streamCardPending) break;
-        ds.currentImageKey = msg.imageKey;
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
@@ -10594,7 +10699,6 @@ function setupWorkerHandlers(
           imageKey: msg.imageKey,
           content: ds.lastScreenContent ?? '',
         });
-        persistStreamCardState(ds);
         // screenshot_uploaded never ARMS the usage refresh — screen_update owns
         // the authorized arm. Here we only tear it down: unconditionally on
         // leaving `working`, and on a managed/silent turn (below) that must not
@@ -10602,7 +10706,18 @@ function setupWorkerHandlers(
         // re-render the prior visible card with THIS managed/hidden turn's
         // content — the same leak class as substitute-turn card suppression.
         if (ds.lastScreenStatus !== 'working') clearUsageRefreshTimer(ds);
-        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) { clearUsageRefreshTimer(ds); break; }
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          clearUsageRefreshTimer(ds);
+          persistStreamCardState(ds);
+          break;
+        }
+        // Store the image key only AFTER the managed gate: now that the ready
+        // handler re-syncs display mode on every path, a worker can be
+        // uploading during a suppressed managed/silent turn — letting that
+        // frame into ds.currentImageKey would paste it onto the next visible
+        // card render (the same leak class the comment above names).
+        ds.currentImageKey = msg.imageKey;
+        persistStreamCardState(ds);
         if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
         if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !workerHasInitialized(ds)) break;
         const readUrl = readableTerminalUrlFor(ds);

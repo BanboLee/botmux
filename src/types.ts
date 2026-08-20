@@ -600,6 +600,23 @@ export interface Session {
    */
   mojoIdentity?: MojoSessionIdentity;
   /**
+   * mojo backend only. Marks an identity frozen by a build whose double-unset
+   * default is HOST execution. An identity without this flag and without an
+   * explicit `localDaemon` key was frozen when double-unset still meant the
+   * cloud sandbox — resuming it under the new default would silently flip the
+   * session cloud→host, the exact transition the freeze exists to prevent, so
+   * sessionMojoConfig pins those legacy rows to `localDaemon: false` instead.
+   */
+  mojoIdentityHostDefault?: boolean;
+  /**
+   * mojo backend only. Queues the user-visible "this session is pinned to the
+   * legacy sandbox behaviour — close and reopen" notice (see the localDaemon
+   * pin in sessionMojoConfig). Same tri-state protocol as
+   * mojoQuarantineNoticePending: `true` = queued, `false` = delivered,
+   * `undefined` = never queued.
+   */
+  mojoLegacyPinNoticePending?: boolean;
+  /**
    * mojo backend only. A remote session id that can no longer be trusted: it was
    * created before `mojoIdentity` existed, so nothing records WHICH control plane
    * holds it.
