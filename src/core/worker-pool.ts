@@ -358,6 +358,16 @@ import {
 } from './session-preview-registry.js';
 import { composeRowFromActive, composeRowFromClosed } from './dashboard-rows.js';
 import { publishAttentionPatch, publishClosedSessionPatch } from './session-activity.js';
+import {
+  attachOrdinaryTurnRecovery,
+  beginOrdinaryTurnRecovery,
+  cancelOrdinaryTurnRecoveryForUserInput as cancelOrdinaryRecoveryForUserInput,
+  disposeOrdinaryTurnRecovery,
+  handleOrdinaryTurnRecoveryTerminal,
+  ordinaryTurnRecoveryHandlesTerminal,
+  requireOrdinaryTurnRecoveryAttention,
+  type OrdinaryTurnRecoveryDispatch,
+} from '../services/ordinary-turn-recovery.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
@@ -1119,6 +1129,118 @@ function tag(ds: DaemonSession): string {
 
 function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
   return ds.session.cliId ?? botCfg.cliId;
+}
+
+function ordinaryTurnRecoveryEligible(
+  ds: DaemonSession,
+  botCfg = getBot(ds.larkAppId).config,
+): boolean {
+  return sessionCliId(ds, botCfg) === 'claude-code'
+    && ds.session.status === 'active'
+    && !ds.adoptedFrom
+    && !ds.session.adoptedFrom
+    && ds.initConfig?.adoptMode !== true
+    && !ds.session.vcMeetingReceiver
+    && larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly });
+}
+
+function ordinaryTurnRecoveryStillOwnsSession(ds: DaemonSession): boolean {
+  if (ds.session.status !== 'active') return false;
+  if (!activeSessionsRegistry) return true;
+  return activeSessionsRegistry.get(sessionKey(sessionAnchorId(ds), ds.larkAppId)) === ds;
+}
+
+function ordinaryTurnRecoveryWarning(
+  state: NonNullable<Session['ordinaryTurnRecovery']>,
+  locale: ReturnType<typeof localeForBot>,
+): string {
+  if (state.status === 'exhausted' && state.continuationsStarted >= 2) {
+    return tr('worker.ordinary_recovery_exhausted', undefined, locale);
+  }
+  if (state.lastErrorCode === 'recovery_enqueue_failed') {
+    return tr('worker.ordinary_recovery_enqueue_failed', undefined, locale);
+  }
+  if (state.lastErrorCode === 'recovery_delivery_failed') {
+    return tr('worker.ordinary_recovery_delivery_failed', undefined, locale);
+  }
+  if (state.lastErrorCode === 'recovery_dispatch_interrupted') {
+    return tr('worker.ordinary_recovery_dispatch_interrupted', undefined, locale);
+  }
+  return tr('worker.ordinary_recovery_non_retryable', undefined, locale);
+}
+
+/** Attach the crash-safe timer owner for one eligible ordinary Claude/Lark
+ * session. Session state is persisted; this runtime registry only owns timers. */
+export function ensureOrdinaryTurnRecoveryAttached(
+  ds: DaemonSession,
+  botCfg = getBot(ds.larkAppId).config,
+): boolean {
+  if (!ordinaryTurnRecoveryEligible(ds, botCfg)) {
+    disposeOrdinaryTurnRecovery(ds.session);
+    return false;
+  }
+  attachOrdinaryTurnRecovery(ds.session, {
+    schedule: (delayMs, run) => {
+      const timer = setTimeout(run, delayMs);
+      timer.unref?.();
+      return timer;
+    },
+    cancel: timer => clearTimeout(timer),
+    persist: () => sessionStore.updateSession(ds.session),
+    enqueue: (dispatch: OrdinaryTurnRecoveryDispatch) => {
+      if (!ordinaryTurnRecoveryEligible(ds) || !ordinaryTurnRecoveryStillOwnsSession(ds)) return false;
+      try {
+        if (!ds.worker || ds.worker.killed || ds.worker.connected === false) {
+          return forkWorker(ds, dispatch.prompt, {
+            resume: true,
+            turnId: dispatch.turnId,
+          });
+        }
+        return sendWorkerInput(ds, dispatch.prompt, dispatch.turnId);
+      } catch (err) {
+        logger.error(
+          `[${tag(ds)}] Failed to enqueue ordinary-turn recovery `
+          + `${dispatch.continuation}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return false;
+      }
+    },
+    warn: state => {
+      const warning = ordinaryTurnRecoveryWarning(state, localeForBot(ds.larkAppId));
+      ds.agentAttention = {
+        kind: 'blocked',
+        reason: warning,
+        at: state.alertSentAt ?? Date.now(),
+      };
+      publishAttentionPatch(ds);
+      emitSessionLifecycleHook(ds, 'session.requires_attention', {
+        reason: 'ordinary_turn_recovery_exhausted',
+        errorCode: state.lastErrorCode,
+        logicalTurnId: state.logicalTurnId,
+      });
+      void requireCallbacks().sessionReply(
+        sessionAnchorId(ds),
+        warning,
+        'text',
+        ds.larkAppId,
+        state.logicalTurnId,
+      ).catch(err => logger.error(
+        `[${tag(ds)}] Failed to deliver ordinary-turn recovery warning: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      ));
+    },
+  });
+  const restored = ds.session.ordinaryTurnRecovery;
+  if (restored?.alertSentAt
+    && (restored.status === 'exhausted' || restored.status === 'attention_required')) {
+    ds.agentAttention = {
+      kind: 'blocked',
+      reason: ordinaryTurnRecoveryWarning(restored, localeForBot(ds.larkAppId)),
+      at: restored.alertSentAt,
+    };
+    publishAttentionPatch(ds);
+  }
+  return true;
 }
 
 function sessionRuntimeDisplayName(
@@ -5281,6 +5403,7 @@ export async function closeSession(
   }
 
   if (ds) {
+    disposeOrdinaryTurnRecovery(ds.session);
     killWorker(ds, {
       ...(preparedRemoteRequestId ? { remoteCloseCommitRequestId: preparedRemoteRequestId } : {}),
       // The prepare above already proved this cancel; the durable row cleared the
@@ -5932,6 +6055,14 @@ function failOrdinaryImDelivery(record: OrdinaryImDelivery, reason: string): voi
     + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} `
     + `attempts=${record.attempt} reason=${reason}`,
   );
+  if (record.turnId.startsWith('bmx-recovery-')) {
+    requireOrdinaryTurnRecoveryAttention(
+      record.ds.session,
+      record.turnId,
+      'recovery_delivery_failed',
+    );
+    return;
+  }
   if (record.ds.session.vcMeetingReceiver || isSilentScheduledTurn(record.ds, record.turnId)) return;
   const loc = botLocale(getBot(record.ds.larkAppId).config);
   void requireCallbacks().sessionReply(
@@ -6042,7 +6173,8 @@ function shouldTrackOrdinaryImDelivery(
   ds: DaemonSession,
   message: Extract<DaemonToWorker, { type: 'message' | 'init' }>,
 ): boolean {
-  return !!message.turnId?.startsWith('om_')
+  return !!message.turnId
+    && (message.turnId.startsWith('om_') || message.turnId.startsWith('bmx-recovery-'))
     && message.dispatchAttempt === undefined
     && (message.type !== 'init' || (!!message.prompt && !message.adoptMode))
     && !ds.adoptedFrom
@@ -7619,6 +7751,43 @@ function rollbackWorkerForkPreInit(
   if (changed) sessionStore.updateSession(ds.session);
 }
 
+/** Finish ordinary-turn recovery bookkeeping only after a fresh Lark turn has
+ * crossed its real admission boundary (durable activation tail or worker
+ * input). The user turn is already accepted at this point, so persistence
+ * failures here are logged without making the caller retry and risk a duplicate
+ * execution. */
+function recordAdmittedOrdinaryUserTurn(
+  ds: DaemonSession,
+  turnId: string,
+  opts: { beginRecovery: boolean },
+): void {
+  const priorRecoveryStatus = ds.session.ordinaryTurnRecovery?.status;
+  let recoveryBookkeepingSucceeded = false;
+  try {
+    if (opts.beginRecovery) {
+      const state = beginOrdinaryTurnRecovery(ds.session, turnId);
+      recoveryBookkeepingSucceeded = state?.logicalTurnId === turnId
+        && state.currentTurnId === turnId;
+    } else {
+      const state = cancelOrdinaryRecoveryForUserInput(ds.session, turnId);
+      recoveryBookkeepingSucceeded = state?.status === 'cancelled'
+        && state.cancelledByTurnId === turnId;
+    }
+  } catch (err) {
+    logger.error(
+      `[${tag(ds)}] Failed to persist ordinary-turn recovery bookkeeping `
+      + `after admitting ${turnId.substring(0, 16)}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (recoveryBookkeepingSucceeded
+    && (priorRecoveryStatus === 'exhausted' || priorRecoveryStatus === 'attention_required')
+    && ds.agentAttention) {
+    ds.agentAttention = undefined;
+    publishAttentionPatch(ds);
+  }
+}
+
 /** Send one normal (non-raw) worker turn while applying the per-bot Codex App
  * clean-input gate at message acceptance time. This freezes the sidecar onto
  * the IPC item, so later config flips do not mutate an already queued turn. */
@@ -7721,6 +7890,9 @@ export function sendWorkerInput(
       logger.info(
         `[${tag(ds)}] Staged turn ${queuedTurnId} behind queued activation ACK`,
       );
+      if (turnId?.startsWith('om_')) {
+        recordAdmittedOrdinaryUserTurn(ds, turnId, { beginRecovery: false });
+      }
       return true;
     } catch (err) {
       logger.error(
@@ -7813,6 +7985,9 @@ export function sendWorkerInput(
       opts.dispatchAttempt,
     );
     return false;
+  }
+  if (turnId?.startsWith('om_')) {
+    recordAdmittedOrdinaryUserTurn(ds, turnId, { beginRecovery: true });
   }
   return true;
 }
@@ -8100,6 +8275,9 @@ export function promoteQueuedActivationTail(
       queuedActivationToken: token,
       ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
     } as DaemonToWorker);
+    if (head.turnId.startsWith('om_')) {
+      recordAdmittedOrdinaryUserTurn(ds, head.turnId, { beginRecovery: true });
+    }
   } catch (err) {
     // Durable ownership already moved to the journal (and Codex ledger). Never
     // append another owner on retry; fence this IPC generation and let recovery
@@ -9158,6 +9336,9 @@ export function forkWorker(
   } else {
     worker.send(initMsg);
   }
+  if (prompt.length > 0 && initAttributionTurnId?.startsWith('om_')) {
+    recordAdmittedOrdinaryUserTurn(ds, initAttributionTurnId, { beginRecovery: true });
+  }
   ds.spawnedAt = Date.now();
   // master: per-runtime-key CLI version (the init send already happened above via
   // the tracked-delivery if/else — do NOT re-send initMsg here).
@@ -9471,6 +9652,7 @@ function setupWorkerHandlers(
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const loc = botLocale(botCfg);
+  ensureOrdinaryTurnRecoveryAttached(ds, botCfg);
   const notifyStartupFailure = async (
     reason: string,
     turnId?: string,
@@ -11168,12 +11350,127 @@ function setupWorkerHandlers(
           && ds.managedTurnOrigin.dispatchAttempt === msg.dispatchAttempt) {
           ds.managedTurnOrigin = undefined;
         }
+        const isClaudeProviderFailure = msg.status !== 'completed'
+          && sessionCliId(ds, botCfg) === 'claude-code'
+          && (msg.errorCode?.startsWith('provider_') ?? false);
+        const recoveryOwnsTerminal = ordinaryTurnRecoveryHandlesTerminal(ds.session, msg);
+        let recoveryHandled = false;
         try {
           await cb.onTurnTerminal?.(ds, msg, { workerGeneration });
         } catch (err: any) {
           // The durable receipt remains non-terminal and can be reconciled;
           // never let a projection/store failure crash the worker IPC loop.
           logger.error(`[${t}] Failed to persist turn_terminal for ${msg.turnId.substring(0, 8)}: ${err.message}`);
+        }
+        try {
+          handleOrdinaryTurnRecoveryTerminal(ds.session, msg);
+          recoveryHandled = recoveryOwnsTerminal;
+        } catch (err) {
+          // Recovery projection is durable fail-closed state, but a temporary
+          // session-store failure must not escape the worker IPC handler. The
+          // prior in-memory/persisted state was restored by the coordinator and
+          // can be reconciled on the next terminal or daemon restart.
+          logger.error(
+            `[${t}] Failed to persist ordinary-turn recovery terminal for `
+            + `${msg.turnId.substring(0, 8)}: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        let nonLarkFailureHandled = false;
+        if (isClaudeProviderFailure && !ds.session.vcMeetingReceiver) {
+          const failureCode = msg.errorCode ?? msg.status;
+          const waitPromise = ds.pendingWaitPromises?.get(msg.turnId);
+          if (waitPromise) {
+            nonLarkFailureHandled = true;
+            ds.pendingWaitPromises?.delete(msg.turnId);
+            const failure = new Error(`Claude turn failed: ${failureCode}`);
+            if (waitPromise.reject) waitPromise.reject(failure);
+            else waitPromise.resolve(`ERROR: ${failure.message}`);
+            logger.info(
+              `[${t}] Settled Wait Mode HTTP turn ${msg.turnId.substring(0, 8)} `
+              + `failed (${failureCode})`,
+            );
+          }
+
+          const asyncResult = ds.asyncTriggerResults?.get(msg.turnId);
+          const asyncSink = !!asyncResult || ds.chatId.startsWith('http_async_');
+          if (asyncSink) {
+            nonLarkFailureHandled = true;
+            const failedAt = Date.now();
+            if (asyncResult?.status === 'completed') {
+              // final_output is stronger and may have settled immediately before
+              // the ordered terminal IPC. Never replace known output with a
+              // later failure boundary, even if its best-effort durable write
+              // has not landed yet.
+              ds.idempotentAsyncTurns?.delete(msg.turnId);
+              logger.info(
+                `[${t}] Ignored failed terminal for completed async HTTP turn `
+                + msg.turnId.substring(0, 8),
+              );
+            } else {
+              if (asyncResult?.status === 'pending') {
+                asyncResult.status = 'failed';
+                asyncResult.failedAt = failedAt;
+                asyncResult.errorCode = 'trigger_failed';
+                asyncResult.terminalErrorCode = failureCode;
+              }
+              try {
+                const outcome = asyncTriggerStore.recordTerminalFailureStrict(
+                  ds.session.sessionId,
+                  msg.turnId,
+                  failedAt,
+                  ds.larkAppId,
+                  failureCode,
+                );
+                if (outcome === 'already_completed') {
+                  // Durable completed proof is stronger. Drop a stale in-memory
+                  // pending/failed projection so trigger-result reads that proof.
+                  ds.asyncTriggerResults?.delete(msg.turnId);
+                }
+              } catch (err) {
+                // The live failed projection still terminates current-daemon
+                // polling. Keep it when durable persistence is unavailable and
+                // report the lost restart guarantee explicitly.
+                logger.error(
+                  `[${t}] Failed to persist async worker terminal for `
+                  + `${msg.turnId.substring(0, 8)}: `
+                  + `${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
+              ds.idempotentAsyncTurns?.delete(msg.turnId);
+              logger.info(
+                `[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} `
+                + `failed (${failureCode})`,
+              );
+            }
+          }
+        }
+
+        if (isClaudeProviderFailure
+          && !nonLarkFailureHandled
+          && !recoveryHandled
+          && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          const failureCode = msg.errorCode ?? msg.status;
+          const warning = tr(
+            'worker.claude_terminal_failure_unrecovered',
+            { errorCode: failureCode },
+            loc,
+          );
+          ds.agentAttention = { kind: 'blocked', reason: warning, at: Date.now() };
+          publishAttentionPatch(ds);
+          emitSessionLifecycleHook(ds, 'session.requires_attention', {
+            reason: 'claude_terminal_failure_unrecovered',
+            errorCode: failureCode,
+            turnId: msg.turnId,
+          });
+          try {
+            await scopedReply(warning, 'text', msg.turnId);
+          } catch (err) {
+            logger.error(
+              `[${t}] Failed to deliver Claude terminal failure warning: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
         }
         // Async-HTTP settle-on-terminal (core-only completion bug #70): a turn
         // the worker's bridge gate suppressed as GENUINE SILENCE (the model
