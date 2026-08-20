@@ -109,6 +109,15 @@ import {
   evaluateVcMeetingManagedSend,
 } from './services/vc-meeting-send-policy.js';
 import { TurnTerminalDeduper } from './services/turn-terminal-deduper.js';
+import {
+  appendBridgeTurnJournalEntry,
+  BridgeRestoreGate,
+  clearBridgeTurnJournal,
+  readBridgeTurnJournal,
+  removeBridgeTurnJournalEntry,
+  selectRestorableBridgeTurns,
+  writeBridgeTurnJournal,
+} from './services/bridge-turn-journal.js';
 import { defaultGatewayEntry, ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
 import {
   sessionMcpGatewayPathRegex,
@@ -4080,6 +4089,19 @@ const bridgeSecondaryPaths = new Map<string, number>(); // path → offset
 let bridgeOffset = 0;
 let bridgePendingTail = '';
 const bridgeQueue = new BridgeTurnQueue();
+/** Journal-restore of interrupted Lark turns is allowed AT MOST ONCE per worker
+ *  process, and only on the FIRST baseline this process runs. Rationale: the
+ *  journal exists to recover a turn that a *cross-process* death (daemon
+ *  restart / worker crash) orphaned — there the whole worker is new and no
+ *  other recovery owner survives. An *in-worker* CLI restart (crash-respawn,
+ *  cwd-move, durable lease expiry) keeps this process alive, so its
+ *  InflightInputTracker carryover already re-delivers the interrupted plain-IM
+ *  input (a full fresh answer) — letting the journal ALSO restore that turn
+ *  would post the recovered partial AND the fresh answer (same turnId, different
+ *  lastUuid → daemon dedupe can't collapse them). Armed on every watcher
+ *  teardown so restore is confined to the one baseline with no competing
+ *  recovery owner. */
+const bridgeRestoreGate = new BridgeRestoreGate();
 /** uuids of structured transcript rate-limit records already turned into a
  *  `limited` emit. Readers may re-read from offset 0 after rotation, so the
  *  stable record uuid keeps the notification idempotent. */
@@ -4253,6 +4275,49 @@ function failedBridgeFallbackContent(errorCode?: string, summary?: string, parti
 function bridgeMarkerPath(): string | undefined {
   if (!process.env.SESSION_DATA_DIR || !sessionId) return undefined;
   return join(process.env.SESSION_DATA_DIR, 'turn-sends', `${sessionId}.jsonl`);
+}
+
+/** Durable journal of pending Lark bridge turns (services/bridge-turn-journal).
+ *  Written at mark time, cleared at every turn-terminal outcome; consulted by
+ *  bridgeAbsorbBaseline after a restart so an interrupted turn's output can
+ *  still reach Lark. Sibling of the turn-sends marker file. */
+function bridgeTurnJournalFilePath(): string | undefined {
+  if (!process.env.SESSION_DATA_DIR || !sessionId) return undefined;
+  return join(process.env.SESSION_DATA_DIR, 'turn-marks', `${sessionId}.json`);
+}
+
+function journalBridgeTurnMark(entry: {
+  turnId: string;
+  dispatchAttempt?: number;
+  markTimeMs: number;
+  fingerprint?: string;
+  contentNormalized?: string;
+  jsonlPath: string;
+  offsetAtMark: number;
+}): void {
+  const path = bridgeTurnJournalFilePath();
+  if (!path) return;
+  try {
+    appendBridgeTurnJournalEntry(path, entry);
+  } catch (err: any) {
+    log(`Bridge turn journal write failed (${err.message}) — restart recovery unavailable for turn ${entry.turnId.substring(0, 8)}`);
+  }
+}
+
+function journalBridgeTurnClear(turnId: string, dispatchAttempt?: number): void {
+  const path = bridgeTurnJournalFilePath();
+  if (!path) return;
+  try {
+    removeBridgeTurnJournalEntry(path, turnId, dispatchAttempt);
+  } catch (err: any) {
+    log(`Bridge turn journal clear failed (${err.message}) for turn ${turnId.substring(0, 8)}`);
+  }
+}
+
+function clearBridgeTurnJournalFile(): void {
+  const path = bridgeTurnJournalFilePath();
+  if (!path) return;
+  try { clearBridgeTurnJournal(path); } catch { /* best-effort — session is closing */ }
 }
 
 function readSendMarkers(): BridgeSendMarker[] {
@@ -4500,6 +4565,12 @@ function scheduleHerdrAdoptBridgeQuietEmit(): void {
 function bridgeAbsorbBaseline(): void {
   if (!bridgeJsonlPath) return;
   if (!lastInitConfig?.adoptMode) {
+    // Restart recovery: if the previous generation left pending Lark turns in
+    // the durable journal (worker/daemon died mid-turn), re-mark them and
+    // baseline BEHIND their recorded offsets instead of skipping to EOF — the
+    // interrupted turn's user line and partial assistant output are then
+    // re-attributed and delivered through the normal fallback gate.
+    if (tryRestoreInterruptedBridgeTurns()) return;
     const cursor = baselineJsonlCursor(bridgeJsonlPath);
     bridgeOffset = cursor.newOffset;
     bridgePendingTail = cursor.pendingTail;
@@ -4517,6 +4588,72 @@ function bridgeAbsorbBaseline(): void {
   // claude-code fallback bridge also uses baseline-existing on daemon
   // restart/resume; it must not emit the "/adopt 前最后一轮" message.
   if (lastInitConfig?.adoptMode) maybeEmitAdoptPreamble(result.events);
+}
+
+/** Restore journal-persisted pending turns after a restart interrupted them.
+ *
+ *  Returns true when it established the bridge cursor itself (restore mode);
+ *  false when there is nothing to restore and the caller should run the
+ *  normal baseline-to-EOF.
+ *
+ *  Scope guards (all deliberate):
+ *    - non-adopt only (caller gates);
+ *    - same transcript file only — a sessionId rotation between generations
+ *      invalidates offsets and risks cross-file mis-attribution;
+ *    - bounded age (BRIDGE_TURN_RESTORE_MAX_AGE_MS) — a partial answer from
+ *      days ago is noise, not recovery.
+ *
+ *  Safety properties:
+ *    - events before the earliest mark (minus the same 5s guard the
+ *      fingerprint switch uses) are ABSORBED as history, so old turns are
+ *      never re-emitted;
+ *    - a stray prior-turn assistant tail after the cutoff can only synthesize
+ *      a local turn, which the non-adopt emit gate always suppresses;
+ *    - a restored mark whose user line never landed in the jsonl simply
+ *      never starts, and pruneExpired clears it (journal entry included) on
+ *      the first idle tick;
+ *    - the send-marker gate still applies at emit — turn-sends markers
+ *      persist across restarts, so an answer the model already `botmux
+ *      send`-ed before the kill stays suppressed. */
+function tryRestoreInterruptedBridgeTurns(): boolean {
+  // At-most-once, and only on this worker process's FIRST bridge baseline. Any
+  // baseline that runs after a watcher teardown is an in-worker CLI restart
+  // whose InflightInputTracker carryover already re-delivers the interrupted
+  // turn — restoring here too would double-deliver (see bridgeRestoreGate,
+  // armed in stopBridgeWatcher).
+  if (!bridgeRestoreGate.mayRestoreOnThisBaseline()) return false;
+  const journalPath = bridgeTurnJournalFilePath();
+  if (!journalPath || !bridgeJsonlPath) return false;
+  const entries = readBridgeTurnJournal(journalPath);
+  if (entries.length === 0) return false;
+  const restorable = selectRestorableBridgeTurns(entries, { currentJsonlPath: bridgeJsonlPath });
+  if (restorable.length !== entries.length) {
+    // Entries for rotated-away files or beyond the age cap can never restore —
+    // drop them now so they don't linger across future generations.
+    try { writeBridgeTurnJournal(journalPath, restorable); } catch { /* best-effort */ }
+  }
+  if (restorable.length === 0) return false;
+  for (const entry of restorable) {
+    bridgeQueue.mark(
+      entry.turnId,
+      entry.fingerprint,
+      entry.markTimeMs,
+      entry.contentNormalized,
+      entry.dispatchAttempt,
+      { restoredFromJournal: true },
+    );
+  }
+  const fromOffset = Math.min(...restorable.map(entry => entry.offsetAtMark));
+  const drained = drainTranscript(bridgeJsonlPath, fromOffset);
+  bridgeOffset = drained.newOffset;
+  bridgePendingTail = drained.pendingTail;
+  const cutoffMs = Math.min(...restorable.map(entry => entry.markTimeMs)) - 5_000;
+  const { history, live } = splitTranscriptEventsByCutoff(drained.events, cutoffMs);
+  bridgeQueue.absorb(history);
+  if (live.length > 0) bridgeQueue.ingest(live, bridgeJsonlPath);
+  bridgeBaselineDone = true;
+  log(`Bridge restored ${restorable.length} interrupted turn(s) from journal (drain ${fromOffset}→${bridgeOffset}, absorbed=${history.length}, live=${live.length})`);
+  return true;
 }
 
 /** Record `bridgeStalePidStateSessionId` if the pid file's current sid
@@ -5049,6 +5186,7 @@ function bridgeIngest(): void {
   const expired = bridgeQueue.pruneExpired(BRIDGE_PENDING_TURN_TTL_MS);
   for (const t of expired) {
     if (t.contentFingerprint) bridgeFingerprintScanLastMs.delete(t.contentFingerprint);
+    journalBridgeTurnClear(t.turnId, t.dispatchAttempt);
     log(`Bridge mark expired after ${Math.round(BRIDGE_PENDING_TURN_TTL_MS / 1000)}s without matching a jsonl user line (turnId=${t.turnId}) — dropped to prevent rotation-fallback scan loop.`);
   }
   // Drain secondary paths first so any trailing assistant text on an old
@@ -5285,6 +5423,12 @@ function stopBridgeWatcher(): void {
   // A fresh backend must not inherit a terminal/fingerprint from the exited
   // process; durable replay is owned by the receiver with a new attempt.
   bridgeQueue.clearPending();
+  // A watcher teardown means this worker process has now had at least one CLI
+  // generation, so any FUTURE baseline is an in-worker restart — never the
+  // first-baseline cross-process recovery the journal is for. Disarm journal
+  // restore: the restart's InflightInputTracker carryover already re-delivers
+  // the interrupted turn, and restoring on top would double-deliver.
+  bridgeRestoreGate.markGenerationRetired();
   bridgePreambleSent = false;
 }
 
@@ -5349,7 +5493,30 @@ function bridgeMarkPendingTurn(
   const normalised = normaliseForFingerprint(messageText);
   const contentNormalized = normalised.length > 0 ? normalised : undefined;
   const turnId = preferredTurnId ?? randomBytes(8).toString('hex');
-  bridgeQueue.mark(turnId, fingerprint, Date.now(), contentNormalized, dispatchAttempt);
+  const markTimeMs = Date.now();
+  bridgeQueue.mark(turnId, fingerprint, markTimeMs, contentNormalized, dispatchAttempt);
+  // Journal the mark so a worker/daemon restart mid-turn can restore it
+  // (bridgeAbsorbBaseline). Excluded:
+  //   - adopt mode: its baseline absorbs the whole transcript with different
+  //     semantics and never suppresses — restore marks would double-attribute;
+  //   - durable turns (dispatchAttempt !== undefined): a durable delivery has
+  //     its OWN cross-restart recovery owner (the daemon's persisted
+  //     queuedActivation* write-ahead + receipt auto-redispatch), so a journal
+  //     restore is always redundant for it and — because the recovered partial
+  //     and the re-dispatched attempt carry the same turnId but different
+  //     lastUuid — would double-deliver. Only PLAIN Lark IM turns (no other
+  //     recovery owner) actually need the journal.
+  if (!lastInitConfig?.adoptMode && bridgeJsonlPath && dispatchAttempt === undefined) {
+    journalBridgeTurnMark({
+      turnId,
+      dispatchAttempt,
+      markTimeMs,
+      fingerprint,
+      contentNormalized,
+      jsonlPath: bridgeJsonlPath,
+      offsetAtMark: bridgeOffset,
+    });
+  }
   return turnId;
 }
 
@@ -5379,6 +5546,13 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
         requireExplicitTerminalForDurable: true,
       });
   if (ready.length === 0) return;
+  // Every popped turn is terminal (emitted or suppressed below) — retire its
+  // durable journal entry NOW, before the final_output IPC. Clear-before-send:
+  // if the worker dies in between, the answer is lost rather than duplicated
+  // (the daemon-side dedupe key does not survive restarts).
+  for (const turn of ready) {
+    if (!turn.isLocal) journalBridgeTurnClear(turn.turnId, turn.dispatchAttempt);
+  }
   const adoptMode = lastInitConfig?.adoptMode === true;
   // Send markers (`botmux send` landed in own thread) + the queue's first
   // still-unready turn. The latter caps the LAST ready turn's window —
@@ -5491,9 +5665,16 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
       continue;
     }
 
+    // A restored turn's fallback is a RECOVERED partial/final produced around
+    // a worker restart — label it so the user can tell it from a live answer.
+    // Prefix is applied AFTER the suppress gate so dedup compares the model's
+    // own text, never the notice.
+    const deliveredText = turn.restoredFromJournal
+      ? `${t('worker.bridge_restored_turn_notice')}\n\n${postText}`
+      : postText;
     send({
       type: 'final_output',
-      content: postText,
+      content: deliveredText,
       lastUuid,
       turnId: turn.turnId,
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
@@ -10068,6 +10249,7 @@ function dropFailedBridgeMark(bridgeTurnId?: string, dispatchAttempt?: number): 
   const droppedStructured = codexBridgeQueue.dropPendingTurn(bridgeTurnId, dispatchAttempt);
   if (dropped) {
     if (dropped.contentFingerprint) bridgeFingerprintScanLastMs.delete(dropped.contentFingerprint);
+    journalBridgeTurnClear(bridgeTurnId, dispatchAttempt);
     log(`Bridge mark dropped after submit failure (turnId=${bridgeTurnId}) — rotation-fallback scan will stop spinning on this fingerprint.`);
   }
   if (droppedStructured) {
@@ -18269,11 +18451,13 @@ process.on('message', async (raw: unknown) => {
         catch { /* logged by backend */ }
       }
       killCli();
-      // Bridge marker file outlives a single CLI process (we keep it across
-      // restarts so a mid-flight send is still credited), but a real close
-      // tears down the session — purge the file so a future re-use of the
-      // same sessionId starts clean.
+      // Bridge marker + turn-journal files outlive a single CLI process (kept
+      // across restarts so a mid-flight send is still credited and an
+      // interrupted turn can be restored), but a real close tears down the
+      // session — purge both so a future re-use of the same sessionId starts
+      // clean.
       clearSendMarkers();
+      clearBridgeTurnJournalFile();
       cleanup();
       process.exit(0);
     }
@@ -18446,6 +18630,7 @@ process.on('message', async (raw: unknown) => {
       stopCodexBridge();
       killCli();
       clearSendMarkers();
+      clearBridgeTurnJournalFile();
       cleanup();
       process.exit(0);
     }
