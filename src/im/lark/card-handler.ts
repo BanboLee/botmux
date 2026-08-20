@@ -90,7 +90,7 @@ import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
-import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
+import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
@@ -2505,9 +2505,22 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // Build the closed card BEFORE closeWorkerPoolSession — it reads the
         // live session's identity off `current`.
         const card = buildClosedSessionCard(current, localeForBot(current.larkAppId));
+        // The clicked card IS the live streaming card in the common in-thread
+        // (non-private) case. When so, patch it in place via the callback return
+        // below instead of sending a separate closed card — a stray extra card
+        // (and its now-dead buttons) is what we're avoiding. Only when the
+        // clicked message is that streaming card and we're not in private mode.
+        const patchClickedCardInPlace = !!cardMessageId
+          && cardMessageId === current.streamCardId
+          && value?.visibility !== 'private'
+          && !botCfg.privateCard;
         let closeResult;
         try {
-          closeResult = await closeWorkerPoolSession(targetSessionId);
+          // Don't await the worker exiting — a busy CLI only dies at the ~7s
+          // SIGKILL backstop, which blows past Lark's ~3s card-ACK window and
+          // surfaces the client-side "code: 300000" toast. The logical close is
+          // synchronous; the worker is killed in the background.
+          closeResult = await closeWorkerPoolSession(targetSessionId, { awaitWorkerExit: false });
         } catch (err) {
           logger.error(`[${tag(current)}] Refused close because backing teardown was not verified: ${err}`);
           return { status: 'teardown_failed' as const, err };
@@ -2530,7 +2543,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             residual: closeResult.residual,
           };
         }
-        return { status: 'closed' as const, current, botCfg, card };
+        return { status: 'closed' as const, current, botCfg, card, patchClickedCardInPlace };
       });
       if (!closed) {
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
@@ -2572,7 +2585,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           },
         };
       }
-      const { current, botCfg, card } = closed;
+      const { current, botCfg, card, patchClickedCardInPlace } = closed;
       // The closed card carries session title / CLI name / workingDir / resume
       // command. In private-card mode those must not leak to the group — send the
       // closed card ephemeral to the same owner audience instead. No group
@@ -2588,6 +2601,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         }
         logger.info(`[${tag(current)}] Closed via card button (private close card → ${audience.length} owner(s))`);
       } else {
+        if (patchClickedCardInPlace) {
+          // Return the closed card as the callback response → Lark patches the
+          // just-clicked streaming card in place (no delete, no separate send,
+          // no "code: 300000" race). The "等待输入" card becomes the closed card
+          // with its now-dead buttons removed.
+          logger.info(`[${tag(current)}] Closed via card button (in-place patch)`);
+          return JSON.parse(card);
+        }
         await deliverEphemeralOrReply(current, operatorOpenId, card, 'interactive', () => sessionReply(rootId, card, 'interactive'));
         logger.info(`[${tag(current)}] Closed via card button`);
       }
@@ -2609,6 +2630,45 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           const resumeMsg = resumeStartsFresh(result.ds.session)
             ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
             : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
+          // Restore the ORIGINAL live streaming card (🖥️ header + usage line +
+          // 显示输出/终端/操作链接/关闭会话) as a WITHDRAW-then-REPOST (old closed card
+          // recalled, fresh card posted at the thread bottom), AND send the
+          // "✅ 会话已恢复…" text follow-up — both are wanted.
+          // Ordering is load-bearing for two reasons:
+          //   1) ACK the callback FIRST (bare `return` → empty ACK), THEN
+          //      post/delete in the background — deleting the just-clicked card
+          //      inside the callback response races it and triggers client
+          //      "code: 300000".
+          //   2) POST the fresh card BEFORE deleting the old one, so the thread
+          //      never briefly shows zero cards (same invariant as park→recall).
+          // Skip in private-card mode (clicked card may be an ephemeral snapshot).
+          const botCfgResume = getBot(result.ds.larkAppId).config;
+          if (cardMessageId && value?.visibility !== 'private' && !botCfgResume.privateCard) {
+            const staleCardId = cardMessageId;
+            const resumedDs = result.ds;
+            void (async () => {
+              try {
+                const freshCardId = await sessionReply(rootId, buildStreamingCardJson(resumedDs), 'interactive');
+                resumedDs.streamCardId = freshCardId;
+                persistStreamCardState(resumedDs);
+                await deleteMessage(resumedDs.larkAppId, staleCardId).catch(() => { /* already withdrawn/expired */ });
+                // Also send the "✅ 会话已恢复…" text follow-up (the original resume
+                // behavior). Both are wanted: the live streaming card AND the text
+                // prompt telling the user to send a message to continue.
+                await deliverEphemeralOrReply(resumedDs, operatorOpenId, resumeMsg, 'text', () => sessionReply(rootId, resumeMsg));
+                logger.info(`[${targetSessionId.substring(0, 8)}] Resumed via card button (withdraw + repost streaming card + text)`);
+              } catch (err) {
+                logger.warn(`[${targetSessionId.substring(0, 8)}] resume card repost failed: ${err instanceof Error ? err.message : String(err)}`);
+              }
+            })();
+            // Bare `return` (→ undefined) so the dispatcher's shaper emits a
+            // genuine empty ACK `{}`. Returning `{}` here would instead be
+            // truthy and get wrapped as `{card:{type:raw,data:{}}}` — an
+            // in-place patch with an empty card body (invalid), racing the
+            // background deleteMessage above. Matches every other empty-ACK in
+            // this handler.
+            return; // fast empty ACK; card work happens in background
+          }
           await deliverEphemeralOrReply(result.ds, operatorOpenId, resumeMsg, 'text', () => sessionReply(rootId, resumeMsg));
           logger.info(`[${targetSessionId.substring(0, 8)}] Resumed via card button`);
         } else if (result.error === 'not_found') {
