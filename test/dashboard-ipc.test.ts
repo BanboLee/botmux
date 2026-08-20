@@ -2009,6 +2009,50 @@ describe('POST /api/sessions/:sessionId/wake', () => {
       __testOnly_resetBotTurnMutationGates();
     }
   });
+
+  it('rejects a Riff-backed wake: a remote lineage must never be locally re-forked', async () => {
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => true as any);
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-riff-wake', cliId: 'riff', backendType: 'riff' },
+      worker: null,
+      adoptedFrom: undefined,
+      hasHistory: true,
+    } as any);
+
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-riff-wake/wake`, { method: 'POST' });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ ok: false, error: 'remote_wake_unsupported' });
+      expect(forkSpy).not.toHaveBeenCalled();
+    } finally {
+      findSpy.mockRestore();
+      forkSpy.mockRestore();
+    }
+  });
+
+  it('rejects a Mojo-backed wake with the same remote guard (not just riff)', async () => {
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => true as any);
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-mojo-wake', cliId: 'mojo', backendType: 'mojo' },
+      worker: null,
+      adoptedFrom: undefined,
+      hasHistory: true,
+    } as any);
+
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-mojo-wake/wake`, { method: 'POST' });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ ok: false, error: 'remote_wake_unsupported' });
+      expect(forkSpy).not.toHaveBeenCalled();
+    } finally {
+      findSpy.mockRestore();
+      forkSpy.mockRestore();
+    }
+  });
 });
 
 describe('POST /api/sessions/:sessionId/suspend', () => {

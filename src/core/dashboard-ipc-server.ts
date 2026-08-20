@@ -224,7 +224,7 @@ import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, larkTransportEnabled, type DaemonSession } from './types.js';
-import { isRemoteBackendSession, isRiffBackendSession } from './persistent-backend.js';
+import { isRemoteBackendSession } from './persistent-backend.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
 import { isSessionGroup } from '../services/session-groups-store.js';
@@ -1274,8 +1274,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/wake', async (req, res, params) => {
     if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
       return jsonRes(res, 409, { ok: false, error: 'adopt_wake_unsupported' });
     }
-    if (isRiffBackendSession(ds)) {
-      return jsonRes(res, 409, { ok: false, error: 'riff_wake_unsupported' });
+    // Every REMOTE backend (riff / mojo) owns a remote lineage that a local
+    // forkWorker cold-boot would sever or replace — the same reason /restart
+    // rejects them. A dormant remote session cold-resumes from its own lineage
+    // on the next message, never from a picker-driven local wake.
+    if (isRemoteBackendSession(ds)) {
+      return jsonRes(res, 409, { ok: false, error: 'remote_wake_unsupported' });
     }
     if (rejectProtectedSessionMutation(res, [ds])) return;
 

@@ -3,6 +3,7 @@ import xtermHeadless from '@xterm/headless';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import { createServer } from 'node:http';
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
@@ -149,7 +150,12 @@ function makeFixture(
       }));
       const configDir = join(root, '.botmux');
       mkdirSync(configDir, { recursive: true });
-      writeFileSync(join(configDir, '.dashboard-secret'), 'picker-wake-test-secret');
+      const secretPath = join(configDir, '.dashboard-secret');
+      writeFileSync(secretPath, 'picker-wake-test-secret');
+      // The host credential loader (secure-host-file) fail-closes unless the
+      // secret is EXACTLY 0600; writeFileSync's mode is umask-masked, so set it
+      // explicitly or fetchDaemonIpc can't sign and the wake never leaves the CLI.
+      chmodSync(secretPath, 0o600);
     }
   }
   writeFileSync(join(dataDir, 'sessions.json'), JSON.stringify(sessions));
