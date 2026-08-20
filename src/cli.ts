@@ -109,6 +109,12 @@ import {
   type SessionPickerLayout,
 } from './cli/session-picker-layout.js';
 import { computeSessionPickerScrollWindow } from './cli/session-picker-viewport.js';
+import {
+  canWakeDormantBackendForAttach,
+  type SessionListWakeRequestContext,
+  wakeDormantBackendForAttach,
+} from './cli/session-list-wake.js';
+import { SESSION_WAKE_DEADLINE_HEADER } from './core/session-wake-deadline.js';
 import { terminalCellWidth } from './cli/terminal-width.js';
 import {
   attachFrozenManagedZmxSession,
@@ -5331,6 +5337,41 @@ function hasRecoverableBackingSession(s: SessionData, snapshot?: BackingProbeSna
   return !!target && backingProbe(snapshot, target) === 'exists';
 }
 
+async function requestDormantSessionWake(
+  session: SessionData,
+  context: SessionListWakeRequestContext,
+): Promise<
+  | { ok: true }
+  | { ok: false; error: string }
+> {
+  const online = listOnlineDaemons();
+  const daemon = session.larkAppId
+    ? online.find(d => d.larkAppId === session.larkAppId)
+    : online.length === 1 ? online[0] : undefined;
+  if (!daemon) {
+    return {
+      ok: false,
+      error: session.larkAppId || online.length === 0
+        ? '所属 daemon 不在线，请先运行 botmux status'
+        : '历史会话缺少 bot 归属，多 daemon 环境下无法安全唤醒',
+    };
+  }
+
+  try {
+    const path = `/api/sessions/${encodeURIComponent(session.sessionId)}/wake`;
+    const response = await fetchDaemonIpc(daemon.ipcPort, path, {
+      method: 'POST',
+      signal: context.signal,
+      headers: { [SESSION_WAKE_DEADLINE_HEADER]: String(context.deadlineMs) },
+    });
+    const body: any = await response.json().catch(() => ({}));
+    if (response.ok && body?.ok) return { ok: true };
+    return { ok: false, error: body?.error ?? `HTTP ${response.status}` };
+  } catch (err: any) {
+    return { ok: false, error: err?.message ?? String(err) };
+  }
+}
+
 /** Shorten path for display: replace $HOME with ~. */
 function shortenPath(p: string): string {
   const home = homedir();
@@ -5360,6 +5401,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     isAdopt: boolean;
     targetLabel: string;
     canAttach: boolean;
+    canWake: boolean;
   }> {
     return active.map(s => {
       const isAdopt = isAdoptedSession(s);
@@ -5402,6 +5444,13 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
           && backing.probe === 'exists'
           && !!('attachBackend' in backing && backing.attachBackend)
           && !!('target' in backing && backing.target),
+        canWake: canWakeDormantBackendForAttach({
+          isAdopt,
+          probe: backing.probe,
+          realManagedSession: isRealManagedSession(s),
+          attachBackend: 'attachBackend' in backing ? backing.attachBackend : undefined,
+          target: 'target' in backing ? backing.target : undefined,
+        }),
       };
     });
   }
@@ -5559,6 +5608,8 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       footerLine = `${styledFooter('warn', selected.targetLabel, labelWidth)}\x1b[2m${fitLine(suffix, width)}\x1b[0m`;
     } else if (selected.canAttach) {
       footerLine = styledFooter('success', `${selected.attachBackend}: ${selected.backendTarget?.sessionName}`, width);
+    } else if (selected.canWake) {
+      footerLine = styledFooter('warn', `${selected.targetLabel}（Enter 恢复并连接）`, width);
     } else {
       footerLine = styledFooter('dim', `${selected.targetLabel}（不可连接）`, width);
     }
@@ -5576,7 +5627,8 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     }
 
     // Keybinding hints
-    const fullHints = `↑/↓ 选择  ⏎ ${selected?.canAttach ? '连接' : '不可连接'}  d 删除  q 退出`;
+    const enterAction = selected?.canAttach ? '连接' : selected?.canWake ? '恢复' : '不可连接';
+    const fullHints = `↑/↓ 选择  ⏎ ${enterAction}  d 删除  q 退出`;
     const compactHints = '↑/↓ 选择  ⏎  d  q';
     const hints = displayWidth(fullHints) <= width ? fullHints : compactHints;
     process.stdout.write(`\n${footerPrefix()}${styledFooter('dim', hints, width)}\n`);
@@ -5600,15 +5652,23 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     };
     process.stdout.on('resize', onResize);
 
+    let deleteInFlight = false;
+    let wakeInFlight = false;
+    let wakeAbortController: AbortController | null = null;
+    let pickerClosed = false;
+
     function cleanup(): void {
+      if (pickerClosed) return;
+      pickerClosed = true;
+      wakeAbortController?.abort();
+      wakeAbortController = null;
+      process.stdin.off('data', onInput);
       process.stdout.off('resize', onResize);
       process.stdin.setRawMode(false);
       process.stdin.pause();
       process.stdout.write('\x1b[?25h');   // show cursor
       process.stdout.write('\x1b[?1049l'); // leave alt screen
     }
-
-    let deleteInFlight = false;
 
     async function deleteSession(idx: number): Promise<void> {
       const r = rows[idx];
@@ -5648,8 +5708,16 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         : { style: 'warn', text: `✓ 已离线删除 ${s.sessionId.substring(0, 8)}` };
     }
 
-    process.stdin.on('data', async (key: string) => {
-      if (deleteInFlight) return;
+    async function onInput(key: string): Promise<void> {
+      // Exit always wins, including while the wake HTTP or backend probe is
+      // pending. cleanup aborts the shared deadline signal before restoring
+      // the terminal, so Ctrl-C/q/Esc can never be swallowed by in-flight work.
+      if (key === '\x03' || key === 'q' || key === '\x1b') {
+        cleanup();
+        resolve();
+        return;
+      }
+      if (deleteInFlight || wakeInFlight) return;
       // Delete confirmation mode
       if (confirmDelete) {
         confirmDelete = false;
@@ -5660,18 +5728,11 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         } else {
           flash = { style: 'dim', text: '取消删除' };
         }
-        render();
+        if (!pickerClosed) render();
         return;
       }
 
       flash = null;
-
-      // Ctrl-C or q or Esc
-      if (key === '\x03' || key === 'q' || key === '\x1b') {
-        cleanup();
-        resolve();
-        return;
-      }
 
       if (rows.length === 0) {
         // No sessions left, only q works
@@ -5708,10 +5769,37 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
           render();
           return;
         }
-        if (!selected.canAttach) {
+        if (!selected.canAttach && !selected.canWake) {
           flash = { style: 'warn', text: '该会话没有可连接的持久后端' };
           render();
           return;
+        }
+        if (selected.canWake) {
+          const target = selected.backendTarget;
+          if (!target) {
+            flash = { style: 'error', text: '恢复目标缺失' };
+            render();
+            return;
+          }
+          wakeInFlight = true;
+          const wakeController = new AbortController();
+          wakeAbortController = wakeController;
+          flash = { style: 'warn', text: `正在恢复 ${target.backendType}: ${persistentTargetDisplay(target)}…` };
+          render();
+          const recovered = await wakeDormantBackendForAttach({
+            target,
+            wake: context => requestDormantSessionWake(selected.session, context),
+            probe: probePersistentBackendTarget,
+            signal: wakeController.signal,
+          });
+          if (wakeAbortController === wakeController) wakeAbortController = null;
+          wakeInFlight = false;
+          if (pickerClosed) return;
+          if (!recovered.ok) {
+            flash = { style: 'error', text: `恢复失败: ${recovered.error}` };
+            render();
+            return;
+          }
         }
         if (selected.attachBackend === 'zmx') {
           const target = selected.backendTarget;
@@ -5756,7 +5844,9 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         resolve();
         return;
       }
-    });
+    }
+
+    process.stdin.on('data', onInput);
   });
 }
 
