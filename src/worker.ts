@@ -112,9 +112,16 @@ import { TurnTerminalDeduper } from './services/turn-terminal-deduper.js';
 import { defaultGatewayEntry, ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
 import {
   sessionMcpGatewayPathRegex,
+  sessionMcpGatewaySocketPath,
   startSessionMcpGatewayHost,
   type SessionMcpGatewayHost,
 } from './core/plugins/mcp/host.js';
+import {
+  clearMcpGatewayLaunchRecord,
+  mcpGatewayPaneReattachSafe,
+  readMcpGatewayLaunchRecord,
+  writeMcpGatewayLaunchRecord,
+} from './core/plugins/mcp/launch-record.js';
 import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
@@ -1542,15 +1549,37 @@ async function prepareCliPluginGenerationAndGateway(
   const manifest = readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir);
   stopSessionMcpGatewayHost();
   if (adapter.mcpGateway && manifest?.entries.length) {
-    sessionMcpGatewayHost = await startSessionMcpGatewayHost({
-      sessionId: cfg.sessionId,
-      dataDir: config.session.dataDir,
-      trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
-      onError: error => log(`[mcp-gateway] host error: ${error.message}`),
-    });
+    await startAndRecordSessionMcpGatewayHost(cfg.sessionId);
     log(`[mcp-gateway] trusted host listening for ${manifest.entries.length} plugin server(s)`);
+  } else {
+    clearMcpGatewayLaunchRecord(config.session.dataDir, cfg.sessionId);
   }
   return manifest;
+}
+
+/** Bind the trusted MCP Gateway host at the session's DETERMINISTIC socket path
+ *  and persist its launch record. Deliberately does NOT refresh the plugin/Skill
+ *  generation: prepareCliPluginGenerationAndGateway does that for fresh/resumed
+ *  spawns, whereas a warm reattach to a surviving pane keeps the CLI's existing
+ *  catalog untouched — but the host itself died with the previous worker, so the
+ *  reattach path must still re-serve it here so the pane's surviving relay can
+ *  reconnect to the same path (see spawnCli's paneRelayReattachSafe branch).
+ *  The caller owns stopping any prior host first (prepare*) or gating on absence
+ *  (reattach). Token rotation + stale-socket removal are handled inside
+ *  startSessionMcpGatewayHost. The trusted-turn-identity provider (#917) is
+ *  wired here so BOTH the fresh/resumed host and the re-served reattach host
+ *  inject the per-turn host-signed caller — the reattach path must not lose it. */
+async function startAndRecordSessionMcpGatewayHost(sessionId: string): Promise<void> {
+  sessionMcpGatewayHost = await startSessionMcpGatewayHost({
+    sessionId,
+    dataDir: config.session.dataDir,
+    trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
+    onError: error => log(`[mcp-gateway] host error: ${error.message}`),
+  });
+  // The NEXT worker generation reads this record to decide whether a surviving
+  // persistent pane can be reattached (relay reconnects to the same path)
+  // instead of killed for a cold-resume.
+  writeMcpGatewayLaunchRecord(config.session.dataDir, sessionId, sessionMcpGatewayHost.socketPath);
 }
 
 /** v2 read isolation — provision a bot's PER-BOT config dir under its BOT_HOME so the
@@ -12739,11 +12768,35 @@ async function spawnCli(
     if (effectiveBackendType === 'zmx') {
       resolvedZmxSessionProbe = paneProbe;
     }
-    if (paneProbe === 'exists') {
-      // The trusted Gateway host belongs to the worker and cannot survive a
-      // worker/daemon replacement. Cold-resume the CLI so its MCP client gets a
-      // fresh relay socket instead of reattaching to a dead connection.
-      log(`[mcp-gateway] persistent pane ${cfg.sessionId} has plugin MCP state — cold-resuming with a fresh host`);
+    const paneRelayReattachSafe = paneProbe === 'exists'
+      && mcpGatewayPaneReattachSafe(
+        readMcpGatewayLaunchRecord(config.session.dataDir, cfg.sessionId),
+        sessionMcpGatewaySocketPath(cfg.sessionId, config.session.dataDir),
+      );
+    if (paneRelayReattachSafe) {
+      // The pane's CLI was launched against the deterministic Gateway socket
+      // path by a reconnect-capable relay. Reattaching preserves whatever turn
+      // the CLI is executing — the whole point of the persistent backend — but
+      // the trusted host died with the previous worker, so we must RE-SERVE it
+      // here at the same deterministic path for the pane's surviving relay to
+      // reconnect to. This reattach path skips prepareCliPluginGenerationAndGateway
+      // (it must not refresh the catalog on a warm reattach), which is the only
+      // other host starter; without this the relay would reconnect forever to a
+      // socket nothing binds. Start only when this fresh worker has no live host
+      // yet — never stomp a host an in-worker restart already brought up.
+      if (!sessionMcpGatewayHost) {
+        await startAndRecordSessionMcpGatewayHost(cfg.sessionId);
+        if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
+        log(`[mcp-gateway] persistent pane ${cfg.sessionId} keeps its relay socket path — re-served trusted host at the same path; relay reconnects on its own`);
+      } else {
+        log(`[mcp-gateway] persistent pane ${cfg.sessionId} keeps its relay socket path — reattaching; live host already bound, relay stays connected`);
+      }
+    } else if (paneProbe === 'exists') {
+      // Legacy pane (mkdtemp-random socket path, or a relay predating
+      // reconnect support): its MCP client can never reach the replacement
+      // host. Cold-resume the CLI so it gets a fresh relay socket instead of
+      // reattaching to a dead connection.
+      log(`[mcp-gateway] persistent pane ${cfg.sessionId} has plugin MCP state without a reconnect-capable relay — cold-resuming with a fresh host`);
       const persistentBackendType = effectiveBackendType as PersistentBackendType;
       const persistentTarget = selectedBackend.persistentBackendTarget;
       if (effectiveBackendType === 'zmx') {
