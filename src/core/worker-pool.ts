@@ -392,6 +392,7 @@ import type {
   DisplayMode,
   StreamStatus,
   QueuedActivationTailEntry,
+  ScreenStatus,
 } from '../types.js';
 import {
   appendAcceptedCodexAppDispatch,
@@ -417,7 +418,7 @@ import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.j
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
-import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
+import { usageLimitStateKey, isActiveWorkRuntimeStatus, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import {
   evaluateVcMeetingManagedSend,
   resolveVcMeetingImTurnOrigin,
@@ -1746,6 +1747,35 @@ function updateUsageLimitState(ds: DaemonSession, usageLimit?: CliUsageLimitStat
   ds.usageLimit = usageLimit;
   persistStreamCardState(ds);
   armUsageLimitRetryTimer(ds, previous);
+}
+
+/**
+ * Resolve the daemon-side screen status in the presence of a usage limit.
+ *
+ * Limit state is intentionally sticky across ticks that carry no fresh verdict
+ * (the worker re-emits only while the limit text stays on screen; screenshot
+ * ticks arrive every 10s), so a recorded limit survives ordinary idle frames
+ * and the cooldown card stays up until the user retries. But it must
+ * self-heal on evidence of active work: a blocked CLI does not produce
+ * `working`/`analyzing` frames, so a limit that survives such a frame was a
+ * false positive (a flicker-frame screen scan, or a structured emit the CLI
+ * recovered from). Without this the card keeps showing 「限额已达」 for the
+ * rest of the turn even though the CLI is demonstrably still running — the
+ * reported 误报. The worker-side status gate (detectScreenUsageLimit) prevents
+ * the detection while active; this is the daemon-side net for limits recorded
+ * during an idle flicker before work resumed.
+ */
+function resolveUsageAwareScreenStatus(
+  ds: DaemonSession,
+  workerStatus: ScreenStatus,
+  freshUsageLimit: CliUsageLimitState | undefined,
+): ScreenStatus {
+  if (freshUsageLimit) return 'limited';
+  if (ds.usageLimit && isActiveWorkRuntimeStatus(workerStatus)) {
+    clearUsageLimitState(ds);
+    return workerStatus;
+  }
+  return ds.usageLimit ? 'limited' : workerStatus;
 }
 
 const WORKER_ERROR_MARKER = '[botmux-worker-error]';
@@ -10525,7 +10555,7 @@ function setupWorkerHandlers(
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
-        ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
+        ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
         bumpStreamCardStatusRevision(ds);
         // A suspend that arrived mid-turn parked itself here. Defer until this
         // screen_update has finished using process state — suspendWorker nulls
@@ -10753,7 +10783,7 @@ function setupWorkerHandlers(
         if (ds.streamCardPending) break;
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
-        ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
+        ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
         bumpStreamCardStatusRevision(ds);
         // Same deferred-suspend checkpoint as the screen_update branch, and
         // deferred for the same reason (see runPendingSuspendIfSettled).
