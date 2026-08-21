@@ -320,6 +320,12 @@ import {
   parseDashboardSummaryRows,
 } from './dashboard/dashboard-summary.js';
 import { createDashboardSummaryEndpoint } from './dashboard/dashboard-summary-endpoint.js';
+import {
+  createDashboardAutostartController,
+  DashboardAutostartError,
+  dashboardAutostartErrorStatus,
+  parseAutostartWrite,
+} from './dashboard/autostart-api.js';
 import { scrubWorkflowWorkerEnv } from './utils/child-env.js';
 
 // The dashboard is an independent long-lived PM2 app and can be resurrected
@@ -331,6 +337,14 @@ scrubWorkflowWorkerEnv(process.env);
 
 const SECRET_PATH = dashboardSecretPath();
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
+const AUTOSTART_CONFIG_DIR = join(homedir(), '.botmux');
+const dashboardAutostart = createDashboardAutostartController({
+  opts: {
+    pkgRoot: botmuxInstallRoot(),
+    configDir: AUTOSTART_CONFIG_DIR,
+    logDir: join(AUTOSTART_CONFIG_DIR, 'logs'),
+  },
+});
 /** Per-daemon budget for the cross-daemon insight overview fan-out — bounds
  *  aggregate latency when one daemon's insight parse is slow or hung. */
 const INSIGHT_FANOUT_TIMEOUT_MS = 10_000;
@@ -3949,6 +3963,37 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, herdrTraexInstall
         ? { ok: true, settings: result.settings, herdrTraexInstall }
         : { ok: true, settings: result.settings });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/autostart') {
+      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      res.setHeader('cache-control', 'no-store');
+      return jsonRes(res, 200, { ok: true, state: await dashboardAutostart.getState() });
+    }
+    if (req.method === 'PUT' && url.pathname === '/api/autostart') {
+      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      res.setHeader('cache-control', 'no-store');
+      let body: unknown;
+      try {
+        body = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const parsed = parseAutostartWrite(body);
+      if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: 'invalid_body' });
+      try {
+        const state = await dashboardAutostart.setEnabled(parsed.enabled);
+        return jsonRes(res, 200, { ok: true, state });
+      } catch (error) {
+        if (error instanceof DashboardAutostartError) {
+          logger.warn(`[dashboard-autostart] ${error.code}: ${error.message}`);
+          return jsonRes(res, dashboardAutostartErrorStatus(error), {
+            ok: false,
+            error: error.code,
+          });
+        }
+        throw error;
+      }
     }
 
     // ─── Version & manual update ─────────────────────────────────────────────

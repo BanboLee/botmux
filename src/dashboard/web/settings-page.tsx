@@ -131,6 +131,19 @@ interface ReleaseNote { version: string; name: string; body: string; url: string
 
 type StatusMessage = { text: string; cls?: string } | null;
 
+interface AutostartState {
+  supported: boolean;
+  enabled: boolean;
+}
+
+function parseAutostartState(value: unknown): AutostartState | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const state = value as Record<string, unknown>;
+  return typeof state.supported === 'boolean' && typeof state.enabled === 'boolean'
+    ? { supported: state.supported, enabled: state.enabled }
+    : null;
+}
+
 /** Map a `herdrTraexInstall` result (returned by PUT /api/settings when the
  *  write triggered a live TraeX plugin install) to a settings status message. */
 function traexInstallMessage(install: any, tr: (k: string) => string): StatusMessage {
@@ -265,6 +278,12 @@ function SettingsPage() {
   const [upBusy, setUpBusy] = useState(false);
   const [upMsg, setUpMsg] = useState<StatusMessage>(null);
 
+  const [autostartState, setAutostartState] = useState<AutostartState | null>(null);
+  const [autostartLoading, setAutostartLoading] = useState(false);
+  const [autostartError, setAutostartError] = useState(false);
+  const [autostartBusy, setAutostartBusy] = useState(false);
+  const [autostartMsg, setAutostartMsg] = useState<StatusMessage>(null);
+
   const clearTimers = useCallback(() => {
     for (const id of timersRef.current) window.clearTimeout(id);
     timersRef.current.clear();
@@ -295,6 +314,24 @@ function SettingsPage() {
       if (!mountedRef.current) return;
       setUpStatus(null);
       setUpStatusError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  const fetchAutostart = useCallback(async () => {
+    setAutostartLoading(true);
+    try {
+      const response = await fetch('/api/autostart', { cache: 'no-store' });
+      const body = await response.json().catch(() => ({}));
+      const state = response.ok ? parseAutostartState(body.state) : null;
+      if (!state) throw new Error('invalid_state');
+      if (!mountedRef.current) return;
+      setAutostartState(state);
+      setAutostartError(false);
+    } catch {
+      if (!mountedRef.current) return;
+      setAutostartError(true);
+    } finally {
+      if (mountedRef.current) setAutostartLoading(false);
     }
   }, []);
 
@@ -336,8 +373,40 @@ function SettingsPage() {
     setUpBusy(false);
     setUpMsg(null);
     setUpChangelogOpen(false);
-    if (canWrite) void fetchStatus();
-  }, [canWrite, fetchStatus, settingsLoaded]);
+    setAutostartMsg(null);
+    if (canWrite) {
+      void fetchStatus();
+      void fetchAutostart();
+    }
+  }, [canWrite, fetchAutostart, fetchStatus, settingsLoaded]);
+
+  async function setAutostartEnabled(enabled: boolean): Promise<void> {
+    if (!autostartState || autostartBusy) return;
+    const before = autostartState;
+    setAutostartBusy(true);
+    setAutostartState({ ...before, enabled });
+    setAutostartMsg({ text: tr('settings.autostartSaving') });
+    try {
+      const response = await fetch('/api/autostart', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      });
+      const body = await response.json().catch(() => ({}));
+      const state = response.ok ? parseAutostartState(body.state) : null;
+      if (!state) throw new Error('save_failed');
+      if (!mountedRef.current) return;
+      setAutostartState(state);
+      setAutostartMsg({ text: tr('settings.autostartSaved'), cls: 'hint-ok' });
+    } catch {
+      if (!mountedRef.current) return;
+      setAutostartState(before);
+      setAutostartMsg({ text: tr('settings.autostartSaveFailed'), cls: 'hint-warn-inline' });
+      void fetchAutostart();
+    } finally {
+      if (mountedRef.current) setAutostartBusy(false);
+    }
+  }
 
   async function saveSettings(
     key: string,
@@ -553,6 +622,19 @@ function SettingsPage() {
     }
   }
 
+  const autostartBlock = (
+    <AutostartCard
+      canWrite={canWrite}
+      state={autostartState}
+      loading={autostartLoading}
+      error={autostartError}
+      busy={autostartBusy}
+      message={autostartMsg}
+      onChange={enabled => { void setAutostartEnabled(enabled); }}
+      onRetry={() => { void fetchAutostart(); }}
+    />
+  );
+
   const updateBlock = (
     <UpdateCard
       canWrite={canWrite}
@@ -590,6 +672,7 @@ function SettingsPage() {
       bound={bound}
       savingKey={savingKey}
       message={settingsMsg}
+      autostartBlock={autostartBlock}
       updateBlock={updateBlock}
       feishuLoginQr={feishuLoginQr}
       onCloseFeishuLoginQr={() => setFeishuLoginQr(null)}
@@ -620,6 +703,7 @@ function SettingsBody(props: {
   bound: boolean;
   savingKey: string | null;
   message: StatusMessage;
+  autostartBlock: ReactNode;
   updateBlock: ReactNode;
   feishuLoginQr: string | null;
   onCloseFeishuLoginQr(): void;
@@ -928,6 +1012,7 @@ function SettingsBody(props: {
         description={tr('settings.moduleSystemHelp')}
       >
       <SettingsGroup className="settings-group-ops">
+        {props.autostartBlock}
         <SettingsBlock
           title={tr('settings.sectionMaintenance')}
           titleExtra={settings.localDevInstall
@@ -1509,6 +1594,58 @@ function TraexPluginEditor(props: {
       </div>
     </div>
   );
+}
+
+function AutostartCard(props: {
+  canWrite: boolean;
+  state: AutostartState | null;
+  loading: boolean;
+  error: boolean;
+  busy: boolean;
+  message: StatusMessage;
+  onChange(enabled: boolean): void;
+  onRetry(): void;
+}) {
+  const tr = useT();
+  let content: ReactNode;
+
+  if (!props.canWrite) {
+    content = <p className="hint-warn">{tr('settings.autostartLoginRequired')}</p>;
+  } else if (props.loading && !props.state) {
+    content = <LoadingState label={tr('settings.autostartLoading')} compact />;
+  } else if (props.error && !props.state) {
+    content = (
+      <>
+        <p className="hint-warn">{tr('settings.autostartLoadFailed')}</p>
+        <div className="update-actions">
+          <button type="button" onClick={props.onRetry}>{tr('settings.autostartRetry')}</button>
+        </div>
+      </>
+    );
+  } else if (props.state?.supported === false) {
+    content = <p className="hint-warn">{tr('settings.autostartUnsupported')}</p>;
+  } else if (props.state) {
+    content = (
+      <>
+        <ToggleRow
+          title={tr('settings.autostartToggle')}
+          help={tr('settings.autostartHelp')}
+          checked={props.state.enabled}
+          disabled={props.busy}
+          onChange={props.onChange}
+        />
+        {props.message ? (
+          <p className={`oncall-status ${props.message.cls ?? ''}`} role="status" aria-live="polite">
+            {props.message.text}
+          </p>
+        ) : null}
+      </>
+    );
+  } else {
+    content = null;
+  }
+
+  return <SettingsBlock title={tr('settings.sectionAutostart')}>{content}</SettingsBlock>;
 }
 
 function UpdateCard(props: {
