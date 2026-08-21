@@ -59,6 +59,8 @@ export type BotDefaultsRow = {
   wrapperCli?: string | null;
   model?: string;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** dsh runner turn timeout (ms); rendered as a dsh-only field. */
+  turnTimeoutMs?: number;
   agentSelectionKey?: string;
   defaultOncall?: { enabled?: boolean; workingDir?: string; since?: number };
   defaultWorkingDir?: string | null;
@@ -87,6 +89,8 @@ export type BotDefaultsRow = {
   summaryMemory?: boolean;
   summaryMemoryPath?: string;
   p2pMode?: string;
+  /** #794: per-turn 上下文注入方式。'auto' = 支持的 CLI 走 hook 注入；缺省/'off' = 内联。 */
+  envelopeInjection?: 'auto' | 'off' | null;
   regularGroupReplyMode?: string;
   regularGroupMentionMode?: string;
   substituteMode?: BotSubstituteMode | null;
@@ -96,6 +100,12 @@ export type BotDefaultsRow = {
   logicalSessionCount?: number;
   residentSessionCount?: number;
   dormantSessionCount?: number;
+  sessionOwnerReminder?: {
+    enabled: boolean;
+    intervalMinutes: number;
+    text: string;
+    states: Array<'idle' | 'dormant' | 'pending_repo' | 'tui_prompt' | 'agent_attention' | 'limited'>;
+  } | null;
   startupCommands?: string;
   customPassthroughCommands?: string;
   canTalkDaemonCommands?: string;

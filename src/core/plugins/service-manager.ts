@@ -71,6 +71,13 @@ function serviceLockTarget(): string {
   return `${pluginsHome()}/service-manager`;
 }
 
+/**
+ * Serializes every plugin service lifecycle mutation on one file lock so a
+ * concurrent plugin start/stop/delete can't interleave. (Pre-migration this
+ * also nested under the shared PM2_HOME fleet-mutation lock to order against an
+ * `include-pm2` core restart's `pm2 kill`; the core fleet is now supervisor-
+ * managed with no shared PM2_HOME, so only the plugin service lock remains.)
+ */
 export function withPluginServiceLockSync<T>(fn: () => T): T {
   return withFileLockSync(serviceLockTarget(), fn, { maxWaitMs: 30_000 });
 }
@@ -446,17 +453,24 @@ export async function deletePluginServices(pluginIds?: readonly string[]): Promi
 }
 
 export async function listPluginServiceStatus(): Promise<PluginServiceReport[]> {
-  const reports: PluginServiceReport[] = [];
-  for (const record of selectedRecords()) {
-    try {
-      const definition = await loadPluginServiceDefinition(record);
-      if (!definition) continue;
-      const app = findPm2App(pluginPm2AppName(record.id));
-      const state = writeServiceState(record, definition, app);
-      reports.push(reportFromState(record, 'status', state));
-    } catch (err: any) {
-      reports.push(reportFromState(record, 'failed', readServiceState(record.id), err?.message ?? String(err)));
+  // Also serialized: a "read-only" status probe runs pm2 jlist, and a pm2
+  // client with no live God lazily births one from THIS process's env —
+  // during an include-pm2 restart's kill→start window that would insert a
+  // replacement God. Holding the shared locks parks the probe until the
+  // mutation completes.
+  return withPluginServiceLock(async () => {
+    const reports: PluginServiceReport[] = [];
+    for (const record of selectedRecords()) {
+      try {
+        const definition = await loadPluginServiceDefinition(record);
+        if (!definition) continue;
+        const app = findPm2App(pluginPm2AppName(record.id));
+        const state = writeServiceState(record, definition, app);
+        reports.push(reportFromState(record, 'status', state));
+      } catch (err: any) {
+        reports.push(reportFromState(record, 'failed', readServiceState(record.id), err?.message ?? String(err)));
+      }
     }
-  }
-  return reports;
+    return reports;
+  });
 }
