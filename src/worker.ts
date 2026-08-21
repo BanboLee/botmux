@@ -342,7 +342,8 @@ import {
   type HerdrWebScrollDirection,
 } from './utils/herdr-web-history.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
-import { detectCliUsageLimit, usageLimitStateKey, structuredRateLimitState, isStructuredRateLimitAuthoritative, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import { structuredRateLimitState, isStructuredRateLimitAuthoritative, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import { createUsageLimitTracker } from './utils/usage-limit-tracker.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
 import { applySessionOwnerEnv, redactChildEnv, scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import {
@@ -3971,65 +3972,29 @@ function structuredRateLimitAuthoritative(): boolean {
   return isStructuredRateLimitAuthoritative(cliAdapter);
 }
 
-// Per-turn usage-limit state machine. Owns the turn counter plus the
-// "did this turn hit a limit" / "suppress a stale retry-ready banner" flags, so
-// classify()'s state writes are explicit method calls rather than hidden
-// mutations of module globals from a function that otherwise reads as a pure
-// mapper.
-function createUsageLimitTracker() {
-  let turnSeq = 0;
-  let detectedTurn: number | undefined;
-  let suppressedRetryReadyKey: string | undefined;
+/**
+ * PTY-quiescence window for the usage-limit active-work gate. A `working`
+ * status alone does not prove output is progressing (it is the default
+ * projection whenever promptReady === false), so the screen-scan suppression
+ * only applies while PTY output is this fresh. A non-structured CLI blocked at
+ * a rate/quota error screen that never renders its ready prompt goes silent
+ * past this window and is correctly detected instead of being suppressed
+ * forever. Aligns with the StuckDetector's PTY-quiescence threshold.
+ */
+const USAGE_LIMIT_OUTPUT_ACTIVE_WINDOW_MS = 15_000;
 
-  return {
-    currentTurn(): number {
-      return turnSeq;
-    },
-    // Open a new turn; remember any stale retry-ready banner still on screen so
-    // classify() doesn't re-flag it as a fresh limit this turn.
-    beginTurn(snapshot: string): number {
-      turnSeq++;
-      detectedTurn = undefined;
-      const current = detectCliUsageLimit(snapshot, undefined, { suppressRateKind: structuredRateLimitAuthoritative() });
-      suppressedRetryReadyKey = current.limited && current.retryReady
-        ? usageLimitStateKey(current)
-        : undefined;
-      return turnSeq;
-    },
-    // Map a runtime status to a usage-limit-aware status, recording whether this
-    // turn hit a limit (read back via detectedThisTurn).
-    classify(
-      content: string,
-      status: RuntimeScreenStatus,
-    ): { status: RuntimeScreenStatus | 'limited'; usageLimit?: CliUsageLimitState } {
-      const detected = detectCliUsageLimit(content, undefined, { suppressRateKind: structuredRateLimitAuthoritative() });
-      if (!detected.limited) return { status };
-
-      const key = usageLimitStateKey(detected);
-      if (detected.retryReady && key === suppressedRetryReadyKey) {
-        return { status };
-      }
-
-      suppressedRetryReadyKey = undefined;
-      detectedTurn = turnSeq;
-      return { status: 'limited', usageLimit: detected };
-    },
-    detectedThisTurn(seq: number): boolean {
-      return detectedTurn === seq;
-    },
-    // Record a limit that came from a STRUCTURED signal (transcript error
-    // record) rather than screen text. Mirrors classify()'s state writes so
-    // the tracker stays coherent: mark this turn as having hit a limit (read
-    // by detectedThisTurn for the submit-confirmation recheck) and clear any
-    // stale retry-ready suppression. The actual emit is done by the caller.
-    noteStructuredLimit(): void {
-      suppressedRetryReadyKey = undefined;
-      detectedTurn = turnSeq;
-    },
-  };
+function isOutputActivelyProgressing(): boolean {
+  return Date.now() - lastPtyActivityAtMs < USAGE_LIMIT_OUTPUT_ACTIVE_WINDOW_MS;
 }
 
-const usageLimitTracker = createUsageLimitTracker();
+// Per-turn usage-limit state machine (extracted to utils/usage-limit-tracker
+// for unit testing). The structured-limit stickiness it owns is load-bearing:
+// a one-shot transcript emit must survive the daemon's working-frame self-heal
+// while the CLI stays genuinely blocked.
+const usageLimitTracker = createUsageLimitTracker<RuntimeScreenStatus>({
+  isRateKindSuppressed: structuredRateLimitAuthoritative,
+  isOutputActive: isOutputActivelyProgressing,
+});
 
 function currentUsageLimitSnapshot(): string {
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return '';
@@ -5306,7 +5271,7 @@ function maybeEmitStructuredRateLimit(events: readonly TranscriptEvent[]): void 
     // Prefer a clock parsed from the record's own text ("... resets 10:40pm");
     // fall back to the shared bucketed cooldown when it carries none.
     const usageLimit = structuredRateLimitState(apiErrorMessageText(ev));
-    usageLimitTracker.noteStructuredLimit();
+    usageLimitTracker.noteStructuredLimit(usageLimit);
     send({
       type: 'screen_update',
       content: currentUsageLimitSnapshot(),
@@ -5662,6 +5627,11 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
         const rawUserText = userEv ? extractTurnStartText(userEv) : '';
         const fields = formatLocalTurnFields(rawUserText, postText);
         if (!fields) continue;
+        // A harvested answer proves the CLI recovered from any structured
+        // limit that parked it — mirror the daemon's final_output self-heal
+        // (worker-pool clears ds.usageLimit there) by dropping the tracker's
+        // re-emit latch so the next classify() does not re-pin the card.
+        usageLimitTracker.noteTurnCompleted();
         send({
           type: 'final_output',
           content: fields.content,
@@ -5676,6 +5646,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
       // Headless local turn — see formatHeadlessLocalTurnContent for context.
       const headlessContent = formatHeadlessLocalTurnContent(postText);
       if (!headlessContent) continue;
+      usageLimitTracker.noteTurnCompleted();
       send({
         type: 'final_output',
         content: headlessContent,
@@ -5694,6 +5665,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     const deliveredText = turn.restoredFromJournal
       ? `${t('worker.bridge_restored_turn_notice')}\n\n${postText}`
       : postText;
+    usageLimitTracker.noteTurnCompleted();
     send({
       type: 'final_output',
       content: deliveredText,
@@ -6667,7 +6639,7 @@ function maybeEmitCodexStructuredRateLimit(events: readonly CodexBridgeEvent[]):
     if (!isCodexRateLimitEvent(ev) || emittedRateLimitUuids.has(ev.uuid)) continue;
     emittedRateLimitUuids.add(ev.uuid);
     const usageLimit = structuredRateLimitState(ev.terminalErrorSummary ?? '429 Too Many Requests');
-    usageLimitTracker.noteStructuredLimit();
+    usageLimitTracker.noteStructuredLimit(usageLimit);
     send({
       type: 'screen_update',
       content: currentUsageLimitSnapshot(),
@@ -7182,6 +7154,9 @@ function emitReadyCodexTurns(): void {
       // Lark's per-message limit; daemon owns the card chrome.
       const fields = formatLocalTurnFields(turn.userText ?? '', postContent);
       if (!fields) continue;
+      // Harvested answer → drop the structured-limit re-emit latch (mirrors
+      // the daemon's final_output self-heal; see emitReadyTurns).
+      usageLimitTracker.noteTurnCompleted();
       send({
         type: 'final_output',
         ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),
@@ -7194,6 +7169,7 @@ function emitReadyCodexTurns(): void {
       });
       continue;
     }
+    usageLimitTracker.noteTurnCompleted();
     send({
       type: 'final_output',
       ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),
