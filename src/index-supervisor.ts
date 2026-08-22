@@ -30,15 +30,17 @@ scrubWorkflowWorkerEnv(process.env);
 
 async function main(): Promise<void> {
   const { FleetSupervisor } = await import('./core/fleet-supervisor.js');
-  const { fleetStatePath, fleetDistDir, fleetLogDir, fleetCommandPath, resolveFleetBots, resolveFleetDaemonEnv, fleetDaemonNodeArgs } = await import('./core/fleet-runtime.js');
+  const { fleetStatePath, fleetDistDir, fleetLogDir, fleetCommandPath, resolveFleetBots, resolveFleetMembers, resolveFleetDaemonEnv, fleetDaemonNodeArgs } = await import('./core/fleet-runtime.js');
   const { drainFleetCommands } = await import('./core/fleet-command-queue.js');
   const { logger } = await import('./utils/logger.js');
 
-  const bots = resolveFleetBots();
-  if (bots.length === 0) {
-    logger.info('[supervisor] no bots configured; nothing to supervise');
-    return;
-  }
+  // Every supervised member: the bot daemons from bots.json PLUS the dashboard.
+  // The dashboard is always present (mirrors the old pm2 ecosystem, which always
+  // pushed a botmux-dashboard app), so the supervisor stays up to run it even
+  // with zero bots configured — that's exactly the state where an operator opens
+  // the dashboard to add their first bot.
+  const members = resolveFleetMembers();
+  const botCount = resolveFleetBots().length;
 
   const supervisor = new FleetSupervisor({
     statePath: fleetStatePath(),
@@ -86,8 +88,8 @@ async function main(): Promise<void> {
   };
   process.on('SIGHUP', () => void drain());
 
-  logger.info(`[supervisor] starting fleet: ${bots.length} bot(s)`);
-  supervisor.start(bots);
+  logger.info(`[supervisor] starting fleet: ${botCount} bot(s) + dashboard`);
+  supervisor.start(members);
   // Keep the process alive supervising; children + timers hold the event loop.
 }
 

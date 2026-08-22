@@ -454,10 +454,10 @@ export async function deletePluginServices(pluginIds?: readonly string[]): Promi
 
 export async function listPluginServiceStatus(): Promise<PluginServiceReport[]> {
   // Also serialized: a "read-only" status probe runs pm2 jlist, and a pm2
-  // client with no live God lazily births one from THIS process's env —
-  // during an include-pm2 restart's kill→start window that would insert a
-  // replacement God. Holding the shared locks parks the probe until the
-  // mutation completes.
+  // client with no live God lazily births one from THIS process's env — which
+  // could insert a replacement God mid-mutation. Holding the plugin service
+  // lock parks the probe until any concurrent plugin start/stop/delete
+  // completes.
   return withPluginServiceLock(async () => {
     const reports: PluginServiceReport[] = [];
     for (const record of selectedRecords()) {

@@ -2,16 +2,18 @@ import { spawn, fork, type ChildProcess, type StdioOptions } from 'node:child_pr
 import { join, dirname } from 'node:path';
 
 /**
- * Spawn one of botmux's own entry modules (daemon / core-only / worker) as a
- * child process, transparently across two runtime shapes:
+ * Spawn one of botmux's own entry modules (daemon / core-only / worker /
+ * supervisor / dashboard) as a child process, transparently across two runtime
+ * shapes:
  *
  *   • Node (npm install, dev): the entry is a real file on disk under dist/, so
  *     we spawn `node dist/<entry>.js` exactly as before — ZERO behavior change.
  *   • Bun single-file executable (`bun build --compile`): there is no dist/ on
  *     disk (everything is bundled inside /$bunfs/), so `node dist/<entry>.js`
  *     cannot work. Instead we re-exec THIS binary (`process.execPath`) with a
- *     hidden subcommand (`__core-only` / `__daemon` / `__worker`) that the CLI
- *     dispatcher routes to the same entry module, imported inline.
+ *     hidden subcommand (`__core-only` / `__daemon` / `__worker` / `__supervisor`
+ *     / `__dashboard`) that the CLI dispatcher routes to the same entry module,
+ *     imported inline.
  *
  * `Bun.isStandaloneExecutable` is the authoritative "am I a compiled binary"
  * check (true only inside `bun build --compile` output; false under `bun run`
@@ -24,7 +26,7 @@ import { join, dirname } from 'node:path';
  * on('message') both ways), so worker code that talks over IPC is unchanged.
  */
 
-export type BotmuxEntry = 'core-only' | 'daemon' | 'worker' | 'supervisor';
+export type BotmuxEntry = 'core-only' | 'daemon' | 'worker' | 'supervisor' | 'dashboard';
 
 /** Hidden CLI subcommand that runs a given entry inline (see cli.ts dispatch). */
 const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
@@ -32,6 +34,7 @@ const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
   'daemon': '__daemon',
   'worker': '__worker',
   'supervisor': '__supervisor',
+  'dashboard': '__dashboard',
 };
 
 /** dist/<entry>.js filename for the Node path. */
@@ -40,6 +43,7 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
   'daemon': 'index-daemon.js',
   'worker': 'worker.js',
   'supervisor': 'index-supervisor.js',
+  'dashboard': 'index-dashboard.js',
 };
 
 /** True only when running as a `bun build --compile` single-file executable.

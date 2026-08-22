@@ -2320,8 +2320,8 @@ async function cmdStart(): Promise<void> {
 /**
  * Wipe stale dashboard-daemon descriptors (mtime older than 5 minutes).
  * Live daemons refresh their descriptor every 30s via heartbeat; anything
- * older is from a daemon that exited without cleaning up. Called as part of
- * the pm2 zombie-cleanup flow so the dashboard registry stays consistent.
+ * older is from a daemon that exited without cleaning up. Called as part of the
+ * stop/restart cleanup flow so the dashboard registry stays consistent.
  */
 function cleanupStaleDaemonDescriptors(): void {
   const regDir = join(resolveDataDir(), 'dashboard-daemons');
@@ -2341,41 +2341,6 @@ function cleanupStaleDaemonDescriptors(): void {
 function sleepSyncMs(ms: number): void {
   if (ms <= 0) return;
   try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* SAB unavailable → no-op */ }
-}
-
-function configuredCoreProcessNames(
-  bots: any[] = loadBotsJson(),
-  activationAppId?: string,
-): string[] {
-  const names: string[] = [];
-  bots.forEach((bot, index) => {
-    const appId = typeof bot?.larkAppId === 'string' ? bot.larkAppId : '';
-    const starting = bot?.activationStarting;
-    const committed = bot?.activationCommitted;
-    const deactivating = bot?.activationDeactivating;
-    const conflicting = starting !== undefined && committed !== undefined;
-    const marker = starting ?? committed;
-    const validMarker = (
-      marker
-      && typeof marker === 'object'
-      && !Array.isArray(marker)
-      && marker.appId === appId
-      && typeof marker.jobId === 'string'
-      && marker.jobId
-    );
-    if (
-      bot?.activationPending === true
-      || deactivating !== undefined
-      || conflicting
-      || (
-        (starting !== undefined || committed !== undefined)
-        && (!validMarker || activationAppId !== appId)
-      )
-    ) return;
-    names.push(botProcessName(bot, index, PM2_NAME));
-  });
-  names.push('botmux-dashboard');
-  return names;
 }
 
 /**
@@ -2470,7 +2435,7 @@ async function cmdRestart(): Promise<void> {
 
       // Stop the live supervisor (graceful, then killed if it overruns) and
       // start a fresh one, which re-reads bots.json and (re)spawns every bot.
-      const { restartFleet, fleetBotNames, waitFleetOnline } = await import('./core/fleet-runtime.js');
+      const { restartFleet, fleetMemberNames, waitFleetOnline } = await import('./core/fleet-runtime.js');
       let health: ReturnType<typeof waitFleetOnline>;
       try {
         const r = restartFleet();
@@ -2479,7 +2444,9 @@ async function cmdRestart(): Promise<void> {
             `[restart] 旧 supervisor (pid ${r.stop.supervisorPid}) 未在超时时间内退出；已 SIGKILL 后仍存活，中止重启。`,
           );
         }
-        const names = fleetBotNames();
+        // Health-gate on every supervised member (bot daemons + dashboard), so a
+        // restart that leaves the dashboard down is reported unhealthy, not "ok".
+        const names = fleetMemberNames();
         health = waitFleetOnline(names, pm2StartVerifyTimeoutMs(names.length));
         if (!health.healthy) {
           throw new Error(
@@ -11669,8 +11636,8 @@ const command = process.argv[2];
 
 // Single-file-executable self-hosting: when botmux is a `bun build --compile`
 // binary, it cannot spawn `node dist/index-*.js` (no dist/ on disk). Instead the
-// daemon/core-only/worker spawners re-exec THIS binary with a hidden subcommand
-// (see src/core/self-spawn.ts). Handle those tokens FIRST — before the workflow
+// daemon/core-only/worker/supervisor/dashboard spawners re-exec THIS binary with
+// a hidden subcommand (see src/core/self-spawn.ts). Handle those tokens FIRST —
 // gate and normal dispatch — by importing the corresponding entry module (each
 // bootstraps on import and then owns the process lifecycle) and then AWAITING a
 // never-resolving promise so control never reaches normal dispatch. Under Node
@@ -11683,6 +11650,7 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'daemon') await import('./index-daemon.js');
   else if (__entrySubcommand === 'worker') await import('./worker.js');
   else if (__entrySubcommand === 'supervisor') await import('./index-supervisor.js');
+  else if (__entrySubcommand === 'dashboard') await import('./index-dashboard.js');
   // The entry module now drives the process (top-level main() keeps the event
   // loop alive for the daemon; the worker's IPC listener does the same; a
   // core-only bind failure exits from within). Park here so the normal dispatch

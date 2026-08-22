@@ -87,6 +87,41 @@ export function resolveFleetBots(): FleetBotSpec[] {
 
 const LOG_DIR = join(CONFIG_DIR, 'logs');
 
+/** Canonical process name of the dashboard fleet member — byte-identical to the
+ *  name the old pm2 ecosystem used, so status/logs correlate across the
+ *  migration. */
+export const DASHBOARD_PROCESS_NAME = 'botmux-dashboard';
+
+/**
+ * The dashboard's fleet spec. The dashboard is supervised exactly like a bot
+ * daemon (crash-restart, graceful-exit code 90 → no restart, max_restarts park),
+ * but runs the `dashboard` entry (index-dashboard.ts) instead of a bot daemon,
+ * carries no bot index/appId, and logs to dashboard-{out,err}.log. This is what
+ * replaces the old unconditional `apps.push({ name: 'botmux-dashboard', … })` in
+ * pm2's ecosystemConfig — the dashboard was always a fleet app under pm2, so it
+ * is always a supervised member now too.
+ */
+export function resolveDashboardSpec(): FleetBotSpec {
+  return {
+    name: DASHBOARD_PROCESS_NAME,
+    appId: '',
+    botIndex: -1, // not a bot; never used because entry !== 'daemon'
+    entry: 'dashboard',
+    logBaseName: 'dashboard',
+  };
+}
+
+/**
+ * Every process the supervisor manages: the bot daemons from bots.json PLUS the
+ * dashboard. This is the list the supervisor `start()` reconciles and the set
+ * `botmux restart` health-gates on. Kept separate from `resolveFleetBots()`,
+ * which stays bot-only so bot addressing (start-bot/stop-bot by appId, status
+ * rows) is unaffected.
+ */
+export function resolveFleetMembers(): FleetBotSpec[] {
+  return [...resolveFleetBots(), resolveDashboardSpec()];
+}
+
 /** True if a live fleet supervisor is already running (per fleet-state pid + kill -0). */
 export function liveSupervisorPid(): number | undefined {
   const state = readFleetState(fleetStatePath());
@@ -286,6 +321,14 @@ export function waitFleetOnline(
 /** Configured supervisor process names (botmux-<name|index>) for health checks. */
 export function fleetBotNames(): string[] {
   return resolveFleetBots().map((b) => b.name);
+}
+
+/** Every supervised member's name — the bot daemons PLUS the dashboard. This is
+ *  what `botmux restart` health-gates on (waitFleetOnline), so a restart that
+ *  brings the fleet back but leaves the dashboard down is reported unhealthy
+ *  rather than silently "ok". */
+export function fleetMemberNames(): string[] {
+  return resolveFleetMembers().map((m) => m.name);
 }
 
 /** Resolve one bot's fleet spec by larkAppId (null if not in bots.json). */

@@ -14,7 +14,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { openSync, closeSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { resolveEntrySpawn } from './self-spawn.js';
+import { resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
 import {
   decideOnExit,
   freshProc,
@@ -28,11 +28,22 @@ import { mutateFleetState, readFleetState } from './fleet-state-store.js';
 import type { FleetCommand } from './fleet-command-queue.js';
 
 export interface FleetBotSpec {
-  /** botmux-<index> process name. */
+  /** botmux-<index> process name (or 'botmux-dashboard' for the dashboard). */
   name: string;
   appId: string;
-  /** 0-based bot index passed to the daemon via BOTMUX_BOT_INDEX. */
+  /** 0-based bot index passed to the daemon via BOTMUX_BOT_INDEX. Ignored for
+   *  non-'daemon' members (the dashboard has no bot index). */
   botIndex: number;
+  /** Which entry module to spawn. Defaults to 'daemon' — a normal bot. The
+   *  dashboard is a fleet member too ('dashboard'), so the supervisor gives it
+   *  the SAME crash-restart / graceful-exit / stop machinery as a bot daemon,
+   *  which is why it isn't a bespoke spawn. */
+  entry?: BotmuxEntry;
+  /** Log file basename under logDir (default `daemon-<botIndex>`). The two
+   *  streams become `<base>-out.log` / `<base>-err.log`. Lets the dashboard
+   *  write `dashboard-out.log` / `dashboard-err.log` instead of a bot-indexed
+   *  name. */
+  logBaseName?: string;
 }
 
 export interface FleetSupervisorOptions {
@@ -180,24 +191,28 @@ export class FleetSupervisor {
 
   private spawnBot(spec: FleetBotSpec, isRestart: boolean): void {
     if (this.stopping) return;
-    const { command, args } = resolveEntrySpawn('daemon', this.opts.distDir);
+    const entry = spec.entry ?? 'daemon';
+    const { command, args } = resolveEntrySpawn(entry, this.opts.distDir);
     // node_args (heap/diag) apply only to the Node path; a compiled binary has
     // no separate interpreter args. resolveEntrySpawn already picks the shape;
     // we prepend node_args only when the command is a node/JS invocation.
     const isStandalone = args.length > 0 && args[0].startsWith('__');
     const nodeArgs = isStandalone ? [] : (this.opts.daemonNodeArgs ?? []);
-    // Per-bot log files (mirrors pm2 out_file/error_file → `botmux logs --bot`).
-    // Opened in append mode so a restart keeps history; fds are closed when the
-    // child exits (see onChildExit). When no logDir is configured (tests), the
-    // child inherits our stdio.
+    // Per-member log files (mirrors pm2 out_file/error_file → `botmux logs`).
+    // Bot daemons write daemon-<index>-{out,err}.log; the dashboard writes
+    // dashboard-{out,err}.log (spec.logBaseName). Opened in append mode so a
+    // restart keeps history; fds are closed when the child exits (see
+    // onChildExit). When no logDir is configured (tests), the child inherits
+    // our stdio.
+    const logBase = spec.logBaseName ?? `daemon-${spec.botIndex}`;
     let stdio: Array<'ignore' | 'inherit' | number> = ['ignore', 'inherit', 'inherit'];
     let outFd: number | undefined;
     let errFd: number | undefined;
     if (this.opts.logDir) {
       try {
         mkdirSync(this.opts.logDir, { recursive: true });
-        outFd = openSync(join(this.opts.logDir, `daemon-${spec.botIndex}-out.log`), 'a');
-        errFd = openSync(join(this.opts.logDir, `daemon-${spec.botIndex}-err.log`), 'a');
+        outFd = openSync(join(this.opts.logDir, `${logBase}-out.log`), 'a');
+        errFd = openSync(join(this.opts.logDir, `${logBase}-err.log`), 'a');
         stdio = ['ignore', outFd, errFd];
       } catch (err) {
         this.log(`${spec.name} log file open failed, inheriting stdio: ${err instanceof Error ? err.message : err}`);
@@ -205,10 +220,18 @@ export class FleetSupervisor {
         if (errFd !== undefined) { try { closeSync(errFd); } catch { /* */ } errFd = undefined; }
       }
     }
+    // Bot daemons need their 0-based index (BOTMUX_BOT_INDEX); the dashboard is
+    // app-agnostic and takes only the shared base env (it loads its own
+    // ~/.botmux/.env H5 family in index-dashboard.ts). Injecting a bot index
+    // into the dashboard would be meaningless and misleading, so gate it on the
+    // 'daemon' entry.
+    const childEnv: NodeJS.ProcessEnv = entry === 'daemon'
+      ? { ...this.opts.daemonEnv, BOTMUX_BOT_INDEX: String(spec.botIndex) }
+      : { ...this.opts.daemonEnv };
     const child = spawn(command, [...nodeArgs, ...args], {
       cwd: this.opts.cwd,
       stdio,
-      env: { ...this.opts.daemonEnv, BOTMUX_BOT_INDEX: String(spec.botIndex) },
+      env: childEnv,
       windowsHide: true,
     });
     // The child dup'd the fds; close our copies so we don't leak one per respawn.
