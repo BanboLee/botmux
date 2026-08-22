@@ -1,9 +1,11 @@
 /**
  * SQLite compatibility shim so botmux runs on BOTH runtimes:
  *   • Node (npm / dev): the built-in `node:sqlite` `DatabaseSync` (Node 22+).
- *   • Bun single-file executable: `node:sqlite` does NOT exist under Bun
- *     (verified: `No such built-in module: node:sqlite` on Bun 1.3.14), so use
- *     Bun's built-in `bun:sqlite` `Database` instead.
+ *   • Bun single-file executable: use Bun's built-in `bun:sqlite` `Database`.
+ *     (Historically `node:sqlite` did NOT exist under Bun — verified missing on
+ *     Bun 1.3.14; Bun 1.4 now ships it, but we keep using `bun:sqlite` under Bun:
+ *     it's the native engine, already verified, and switching would be a
+ *     behavior change for no benefit. The runtime split stays.)
  *
  * Both back the same tiny synchronous API botmux uses (open, exec, prepare→
  * get/run/all, close), so we expose one `DatabaseSyncLike` interface and pick
@@ -42,7 +44,8 @@ export interface OpenOptions {
   readOnly?: boolean;
 }
 
-/** True when running under Bun (has the `Bun` global). node:sqlite is absent here. */
+/** True when running under Bun (has the `Bun` global). We back it with
+ *  `bun:sqlite` regardless of whether this Bun also exposes node:sqlite (1.4+). */
 function isBunRuntime(): boolean {
   // @ts-ignore — Bun global absent under Node/tsc.
   return typeof Bun !== 'undefined';

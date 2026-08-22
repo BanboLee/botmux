@@ -22,8 +22,9 @@ import { join, dirname } from 'node:path';
  *
  * IPC parity: `child_process.fork(file)` sets up a Node IPC channel via a magic
  * `ipc` stdio slot. `spawn(execPath, [subcmd], { stdio: [...,'ipc'] })` sets up
- * the SAME channel (verified on Bun 1.3.14: bidirectional process.send /
- * on('message') both ways), so worker code that talks over IPC is unchanged.
+ * the SAME channel (verified on Bun 1.3.14 and still the pinned behavior on 1.4:
+ * bidirectional process.send / on('message') both ways), so worker code that
+ * talks over IPC is unchanged.
  */
 
 export type BotmuxEntry = 'core-only' | 'daemon' | 'worker' | 'supervisor' | 'dashboard';
@@ -48,14 +49,16 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
 
 /** True only when running as a `bun build --compile` single-file executable.
  *
- *  `Bun.isStandaloneExecutable` SOUNDS authoritative but is unreliable in
- *  practice (observed `undefined` inside a real --compile binary on Bun 1.3.14),
- *  so we primarily detect the embedded-filesystem marker: a compiled binary's
- *  entry module lives under the virtual `/$bunfs/` root, so `process.argv[1]`
- *  (and `import.meta`/module paths) start with it — in BOTH the top-level process
- *  and any child we re-exec via `process.execPath` (verified: the child still
- *  reports the /$bunfs/ argv[1]). We OR the two signals so a future Bun that
- *  fixes the flag also works. */
+ *  `Bun.isStandaloneExecutable` SOUNDS authoritative but WAS unreliable (observed
+ *  `undefined` inside a real --compile binary on Bun 1.3.14; Bun 1.4 fixes it —
+ *  verified it returns a proper boolean there). We still primarily detect the
+ *  embedded-filesystem marker: a compiled binary's entry module lives under the
+ *  virtual `/$bunfs/` root, so `process.argv[1]` (and `import.meta`/module paths)
+ *  start with it — in BOTH the top-level process and any child we re-exec via
+ *  `process.execPath` (verified: the child still reports the /$bunfs/ argv[1]).
+ *  We OR the two signals: the flag (now correct on 1.4) plus the marker that also
+ *  covered the older Bun — so the check is robust across both pinned and future
+ *  Bun versions. */
 export function isStandaloneBinary(): boolean {
   // @ts-ignore — Bun global is absent under Node/tsc; guard at runtime.
   if (typeof Bun !== 'undefined' && Bun.isStandaloneExecutable === true) return true;
@@ -97,8 +100,9 @@ export function entryForSubcommand(token: string): BotmuxEntry | null {
  *     and existing tests that mock `child_process.fork` keep intercepting it.
  *   • Standalone binary: there is no dist/worker.js on disk, and `fork` needs a
  *     module file — so use `spawn(process.execPath, ['__worker'], {stdio:[...,'ipc']})`,
- *     which gives the SAME Node IPC channel (verified on Bun 1.3.14: bidirectional
- *     process.send / on('message')). execArgv is dropped (a compiled binary has no
+ *     which gives the SAME Node IPC channel (verified on Bun 1.3.14, unchanged on
+ *     the 1.4 pin: bidirectional process.send / on('message')). execArgv is
+ *     dropped (a compiled binary has no
  *     separate interpreter args).
  */
 export function spawnWorker(opts: {

@@ -115,6 +115,22 @@ describe('dashboard launcher — source pins', () => {
     const cli = read('cli.ts');
     expect(cli).toContain('fleetMemberNames');
   });
+
+  it('bot-onboarding.ts STATIC-imports qrcode vendor files so the compiled binary embeds them', () => {
+    // The compiled (bun --compile) dashboard crashed with "Cannot find module
+    // 'qrcode-terminal/vendor/QRCode'" because a `createRequire(...)` of a bare
+    // dir path is not traced/embedded by the bundler. Static `.js` imports are.
+    // (Verified end-to-end: the fix takes the 1.4 compiled dashboard from
+    // crashloop → online.) Guard against a regression back to createRequire.
+    const src = read('dashboard/bot-onboarding.ts');
+    expect(src).toContain("import QRCode from 'qrcode-terminal/vendor/QRCode/index.js'");
+    expect(src).toContain("import QRErrorCorrectLevel from 'qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel.js'");
+    // No actual createRequire CALL or dynamic vendor require (the prose comment
+    // mentions createRequire, so match the code forms, not the bare word).
+    expect(src).not.toContain("createRequire(import.meta");
+    expect(src).not.toContain("import { createRequire }");
+    expect(src).not.toMatch(/require\(\s*['"]qrcode-terminal\/vendor/);
+  });
 });
 
 describe('FleetSupervisor manages the dashboard like a bot daemon (live)', () => {

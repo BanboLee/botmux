@@ -15,13 +15,15 @@ import { logger } from '../utils/logger.js';
  * upgrade are just byte streams, so the same code path serves both.
  *
  * Why raw TCP rather than `http.createServer` + `http.request`: Bun's node:http
- * has two upgrade black holes (verified on Bun 1.3.14, tracked upstream as
- * oven-sh/bun#9882 / #25156, both also break `http-proxy` and `vite` dev proxy):
+ * has two upgrade black holes (first hit on Bun 1.3.14, STILL OPEN on the 1.4
+ * pin — tracked upstream as oven-sh/bun#9882 / #25156 / #25278, which also break
+ * `http-proxy` and `vite` dev proxy):
  *   1. a client `http.request()` never emits the `'upgrade'` event on a 101, and
  *   2. the socket handed to a server `'upgrade'` listener is write-only-to-void —
  *      `write()` returns true, its callback fires, yet no bytes reach the client.
  * Either one silently drops every terminal WebSocket. Raw sockets rely on none
- * of that machinery, so this proxy behaves identically on Node and Bun.
+ * of that machinery, so this proxy behaves identically on Node and Bun. (Do NOT
+ * simplify to node:http on a Bun upgrade until #9882 closes and it's re-verified.)
  */
 
 export interface TerminalProxyOptions {
