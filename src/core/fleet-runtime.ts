@@ -318,11 +318,6 @@ export function waitFleetOnline(
   }
 }
 
-/** Configured supervisor process names (botmux-<name|index>) for health checks. */
-export function fleetBotNames(): string[] {
-  return resolveFleetBots().map((b) => b.name);
-}
-
 /** Every supervised member's name — the bot daemons PLUS the dashboard. This is
  *  what `botmux restart` health-gates on (waitFleetOnline), so a restart that
  *  brings the fleet back but leaves the dashboard down is reported unhealthy
