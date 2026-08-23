@@ -4390,53 +4390,63 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
           {err && <span className="status-error">✗ {err}</span>}
         </div>
       </div>
-      {authUrl ? (
-        <div className="feed-group-auth-overlay">
-          <section className="feed-group-auth-card" role="dialog" aria-modal="true" aria-labelledby="sg-tag-auth-title">
-            <h3 id="sg-tag-auth-title">{tr('botDefaults.sgTagAuthTitle')}</h3>
-            <p>{tr('botDefaults.sgTagAuthHint')}</p>
-            <button type="button" className="primary feed-group-auth-open" onClick={() => window.open(authUrl, '_blank', 'noopener')}>
-              {tr('botDefaults.sgTagAuthOpen')}
-            </button>
-            <label>
-              <span>{tr('botDefaults.sgTagAuthPasteLabel')}</span>
-              <input
-                type="url"
-                data-input="sessionGroupTagCallbackUrl"
-                value={callbackUrl}
-                placeholder="http://127.0.0.1:9768/callback?code=…&state=…"
-                onChange={event => setCallbackUrl(event.currentTarget.value)}
-              />
-            </label>
-            <div className="actions">
-              <button
-                type="button"
-                data-action="session-group-tag-cancel"
-                onClick={() => {
-                  // 取消不仅关弹窗，还要停掉 startAuth 里仍在跑的 60 次轮询——否则
-                  // authBusy 一直为 true，「一键授权」卡在禁用态最长 3 分钟。bump
-                  // generation 让在途轮询的守卫失配即退出。
-                  lifecycle.current.generation += 1;
-                  setAuthUrl('');
-                  setCallbackUrl('');
-                  setSubmitting(false);
-                  setAuthBusy(false);
-                }}
-              >
-                {tr('botDefaults.sgTagAuthCancel')}
+      {authUrl && typeof document !== 'undefined' ? (
+        // Portal 到 body:此弹层内联渲染在 .page 页面容器的 DOM 里,而 .page 有
+        // `animation: dashboard-page-enter … both`——fill-mode:both 使动画结束后
+        // computed transform 持续为 identity matrix(而非关键字 none),会为后代
+        // position:fixed 建立包含块,于是 .feed-group-auth-overlay 虽写了
+        // fixed+inset:0 却相对 .page 而非视口定位,被约束进页面几何(表现为弹窗
+        // 不全屏、偏挂在按钮附近)。挂到 body 顶层逃出该包含块,与 FeishuLoginModal /
+        // auth-expired-overlay 一致,稳定全屏居中。
+        createPortal(
+          <div className="feed-group-auth-overlay">
+            <section className="feed-group-auth-card" role="dialog" aria-modal="true" aria-labelledby="sg-tag-auth-title">
+              <h3 id="sg-tag-auth-title">{tr('botDefaults.sgTagAuthTitle')}</h3>
+              <p>{tr('botDefaults.sgTagAuthHint')}</p>
+              <button type="button" className="primary feed-group-auth-open" onClick={() => window.open(authUrl, '_blank', 'noopener')}>
+                {tr('botDefaults.sgTagAuthOpen')}
               </button>
-              <button
-                type="button"
-                className="primary"
-                data-action="session-group-tag-complete"
-                disabled={!callbackUrl.trim() || submitting}
-                onClick={() => void completeAuth()}
-              >
-                {submitting ? tr('botDefaults.sgTagAuthSubmitting') : tr('botDefaults.sgTagAuthComplete')}
-              </button>
-            </div>
-          </section>
-        </div>
+              <label>
+                <span>{tr('botDefaults.sgTagAuthPasteLabel')}</span>
+                <input
+                  type="url"
+                  data-input="sessionGroupTagCallbackUrl"
+                  value={callbackUrl}
+                  placeholder="http://127.0.0.1:9768/callback?code=…&state=…"
+                  onChange={event => setCallbackUrl(event.currentTarget.value)}
+                />
+              </label>
+              <div className="actions">
+                <button
+                  type="button"
+                  data-action="session-group-tag-cancel"
+                  onClick={() => {
+                    // 取消不仅关弹窗，还要停掉 startAuth 里仍在跑的 60 次轮询——否则
+                    // authBusy 一直为 true，「一键授权」卡在禁用态最长 3 分钟。bump
+                    // generation 让在途轮询的守卫失配即退出。
+                    lifecycle.current.generation += 1;
+                    setAuthUrl('');
+                    setCallbackUrl('');
+                    setSubmitting(false);
+                    setAuthBusy(false);
+                  }}
+                >
+                  {tr('botDefaults.sgTagAuthCancel')}
+                </button>
+                <button
+                  type="button"
+                  className="primary"
+                  data-action="session-group-tag-complete"
+                  disabled={!callbackUrl.trim() || submitting}
+                  onClick={() => void completeAuth()}
+                >
+                  {submitting ? tr('botDefaults.sgTagAuthSubmitting') : tr('botDefaults.sgTagAuthComplete')}
+                </button>
+              </div>
+            </section>
+          </div>,
+          document.body,
+        )
       ) : null}
     </div>
   );
