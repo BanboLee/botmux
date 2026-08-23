@@ -104,6 +104,7 @@ import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { normalizeExistingAppServerEndpoint } from './core/existing-app-server.js';
 import { resolveChildBotsConfig } from './core/config-dir.js';
 import {
   evaluateVcMeetingManagedSend,
@@ -372,6 +373,7 @@ import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
 import {
+  CODEX_APP_ACTIVE_WRITER_EXIT_CODE,
   normalizeCodexAppLifecycleEvent,
   normalizeFinalUsage,
 } from './services/codex-app-runner-protocol.js';
@@ -5721,6 +5723,21 @@ function codexBridgeFallbackActive(): boolean {
   return isStructuredBridgeFallbackActive(lastInitConfig?.cliId, lastInitConfig?.adoptMode === true);
 }
 
+/** A Codex App shared-adopt starts a SECOND official `codex --remote` client
+ * against an external App Server/thread. It has the same transcript shape as
+ * terminal `/adopt`, but is deliberately NOT `adoptMode`: BotMux still owns
+ * the remote TUI and its normal Lark-input reliability rules. */
+function isExistingAppServerSharedBridge(): boolean {
+  return !!lastInitConfig?.existingAppServerEndpoint;
+}
+
+/** `/adopt`'s split-live attach is also required for the App Server share:
+ * existing history is absorbed while new, App-side turns after the attach
+ * boundary can be synthesised back into the Lark conversation. */
+function codexBridgeUsesSplitLiveAttach(): boolean {
+  return lastInitConfig?.adoptMode === true || isExistingAppServerSharedBridge();
+}
+
 /** Only drivers with a complete normal-final + interrupted-terminal contract
  *  may let a transcript-started turn override the screen-ready heuristic. */
 function hasStructuredLifecycleBlock(): boolean {
@@ -5885,8 +5902,9 @@ function codexBridgeStartTimer(): void {
         // Late-attach: cliSessionId (writeInput / daemon probe) then adopt
         // pid. Path lookup is centralized in resolveFileBridgePath so
         // adding a file-backed CLI does not grow this if-tree.
-        // Adopt → split-live; non-adopt → fresh-empty (queue markTimeMs
-        // lower bound handles history without a split).
+        // Terminal `/adopt` and an existing-App-Server share both need
+        // split-live: absorb history before the attach boundary while keeping
+        // new local/App-side turns after it available for forwarding.
         const path = resolveFileBridgePath(lastInitConfig?.cliId, {
           sessionId: codexBridgePendingSessionId,
           cwd: lastInitConfig?.workingDir,
@@ -5914,7 +5932,7 @@ function codexBridgeStartTimer(): void {
           }
           codexBridgePendingSessionId = undefined;
           codexAdoptPendingPid = undefined;
-          const mode = lastInitConfig?.adoptMode ? 'split-live' : 'fresh-empty';
+          const mode = codexBridgeUsesSplitLiveAttach() ? 'split-live' : 'fresh-empty';
           codexBridgeAttach(path, mode);
         }
       }
@@ -6314,7 +6332,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
       const pid = currentCodexObservedPid();
       const next = resolveFileBridgePath('codex', { sessionId: cliSessionId });
       if (next && next !== codexBridgeRolloutPath) {
-        const attachMode = lastInitConfig?.adoptMode ? 'split-live' : 'fresh-empty';
+        const attachMode = codexBridgeUsesSplitLiveAttach() ? 'split-live' : 'fresh-empty';
         log(`Codex session binding corrected ${currentSid ?? '?'} → ${cliSessionId} (pid ${pid} owns it); re-attaching bridge to ${next}`);
         codexBridgeDetachFile();
         codexBridgePendingSessionId = undefined;
@@ -6433,7 +6451,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     }
     return;
   }
-  // Codex INITIAL attach (no prior rollout bound). The multi-fd adopt case
+  // Codex INITIAL attach (no prior rollout bound). The multi-fd terminal-adopt case
   // reaches here with codexBridgeRolloutPath still unset: findCodexRolloutByPid
   // returned undefined (ambiguous parent+sibling), so the adopt block armed the
   // poller instead of attaching. The cliSessionId is normally already
@@ -6471,7 +6489,10 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   });
   if (path) {
     codexBridgePendingSessionId = undefined;
-    codexBridgeAttach(path, 'fresh-empty');
+    codexBridgeAttach(
+      path,
+      codexBridgeUsesSplitLiveAttach() ? 'split-live' : 'fresh-empty',
+    );
   } else {
     codexBridgePendingSessionId = cliSessionId;
     codexBridgeStartTimer();
@@ -7078,11 +7099,12 @@ function emitReadyCodexTurns(): void {
   // that flag to settle completed-with-empty; a bare `completed` terminal (e.g.
   // the RPC-hydration timeout path) must never be read as silence.
   const nothingToSendTurns = new Set<(typeof ready)[number]>();
-  const adoptMode = lastInitConfig?.adoptMode === true;
+  const terminalAdoptMode = lastInitConfig?.adoptMode === true;
+  const sharedAppServerBridge = isExistingAppServerSharedBridge();
   // Adopt mode: model is the user's external Codex, no botmux send to
   // gate against — every assistant turn (Lark-driven OR locally typed)
   // should reach the thread. Skip marker IO entirely.
-  const markers = adoptMode ? [] : readSendMarkers();
+  const markers = terminalAdoptMode ? [] : readSendMarkers();
   const remaining = codexBridgeQueue.peek();
   // Only a STARTED pending turn can bound the last ready turn's send window.
   // An unstarted turn hasn't been dequeued yet (its user event hasn't landed),
@@ -7097,6 +7119,13 @@ function emitReadyCodexTurns(): void {
     : undefined;
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
+    // A shared App Server session still owns the BotMux remote TUI, so its
+    // Lark-originated turns retain normal send-marker deduplication. Only a
+    // turn synthesized from Codex App input is external/local: that side has
+    // no pending Lark fingerprint and must be forwarded like terminal
+    // `/adopt`, including both the App prompt and its final reply.
+    const adoptMode = terminalAdoptMode
+      || (sharedAppServerBridge && turn.isLocal === true);
     const sourceHermesSessionId = structuredBridgeIsHermes() ? turn.sourceSessionId : undefined;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
     const gateInput = {
@@ -8706,6 +8735,13 @@ function handleVisibleStartupInteraction(data: string): boolean {
   // Consume only the known startup update picker and choose its non-upgrade
   // row; never let its selection marker reach the first-prompt idle detector.
   if (dismissAidenCodexUpdateDialog(data)) return true;
+
+  // An existing App Server viewer shares the user's Codex App trust context.
+  // Never auto-accept an interactive trust prompt here: it can include
+  // project/plugin hooks owned outside BotMux. The operator can safely choose
+  // "Continue without trusting" through the Web Terminal when Codex presents
+  // its Hooks review menu.
+  if (lastInitConfig?.existingAppServerEndpoint) return false;
 
   if (trustHandled) return false;
   const stripped = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
@@ -12054,6 +12090,30 @@ async function spawnCli(
   opts: { pluginGenerationPrepared?: boolean } = {},
 ): Promise<void> {
   const spawnGeneration = ++cliSpawnGeneration;
+  // Experimental external App Server attachment: BotMux owns only this TUI
+  // client, never the server or its JSON-RPC input stream. Re-establish the
+  // remote argv state on EVERY spawn because killCli() deliberately clears the
+  // generic RPC remote variables before a restart.
+  if (cfg.existingAppServerEndpoint !== undefined) {
+    if (cfg.cliId !== 'codex') {
+      throw new Error('existing App Server attachment requires cliId "codex"');
+    }
+    if (!cfg.cliSessionId) {
+      throw new Error('existing App Server attachment requires an already-selected Codex thread id');
+    }
+    if (cfg.codexRpcInput === true) {
+      throw new Error('existing App Server attachment cannot enable BotMux codexRpcInput');
+    }
+    if (codexRpcEngine) {
+      throw new Error('existing App Server attachment cannot share a BotMux-owned Codex RPC engine');
+    }
+    remoteWsUrl = normalizeExistingAppServerEndpoint(
+      cfg.existingAppServerEndpoint,
+      `worker existingAppServerEndpoint for session ${cfg.sessionId}`,
+    );
+    remoteThreadId = cfg.cliSessionId;
+    log(`External Codex App Server attach prepared for thread ${cfg.cliSessionId.substring(0, 12)}`);
+  }
   // Prefer force-clear so a half-finished rename cannot block the new generation.
   forceClearSessionRenameInFlight();
   currentCliCredentialIsolated = false;
@@ -14861,6 +14921,13 @@ async function spawnCli(
   // can verify they were spawned inside a botmux session by walking the
   // process tree and looking for a matching pid file in this directory.
   const cliPid = backend.getChildPid?.();
+  if (cfg.existingAppServerEndpoint !== undefined) {
+    // The local `codex --remote` client does not own the selected rollout fd;
+    // writeInput must accept only the explicitly bound remote thread in the
+    // shared history.jsonl instead of applying its normal local-PID ownership
+    // filter (which would reject the correct App Server submission).
+    (backend as PtyHandle).expectedCodexSessionId = cfg.cliSessionId;
+  }
   publishLocalProcessAttestation(cliPid ?? undefined);
   if (cliPid && process.env.SESSION_DATA_DIR) {
     const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
@@ -15058,12 +15125,23 @@ async function spawnCli(
   if (cfg.cliId === 'hermes') {
     hermesBridgeAttach(effectiveResume ? 'baseline-existing' : 'fresh-empty');
   } else if (cfg.cliId === 'codex') {
+    if (cfg.existingAppServerEndpoint) {
+      // A shared Codex App thread has two legitimate writers: the App and
+      // BotMux's official `codex --remote` client. Enable local-turn
+      // synthesis only from this share's attach boundary, so older thread
+      // history is absorbed while future App-side turns are mirrored to Lark.
+      codexAdoptStartMs = Date.now();
+      codexBridgeQueue.setLocalTurns(true, codexAdoptStartMs);
+      log('Codex bridge enabled App Server shared-turn forwarding');
+    }
     if (effectiveCliSessionId) {
       const rolloutPath = findCodexRolloutBySessionId(effectiveCliSessionId);
       if (rolloutPath) {
         codexBridgeAttach(
           rolloutPath,
-          effectiveResume ? 'baseline-existing' : 'fresh-empty',
+          cfg.existingAppServerEndpoint
+            ? 'split-live'
+            : effectiveResume ? 'baseline-existing' : 'fresh-empty',
         );
       } else {
         codexBridgePendingSessionId = effectiveCliSessionId;
@@ -15493,7 +15571,7 @@ async function spawnCli(
     if (intentionalRestart) {
       log('Suppressed claude_exit for intentional in-worker restart');
     } else {
-      send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic, turnId: exitedTurnId, dispatchAttempt: exitedDispatchAttempt });
+      send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic, turnId: exitedTurnId, dispatchAttempt: exitedDispatchAttempt, ...(lastInitConfig?.cliId === 'codex-app' && code === CODEX_APP_ACTIVE_WRITER_EXIT_CODE ? { codexAppActiveWriter: true } : {}) });
     }
   });
 
@@ -15762,8 +15840,8 @@ async function restartCliProcess(
   reason: string,
   opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean } = {},
 ): Promise<void> {
-  if (lastInitConfig?.adoptMode) {
-    log(`Restart ignored in adopt mode (${reason})`);
+  if (lastInitConfig?.adoptMode || lastInitConfig?.existingAppServerEndpoint) {
+    log(`Restart ignored in shared-adopt mode (${reason})`);
     return;
   }
   // Invalidate queued/deferred callbacks before async teardown begins. Waiting
@@ -18966,10 +19044,30 @@ function cleanup(): void {
   releaseCodexAppPosixOwnerLease();
 }
 
-process.on('SIGTERM', () => { stopScreenshotLoop(); killCli(); cleanup(); process.exit(0); });
-process.on('SIGINT', () => { stopScreenshotLoop(); killCli(); cleanup(); process.exit(0); });
+/**
+ * A shared existing-App-Server session owns this worker and its bmx-* remote
+ * TUI, but never owns the App Server/thread behind that TUI. On daemon
+ * restart, preserve the remote TUI so the replacement daemon can reattach it;
+ * only retire this worker's HTTP/WebSocket observers. Ordinary managed sessions
+ * retain the historical killCli shutdown path.
+ */
+function shutdownWorkerForParentExit(reason: string): void {
+  stopScreenshotLoop();
+  if (lastInitConfig?.existingAppServerEndpoint) {
+    log(`Preserving existing-App-Server remote TUI during ${reason}`);
+    cleanup();
+    process.exit(0);
+    return;
+  }
+  killCli();
+  cleanup();
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => shutdownWorkerForParentExit('SIGTERM'));
+process.on('SIGINT', () => shutdownWorkerForParentExit('SIGINT'));
 // If parent daemon dies, IPC channel closes — clean up
-process.on('disconnect', () => { log('Daemon disconnected'); stopScreenshotLoop(); killCli(); cleanup(); process.exit(0); });
+process.on('disconnect', () => { log('Daemon disconnected'); shutdownWorkerForParentExit('IPC disconnect'); });
 
 // Watchdog: belt-and-braces parent-death detection. SIGTERM and 'disconnect'
 // should both reach us when the daemon dies, but if main thread is stuck in
@@ -18987,10 +19085,8 @@ setInterval(() => {
   const currentPpid = process.ppid;
   if (currentPpid !== ORIGINAL_PARENT_PID || currentPpid === 1) {
     log(`Watchdog: parent pid changed (${ORIGINAL_PARENT_PID} → ${currentPpid}) — daemon died, exiting`);
-    stopScreenshotLoop();
-    try { killCli(); } catch { /* best-effort */ }
-    try { cleanup(); } catch { /* best-effort */ }
-    process.exit(0);
+    try { shutdownWorkerForParentExit('parent watchdog'); }
+    catch { process.exit(0); /* best-effort exit if teardown itself faults */ }
   }
 }, 30_000).unref();
 
