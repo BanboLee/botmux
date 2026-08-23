@@ -24052,6 +24052,60 @@ dialog select[multiple]:hover:not(:disabled) {
   z-index: 1300;
 }
 
+/* ── ModelPickerField：下拉候选 + 自定义输入（defaults 页与 onboarding 共用） ── */
+.bd-model-picker {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* 自定义模式：输入框与返回按钮并排，输入框占满剩余宽度 */
+.bd-model-custom {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.bd-model-custom > input[type="text"] {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.bd-model-back {
+  flex: none;
+  min-height: var(--button-height);
+  padding: 0 var(--button-padding-x);
+}
+
+/* live 探测进行中：控件下方小转圈（无文案，避免再增 i18n key） */
+.bd-model-busy {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.bd-model-spinner {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  border: 2px solid color-mix(in srgb, currentColor 34%, transparent);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: page-loading-rotate 0.8s linear infinite;
+}
+
+/* 探测结果提示（「已探测 N 个可用模型」） */
+.bd-model-detected {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.45;
+}
+
 .bot-defaults-page :where(.bd-section, .bd-subsection) > .actions,
 .bot-defaults-page .bd-row > .actions {
   justify-content: flex-end;

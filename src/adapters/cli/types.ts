@@ -495,6 +495,20 @@ export interface CliAdapter {
    *  free-text option, so this list is curation, not a hard whitelist. */
   readonly modelChoices?: readonly string[];
 
+  /** Optional live model discovery: enumerate the models this CLI can actually
+   *  use right now (e.g. `traex debug models` prints its full catalogue as
+   *  JSON). The dashboard model picker invokes it on demand for the SELECTED
+   *  CLI only — never in a scan over all adapters — and merges the result with
+   *  `modelChoices`. Contract:
+   *  - MUST be fail-soft: return null on any error, timeout, or unparseable
+   *    output, never throw (the caller falls back to `modelChoices`);
+   *  - MUST be self-contained: one short-lived subprocess (or pure file read)
+   *    with a tight timeout (≤10s) and a capped output buffer — catalogue
+   *    JSON can be hundreds of KB;
+   *  - absent = the CLI cannot enumerate its models; the picker shows
+   *    `modelChoices` only. */
+  readonly detectModels?: () => Promise<readonly string[] | null>;
+
   /** Claude-family CLIs only (claude-code, seed). The data root holding
    *  `projects/<hash>/<id>.jsonl`, `sessions/<pid>.json`, `tasks/`,
    *  `keybindings.json` and `settings.json`. When set, the worker drives the

@@ -1,7 +1,10 @@
+import { execFile } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { promisify } from 'node:util';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { parseDebugModelsJson } from './model-catalog-json.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { traeStateDbPath, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
 import {
@@ -273,6 +276,10 @@ const TRAEX_STATIC_BUSY_PATTERN = new RegExp(
   'i',
 );
 
+/** traex / codex / coco 的 `debug models` 输出同构，解析逻辑抽到
+ *  model-catalog-json.js 共享；旧名 re-export 保持既有引用（含测试）可用。 */
+export { parseDebugModelsJson as parseTraexModelsJson };
+
 export function createTraexAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'traex';
   let cachedBin: string | undefined;
@@ -496,6 +503,28 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       'DeepSeek-V4-Pro',
       'kimi-k2.6',
     ],
+    // Live 模型枚举：`traex debug models` 输出单行 JSON（全量目录 24+ 个模型，
+    // 每条带长 description，整包可达数百 KB），故 maxBuffer 给到 16MB、8s 超时
+    // 兜底。仅 dashboard 在用户选中 traex 时按需调用，不在 daemon/worker 启动
+    // 路径上；任何异常（spawn 失败/超时/输出非法）一律 fail-soft 返回 null，
+    // picker 回退到上面的 modelChoices。
+    async detectModels(): Promise<readonly string[] | null> {
+      try {
+        // lazy promisify：顶层 promisify(execFile) 会在部分 mock child_process
+        // 的测试 import 阶段炸（mock 无 execFile 导出）；推迟到调用时，fail-soft
+        // 的 try/catch 兜住（契约：任何异常 → null）。
+        const execFileAsync = promisify(execFile);
+        const { stdout } = await execFileAsync(this.resolvedBin, ['debug', 'models'], {
+          timeout: 8000,
+          maxBuffer: 16 * 1024 * 1024,
+          windowsHide: true,
+        });
+        const models = parseDebugModelsJson(stdout);
+        return models.length > 0 ? models : null;
+      } catch {
+        return null;
+      }
+    },
     // RPC mode bridges native AskUserQuestion directly. Keep the normal
     // botmux-ask skill available too: TraeX sessions can fail closed to a
     // standard PTY when RPC is unavailable, where native questions cannot

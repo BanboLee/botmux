@@ -134,6 +134,11 @@ import {
   TTADK_DEFAULT_MODEL,
   TTADK_MODEL_SUGGESTIONS,
 } from './setup/cli-selection.js';
+import {
+  staticModelChoices,
+  isKnownSelectionKey,
+  buildModelChoicesResponse,
+} from './services/model-catalog.js';
 import { checkCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
@@ -4786,12 +4791,22 @@ const server = createServer(async (req, res) => {
             cliId: o.cliId,
             wrapperCli: o.wrapperCli,
           }, { shellFallback: false });
+          // 静态模型候选（shell-free）：模型下拉的初始选项；live 增量由
+          // /api/cli-options/models 按需探测。staticModelChoices 自身 fail-soft，
+          // 这里再包一层 try/catch 兜底，保证选项列表永不因模型目录异常而整包失败。
+          let modelChoices: string[] = [];
+          try {
+            modelChoices = [...staticModelChoices(o.key)];
+          } catch {
+            modelChoices = [];
+          }
           return {
             id: o.key,
             label: o.label,
             available: availability.available,
             command: availability.command,
             availabilityReason: availability.reason,
+            modelChoices,
             // ttadk 网关项: 前端据此把模型框默认成 glm-5.1 并挂候选下拉; CoCo 不接受 -m.
             ...(isTtadkWrapper(o.wrapperCli)
               ? { gateway: 'ttadk' as const, acceptsModel: ttadkAcceptsModel(o.wrapperCli) }
@@ -4804,6 +4819,18 @@ const server = createServer(async (req, res) => {
         suggestedAppName: botOnboarding.suggestedAppName(),
         webSession,
       });
+    }
+
+    // On-demand 模型探测：只探测当前选中的单个 CLI（用户在模型下拉旁点「刷新」时），
+    // 不做全量扫描——20+ CLI 各自 shell out 会让表单打开即卡。静态候选已随
+    // /api/cli-options 的 modelChoices 字段下发，本端点只补 live 增量并合并去重。
+    if (req.method === 'GET' && url.pathname === '/api/cli-options/models') {
+      const key = (url.searchParams.get('key') ?? '').trim();
+      if (!isKnownSelectionKey(key)) {
+        return jsonRes(res, 400, { ok: false, error: 'unknown_selection_key' });
+      }
+      const body = await buildModelChoicesResponse(key);
+      return jsonRes(res, 200, body);
     }
 
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
