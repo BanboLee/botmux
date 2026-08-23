@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } fro
 import { DropdownMenu } from './dashboard-components.js';
 import { fetchDetectedModels, mergeModelCandidates, modelSuggestionsForOption } from './bot-defaults.js';
 import { ModelPickerField } from './bot-defaults-page.js';
+import { confirm } from './confirm-modal.js';
 import { t } from './ui.js';
 
 export const OPEN_BOT_ONBOARDING_EVENT = 'botmux:open-bot-onboarding';
@@ -757,9 +758,9 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     void startOnboarding('web');
   }, [startOnboarding]);
 
-  const retry = useCallback((registrationMode: 'web' | 'compat') => {
+  const retry = useCallback(async (registrationMode: 'web' | 'compat') => {
     if (registrationMode === 'compat') {
-      const accepted = window.confirm(t('botOnboarding.compatibilityConfirm'));
+      const accepted = await confirm({ title: '兼容性确认', message: t('botOnboarding.compatibilityConfirm'), danger: false });
       if (!accepted) return;
     }
     const requiresFreshLogin = registrationMode === 'web'
