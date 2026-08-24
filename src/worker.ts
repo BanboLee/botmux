@@ -334,7 +334,11 @@ import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { probeZmxVersion } from './setup/ensure-zmx.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import { IdleDetector } from './utils/idle-detector.js';
-import { StuckDetector, matchHookReviewScreen } from './utils/stuck-detector.js';
+import {
+  StuckDetector,
+  matchHookReviewScreen,
+  shouldHoldInputForHookReview,
+} from './utils/stuck-detector.js';
 import { processStuckWarningTuiKeys, shouldRearmStuckDetector } from './utils/stuck-key-guard.js';
 import { sendTuiKeySequence, submitTuiTextInput } from './utils/tui-input-delivery.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
@@ -2206,6 +2210,37 @@ let readyPatternSeenDuringHold = false;
 let awaitingPostSessionStartPromptEvidence = false;
 /** Scoped marker set only by IdleDetector's screen-driven callback. */
 let postSessionStartPromptEvidenceInFlight = false;
+/** A visible Codex Hook-review screen owns Enter/arrow keys. Keep queued IM
+ * input out of that menu so an automated submit cannot accidentally select
+ * “Trust all” or get consumed as menu navigation. */
+let hookReviewInputHold = false;
+let hookReviewInputHoldNotified = false;
+
+function refreshHookReviewInputHold(snapshot: string): void {
+  if (!snapshot.trim()) return;
+  const blocked = shouldHoldInputForHookReview(snapshot);
+  if (blocked === hookReviewInputHold) return;
+  hookReviewInputHold = blocked;
+  if (blocked) {
+    log('Hook review menu visible — holding queued input until the menu is resolved');
+    return;
+  }
+  hookReviewInputHoldNotified = false;
+  log('Hook review menu cleared — releasing queued input');
+  if (hasPendingInputForFlush()) queueMicrotask(() => { void flushPending(); });
+}
+
+function notifyHookReviewInputHold(): void {
+  if (hookReviewInputHoldNotified) return;
+  hookReviewInputHoldNotified = true;
+  send({
+    type: 'user_notify',
+    turnId: currentBotmuxTurnId,
+    message:
+      '⚠️ Codex 正在显示 Hook 审核菜单。为避免消息误触“Trust all”或被菜单吞掉，'
+      + 'BotMux 已暂存后续消息；请先在终端完成 Hook 选择，恢复普通输入框后会自动投递。',
+  });
+}
 
 /** Wait until the PTY has been quiet for READY_FLUSH_SETTLE_MS (Ink render
  *  drained), capped at READY_FLUSH_SETTLE_CAP_MS, then flush the held prompt.
@@ -2461,6 +2496,16 @@ let pendingSessionRename: string | null = null;
 let nativeSessionTitleSyncInFlight: string | undefined;
 let nativeSessionTitleAppliedThreadId: string | undefined;
 let nativeSessionTitleRevision = 0;
+
+/** Every user-controlled input class that flushPending can deliver. Keep this
+ * shared with review-menu release handling so a queued raw command, adopt
+ * message, or native rename is not stranded after the menu disappears. */
+function hasPendingInputForFlush(): boolean {
+  return pendingMessages.length > 0
+    || pendingAdoptMessages.length > 0
+    || pendingRawInputs.length > 0
+    || pendingSessionRename !== null;
+}
 let nativeSessionTitleResumeUpdatedAt: number | undefined;
 let nativeSessionTitleCurrentGenerationResume = false;
 const nativeSessionTitleSyncAbortControllers = new Set<AbortController>();
@@ -9661,6 +9706,7 @@ function onPtyData(data: string): void {
     }
   }
   renderer?.write(data);
+  refreshHookReviewInputHold(`${renderer?.rawSnapshot() ?? ''}\n${data}`);
 
   // In tmux-attach mode, each web client has its own tmux attach PTY —
   // no relay needed. In non-tmux mode AND in pipe mode (adopt-bridge),
@@ -9771,6 +9817,7 @@ async function onBackendScreenResync(snapshot: string): Promise<void> {
   // current viewport: a prior local attach may have changed the real geometry.
   const visibleSnapshot = nextRenderer?.rawSnapshot() ?? '';
   lastAnalyzerSnapshot = visibleSnapshot;
+  refreshHookReviewInputHold(visibleSnapshot);
 
   // ZMX history does not carry the authoritative current PTY dimensions. A
   // local `zmx attach` can resize the session below our default 120x24 and that
@@ -10675,7 +10722,7 @@ async function flushPending(): Promise<void> {
     ambiguousSubmissionRecoveryHold = null;
   }
   if (ambiguousSubmissionRecoveryHold?.backend === backend) return;
-  if (pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null) return;  // nothing to flush — keep isPromptReady
+  if (!hasPendingInputForFlush()) return;  // nothing to flush — keep isPromptReady
   if (sessionRenameInFlight()) return;  // wait for /rename to finish before any user input
   if (commandLineWritesPending > 0) return;  // do not splice into text -> Enter
   // 注入进行中不得并发写 PTY（用户消息留在 pendingMessages，注入完成后的下一次
@@ -10688,6 +10735,14 @@ async function flushPending(): Promise<void> {
   // flushPendingInjections 消费完 barrier 后由其 finally 的 re-kick 排空。
   if (shouldDeferUserFlush(pendingInjections)) return;
   if (bareShellLaunchBlocked) return;  // launch is held at a bare shell — don't type prompts into it
+  // A Hook-review page has an active selection and consumes Enter/arrow keys.
+  // Re-check the rendered viewport right before a literal write; PTY chunks
+  // can arrive between idle detection and this queue drain.
+  refreshHookReviewInputHold(lastAnalyzerSnapshot || renderer?.rawSnapshot() || '');
+  if (hookReviewInputHold) {
+    notifyHookReviewInputHold();
+    return;
+  }
   // Screen-idle is not a durable receipt. A permission/AskUser prompt can look
   // idle while the logical delivery is unresolved, so no following IM or
   // meeting turn may cross this boundary until an explicit terminal releases
@@ -13247,6 +13302,8 @@ async function spawnCli(
   bareShellLaunchBlocked = false;
   bareShellChecked = false;
   bareShellCheckInProgress = false;
+  hookReviewInputHold = false;
+  hookReviewInputHoldNotified = false;
 
   // ── Resume pre-flight check + two-tier fallback ──────────────────────────
   // Tier 0 (adapter capability): adapters whose buildArgs can only resume a
@@ -18239,12 +18296,22 @@ process.on('message', async (raw: unknown) => {
       // shell。bareShellCheckInProgress 覆盖“检查进行中”、bareShellLaunchBlocked
       // 覆盖“仍停在裸 shell 的安全 hold”两种状态，一并入队；若该进程随后出现
       // 真实 PTY prompt 且 leaf 已变为非 shell，markPromptReady 会恢复排空。
+      // Hook-review menus are another direct-write hazard: raw_input normally
+      // preserves busy delivery, but its Enter/arrow sequence must never drive
+      // the menu's current selection.
+      refreshHookReviewInputHold(lastAnalyzerSnapshot || renderer?.rawSnapshot() || '');
       if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight()
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)
-        || bareShellCheckInProgress || bareShellLaunchBlocked) {
+        || bareShellCheckInProgress || bareShellLaunchBlocked
+        || hookReviewInputHold) {
         freshnessInputQueue.enqueueRaw(msg);
-        log(`Deferred passthrough slash command until CLI input gate settles: ${msg.content}`);
+        if (hookReviewInputHold) {
+          notifyHookReviewInputHold();
+          log(`Deferred passthrough slash command while Hook review is visible: ${msg.content}`);
+        } else {
+          log(`Deferred passthrough slash command until CLI input gate settles: ${msg.content}`);
+        }
       } else {
         await deliverRawInput(msg);
       }
