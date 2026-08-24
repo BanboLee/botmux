@@ -108,21 +108,48 @@ export class FleetSupervisor {
     this.explicitStop.clear();
     // Record our supervisor identity + reconcile the persisted proc set against
     // reality before deciding what to (re)spawn.
+    //
+    // TAKEOVER SAFETY: a proc that is 'online' with a live pid but which THIS
+    // supervisor process did not spawn (not in `this.children`) is an orphan from
+    // a previous supervisor generation that died hard (SIGKILL/OOM/panic) while
+    // its daemon children kept running. If we left it 'online', planStart would
+    // skip it and — when every member is such an orphan — we would spawn NOTHING,
+    // hold no child handles or timers, and the event loop would drain: the new
+    // supervisor exits immediately, leaving the whole fleet (bot daemons AND the
+    // dashboard) running unsupervised, with `botmux start/restart` unable to bring
+    // it back. A supervisor must OWN every live member, so we kill these orphans
+    // here and let planStart respawn them under our ownership. (On the same
+    // supervisor re-reconciling — priorPid === our pid — the children we spawned
+    // ARE in `this.children`, so nothing is killed: idempotent re-start is safe.)
+    const priorPid = readFleetState(this.opts.statePath)?.supervisorPid ?? 0;
+    const isTakeover = priorPid !== process.pid;
+    if (isTakeover) {
+      for (const p of readFleetState(this.opts.statePath)?.procs ?? []) {
+        if (specByName.has(p.name) && p.status === 'online' && pidAlive(p.pid) && !this.children.has(p.name)) {
+          try { process.kill(p.pid, 'SIGTERM'); } catch { /* already gone */ }
+          this.log(`takeover: reclaiming orphan ${p.name} (pid ${p.pid}) from a prior supervisor — SIGTERM + respawn`);
+        }
+      }
+    }
     mutateFleetState(this.opts.statePath, (cur) => {
       // Refresh the start time whenever a NEW supervisor takes over (pid differs
       // from the one on record); a plain `||` would pin it to the first-ever
       // start forever, so status/uptime would misreport across restarts. Keep it
       // only when the SAME supervisor re-reconciles (idempotent re-start).
-      const priorPid = cur.supervisorPid;
-      if (priorPid !== process.pid || !cur.supervisorStartedAt) {
+      const recordedPid = cur.supervisorPid;
+      if (recordedPid !== process.pid || !cur.supervisorStartedAt) {
         cur.supervisorStartedAt = new Date().toISOString();
       }
       cur.supervisorPid = process.pid;
       // Drop procs no longer configured; mark dead 'online' procs as such so
-      // planStart re-spawns them (reconcile after a supervisor restart).
+      // planStart re-spawns them (reconcile after a supervisor restart). On a
+      // takeover, the live orphans we just SIGTERM'd above are also marked
+      // not-online here so planStart respawns them under our ownership — an
+      // orphan we don't hold a handle to is not a member we supervise.
       cur.procs = cur.procs.filter((p) => specByName.has(p.name));
       for (const p of cur.procs) {
-        if (p.status === 'online' && !pidAlive(p.pid)) { p.pid = 0; p.status = 'stopped'; }
+        const owned = this.children.has(p.name);
+        if (p.status === 'online' && (!pidAlive(p.pid) || (isTakeover && !owned))) { p.pid = 0; p.status = 'stopped'; }
       }
       return cur;
     });
@@ -143,6 +170,17 @@ export class FleetSupervisor {
     if (this.stopping) return;
     this.knownSpecs.set(spec.name, spec);
     this.explicitStop.delete(spec.name);
+    // Cancel any pending crash-restart timer FIRST (mirrors stopOneBot). A bot
+    // that just crashed is mid-backoff: status 'launching', pid 0, not in
+    // `children`, with a restart timer scheduled to respawn it. Without this
+    // cancel, the guard below (which needs online+alive+children) does not match,
+    // so we spawn a fresh child here — and then the stale timer ALSO fires and
+    // spawns a SECOND one. The first becomes an orphan the supervisor no longer
+    // tracks (not in `children`/state, its exit ignored by the generation guard),
+    // never reaped by stopAll/stop-bot: two daemons for one bot. Cancelling the
+    // timer makes this the single, owned (re)spawn.
+    const pendingRestart = this.restartTimers.get(spec.name);
+    if (pendingRestart) { clearTimeout(pendingRestart); this.restartTimers.delete(spec.name); }
     const proc = readFleetState(this.opts.statePath)?.procs.find((p) => p.name === spec.name);
     if (proc && proc.status === 'online' && pidAlive(proc.pid) && this.children.has(spec.name)) {
       this.log(`start-bot ${spec.name}: already online (pid ${proc.pid})`);

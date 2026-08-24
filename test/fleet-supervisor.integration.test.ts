@@ -4,13 +4,15 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { FleetSupervisor, pidAlive, type FleetBotSpec } from '../src/core/fleet-supervisor.js';
-import { readFleetState } from '../src/core/fleet-state-store.js';
+import { readFleetState, mutateFleetState } from '../src/core/fleet-state-store.js';
 
 const dirs: string[] = [];
 const hostProcs: ChildProcess[] = [];
+const strayPids: number[] = [];
 function tmp(): string { const d = mkdtempSync(join(tmpdir(), 'fleet-sup-')); dirs.push(d); return d; }
 afterEach(() => {
   for (const p of hostProcs.splice(0)) { try { p.kill('SIGKILL'); } catch { /* gone */ } }
+  for (const pid of strayPids.splice(0)) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
@@ -288,5 +290,113 @@ describe('FleetSupervisor (live, integration)', () => {
     expect(child.pid && pidAlive(child.pid)).toBe(true);
 
     child.kill('SIGKILL');
+  });
+
+  it('REGRESSION #1: start-bot during crash-backoff does NOT double-spawn / leak an orphan', async () => {
+    // A crashed bot is mid-backoff: status 'launching', pid 0, not in `children`,
+    // with a pending restart timer. If startOneBot didn't cancel that timer, it
+    // would spawn a fresh child AND the stale timer would later spawn a second —
+    // the first becoming an orphan stopAll can never reap (two daemons for one
+    // bot). Assert exactly one live child and no orphan survives stopAll.
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 10, restartDelayMs: 1500 }, log: () => {}, // wide backoff window
+    });
+    sup.start([bots[0]]);
+    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'online');
+    // Force a crash → the bot enters 'launching' with a pending 1.5s restart timer.
+    process.kill(readFleetState(statePath)!.procs[0].pid, 'SIGKILL');
+    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'launching');
+
+    // start-bot lands INSIDE the backoff window.
+    sup.startOneBot(bots[0]);
+    const startBotPid = readFleetState(statePath)!.procs[0].pid;
+    strayPids.push(startBotPid);
+    // Wait past the original timer's deadline: a stale timer, if not cancelled,
+    // would fire here and spawn a second child (changing the pid).
+    await delay(2000);
+    const afterPid = readFleetState(statePath)!.procs[0].pid;
+    strayPids.push(afterPid);
+    // Single owned (re)spawn: the stale timer was cancelled, so no second spawn.
+    expect(afterPid).toBe(startBotPid);
+
+    // stopAll reaps the one child; no orphan is left running.
+    await sup.stopAll();
+    await delay(300);
+    expect(pidAlive(startBotPid)).toBe(false);
+  });
+
+  it('REGRESSION #3: a new supervisor taking over a live-but-unowned fleet reclaims it instead of self-exiting', async () => {
+    // A prior supervisor died hard (SIGKILL/OOM) while its daemon kept running.
+    // The state still says that proc is 'online' with a live pid. A new supervisor
+    // must NOT trust that and skip it — if it spawned nothing it would hold no
+    // handles and its event loop would drain (the supervisor exits, leaving the
+    // fleet unsupervised). It must reclaim the orphan: kill it, respawn under its
+    // own ownership, and end up holding a live child.
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    // Orphan daemon from the "previous" supervisor generation (still alive).
+    const orphan = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+    strayPids.push(orphan.pid!);
+    await waitFor(() => pidAlive(orphan.pid!));
+    // State records it online, under a prior (now-dead) supervisor pid.
+    mutateFleetState(statePath, () => ({
+      supervisorPid: 999_999, supervisorStartedAt: 'T-prior',
+      procs: [{ name: 'botmux-0', appId: 'cli_a', pid: orphan.pid!, generation: 1, status: 'online', restarts: 0, lastExitCode: null, startedAt: 'T' }],
+    }));
+
+    const sup = new FleetSupervisor({ statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, log: () => {} });
+    sup.start([bots[0]]); // takeover
+    // The orphan must be reclaimed: a NEW owned child is spawned (different pid),
+    // and the supervisor holds a live handle (so its loop won't drain → no self-exit).
+    const reclaimed = await waitFor(() => {
+      const p = readFleetState(statePath)?.procs[0];
+      return !!p && p.status === 'online' && p.pid !== orphan.pid && p.pid > 1 && pidAlive(p.pid);
+    });
+    expect(reclaimed).toBe(true);
+    const newPid = readFleetState(statePath)!.procs[0].pid;
+    strayPids.push(newPid);
+    expect(newPid).not.toBe(orphan.pid);
+    // The old orphan was SIGTERM'd (it was a plain `setInterval` with no SIGTERM
+    // handler, so it dies) — no longer running unsupervised.
+    await waitFor(() => !pidAlive(orphan.pid!));
+    expect(pidAlive(orphan.pid!)).toBe(false);
+
+    await sup.stopAll();
+  });
+
+  it('REGRESSION #2: stop-bot on a bot mid-crash-backoff cancels the restart and it stays stopped (no revive)', async () => {
+    // Backs the fleet-runtime gate fix: `botmux stop-bot` on a crash-looping bot
+    // must actually stop it. The gate now enqueues for 'launching' (not just
+    // 'online'), and the supervisor's stopOneBot must cancel the pending restart
+    // timer so the bot does NOT come back ~restartDelayMs later. We drive the
+    // supervisor side directly (what a drained stop-bot command does) while the
+    // bot is in its backoff window, then assert it stays stopped.
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 10, restartDelayMs: 1500 }, log: () => {}, // wide window
+    });
+    sup.start([bots[0]]);
+    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'online');
+    // Crash it → enters 'launching' with a pending 1.5s restart timer.
+    process.kill(readFleetState(statePath)!.procs[0].pid, 'SIGKILL');
+    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'launching');
+
+    // stop-bot lands mid-backoff (via the drainCommands path a SIGHUP triggers).
+    await sup.drainCommands([{ id: 's', op: 'stop-bot', name: 'botmux-0', appId: 'cli_a', botIndex: 0, at: 'T' }]);
+    // Immediately reflected stopped, and the pending restart timer was cancelled.
+    expect(readFleetState(statePath)!.procs[0].status).toBe('stopped');
+    // Wait well past the original 1.5s backoff: a leaked timer would revive it.
+    await delay(2000);
+    const after = readFleetState(statePath)!.procs[0];
+    strayPids.push(after.pid);
+    expect(after.status).toBe('stopped'); // did NOT come back online
+    expect(pidAlive(after.pid)).toBe(false);
+
+    await sup.stopAll();
   });
 });

@@ -397,7 +397,16 @@ export function stopBotViaSupervisor(
     return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行', name: spec.name };
   }
   const existing = readFleetStatus().rows.find((r) => r.name === spec.name);
-  if (!existing || existing.status !== 'online' || !existing.alive) {
+  // Short-circuit as already-stopped ONLY when the bot is genuinely at rest with
+  // no supervisor-side work pending: absent, 'stopped' (pid 0), or 'errored'
+  // (parked, no restart timer). A 'launching' bot is mid-crash-backoff — the
+  // supervisor still holds a pending restart timer that WILL respawn it, so it is
+  // NOT stopped; reporting 'already-stopped' here would be a lie and the bot
+  // reappears ~200ms later. 'online' (with or without a live pid) likewise needs
+  // the supervisor to act. In all those cases we must enqueue + SIGHUP so the
+  // supervisor's stopOneBot cancels the timer and marks it stopped authoritatively.
+  const atRest = !existing || existing.status === 'stopped' || existing.status === 'errored';
+  if (atRest) {
     return { ok: true, state: 'already-stopped', name: spec.name };
   }
   enqueueFleetCommand(fleetCommandPath(), {
@@ -406,11 +415,13 @@ export function stopBotViaSupervisor(
   try { process.kill(supervisorPid, 'SIGHUP'); } catch {
     return { ok: false, reason: 'fleet_down', message: 'supervisor 已不在运行', name: spec.name };
   }
-  // Poll until the bot leaves online+alive (stopped), or timeout.
+  // Poll until the bot has actually come to rest (stopped/errored/absent), or
+  // timeout. 'launching' and 'online' both mean the supervisor is still working
+  // (or the restart timer hasn't been cancelled yet), so keep waiting.
   const deadline = Date.now() + Math.max(0, timeoutMs);
   for (;;) {
     const row = readFleetStatus().rows.find((r) => r.name === spec.name);
-    if (!row || row.status !== 'online' || !row.alive) return { ok: true, state: 'stopped', name: spec.name };
+    if (!row || row.status === 'stopped' || row.status === 'errored') return { ok: true, state: 'stopped', name: spec.name };
     if (Date.now() >= deadline) return { ok: false, reason: 'timeout', message: `${spec.name} 未在超时时间内停止`, name: spec.name };
     sleepSyncMs(150);
   }
