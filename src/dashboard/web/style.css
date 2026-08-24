@@ -27550,7 +27550,8 @@ button.skills-issue-badge:hover {
   display: grid;
   place-items: center;
   padding: 20px;
-  background: rgb(15 23 42 / 62%);
+  /* 主题感知的遮罩：暗色下更深、亮色下偏灰蓝，跟 .feishu-login-overlay 一致 */
+  background: var(--modal-backdrop, rgb(15 23 42 / 62%));
 }
 
 .feed-group-auth-card {
@@ -27558,18 +27559,24 @@ button.skills-issue-badge:hover {
   padding: 24px;
   border: 1px solid var(--border);
   border-radius: 14px;
-  background: var(--panel, #fff);
-  color: #111827;
-  box-shadow: 0 24px 70px rgb(0 0 0 / 28%);
+  /* 用主题 token 而非硬编码白底/深字：暗色主题下随 --surface/--fg 翻深，
+     不再是刺眼的白块。--panel 仅在 .insights-page 作用域定义，这里 portal 到
+     body 后取不到，故直接用全站通用的 --surface。 */
+  background: var(--surface);
+  color: var(--fg);
+  box-shadow: var(--modal-shadow, 0 24px 70px rgb(0 0 0 / 28%));
 }
 
-.feed-group-auth-card h3 { margin-top: 0; }
-.feed-group-auth-card p,
+.feed-group-auth-card h3 { margin-top: 0; color: var(--fg); }
+.feed-group-auth-card p { color: var(--muted); }
 .feed-group-auth-card label,
-.feed-group-auth-card label span { color: #111827; }
+.feed-group-auth-card label span { color: var(--fg); }
 .feed-group-auth-card label { display: grid; gap: 8px; margin-top: 18px; }
-.feed-group-auth-card input { width: 100%; box-sizing: border-box; color: #111827; background: #fff; }
-.feed-group-auth-card input::placeholder { color: #4b5563; opacity: 1; }
+/* 输入框的配色/边框/内距交给全站基础 input 规则(已用 --surface-raised/--fg/
+   --border,主题感知),那条规则带 7 个 :not() 守卫、特异性高于本作用域,这里
+   只补它不管的布局:占满宽度 + border-box。 */
+.feed-group-auth-card input { width: 100%; box-sizing: border-box; }
+.feed-group-auth-card input::placeholder { color: var(--faint); opacity: 1; }
 .feed-group-auth-card .actions { margin-top: 20px; justify-content: flex-end; }
 .feed-group-auth-open {
   display: inline-flex;
@@ -27578,15 +27585,15 @@ button.skills-issue-badge:hover {
   min-height: 42px;
   margin-top: 4px;
   padding: 0 20px;
-  border: 1px solid #2563eb;
+  border: 1px solid var(--accent);
   border-radius: 8px;
-  color: #fff;
-  background: #2563eb;
+  color: var(--on-accent);
+  background: var(--accent);
   font-weight: 700;
   cursor: pointer;
 }
 
-.feed-group-auth-open:hover { background: #1d4ed8; }
+.feed-group-auth-open:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
 
 .cs-advanced-fields .cs-feed-group {
   min-width: 0;
