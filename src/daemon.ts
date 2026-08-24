@@ -270,6 +270,7 @@ import {
 } from './core/bot-turn-mutation-gate.js';
 import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn } from './core/initial-user-turn.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
+import { fillNativeTopicId } from './core/native-topic-id.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
 import { beginReplyTargetTurn, buildTurnParticipantsFrom, fallbackTurnId, isSubstituteTurn, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
@@ -460,6 +461,7 @@ import {
   announcePendingRepoSession,
   publishAttentionPatch,
   publishLastInputFromBotPatch,
+  publishNativeTopicLinkPatch,
   publishSessionMessagePreviewPatch,
   publishClosedSessionPatch,
   clearAgentAttention,
@@ -17291,6 +17293,7 @@ async function startInitialPassthroughSession(args: {
   session.quoteTargetSenderIsBot = resolvedSenderIsBot;
   session.lastMessageAt = new Date(now).toISOString();
   session.scope = scope;
+  fillNativeTopicId(session, scope, parsed.threadId);
   sessionStore.updateSession(session);
 
   const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
@@ -17939,6 +17942,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       session.lastCallerOpenId = senderOpenId;
       session.lastMessageAt = new Date(now).toISOString();
       session.scope = scope;
+      fillNativeTopicId(session, scope, parsed.threadId);
 
       // First-message `/repo`: seed the same pending-repo state the card flow
       // uses, so the `/repo` handler launches the CLI straight away —
@@ -18174,6 +18178,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   session.quoteTargetSenderIsBot = isForeignBotSender || parsed.senderType === 'app' || parsed.senderType === 'bot';
   session.lastMessageAt = new Date(now).toISOString();
   session.scope = scope;
+  fillNativeTopicId(session, scope, parsed.threadId);
   session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
     parsed.content,
     parsed.mentions,
@@ -19390,6 +19395,7 @@ async function handleThreadReplyAdmitted(
         session.lastCallerOpenId = threadSenderOpenId;
         session.lastMessageAt = new Date(now).toISOString();
         session.scope = scope;
+        fillNativeTopicId(session, scope, parsed.threadId);
         let cmdPending: Partial<DaemonSession> | undefined;
         if (cmd === '/repo') {
           const { pinnedWorkingDir } = await resolvePinnedWorkingDir({ scope, anchor, chatId: threadChatId, chatType: ctxChatType, larkAppId });
@@ -19482,6 +19488,10 @@ async function handleThreadReplyAdmitted(
   logger.info(`Reply in ${scope}-scope session ${anchor.substring(0, 12)}: ${content.substring(0, 100)} (resources: ${resources.length})`);
 
   let ds = activeSessions.get(sessionKey(anchor, larkAppId));
+  if (ds && fillNativeTopicId(ds.session, scope, parsed.threadId)) {
+    sessionStore.updateSession(ds.session);
+    publishNativeTopicLinkPatch(ds);
+  }
 
   // If another bot already owns this anchor, ignore unmentioned replies here as a
   // second line of defense. Explicit @mentions are still allowed to spin up/take over.
@@ -19960,6 +19970,7 @@ async function handleThreadReplyAdmitted(
     session.quoteTargetSenderIsBot = isForeignBot;
     session.lastMessageAt = new Date(now).toISOString();
     session.scope = scope;
+    fillNativeTopicId(session, scope, parsed.threadId);
     const groupChatName = await groupChatNamePromise;
     if (groupChatName) session.chatDisplayName = groupChatName;
     session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
