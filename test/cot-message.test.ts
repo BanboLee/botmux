@@ -19,7 +19,7 @@ vi.mock('../src/bot-registry.js', () => ({
 import { mkdtempSync, existsSync, readdirSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { handleCotThinkingUpdate, finalizeCotMessage, sweepOrphanCotMessages } from '../src/im/lark/cot-message.js';
+import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage, sweepOrphanCotMessages } from '../src/im/lark/cot-message.js';
 import { getBot } from '../src/bot-registry.js';
 
 // Orphan markers land under config.session.dataDir — point it at a tmp dir so
@@ -279,15 +279,67 @@ describe('orphan markers & sweep (daemon restart mid-turn)', () => {
     mkdirSync(orphanDir, { recursive: true });
     writeFileSync(join(orphanDir, 'cot_prev.json'), JSON.stringify({ larkAppId: 'app1', cotId: 'cot_prev', messageId: 'om_prev' }));
     writeFileSync(join(orphanDir, 'broken.json'), 'not json');
-    await sweepOrphanCotMessages();
+    await sweepOrphanCotMessages('app1');
     const complete = request.mock.calls.find(([req]) => String(req.url).includes('/message_cot/complete/cot_prev'));
     expect(complete).toBeTruthy();
     expect(complete![0].params).toEqual({ message_id: 'om_prev', reason: 'done' });
     expect(readdirSync(orphanDir)).toEqual([]);
   });
 
+  it('sweep leaves sibling bots\' markers alone (shared dataDir, per-bot daemons)', async () => {
+    mkdirSync(orphanDir, { recursive: true });
+    writeFileSync(join(orphanDir, 'cot_mine.json'), JSON.stringify({ larkAppId: 'app1', cotId: 'cot_mine', messageId: 'om_mine' }));
+    writeFileSync(join(orphanDir, 'cot_theirs.json'), JSON.stringify({ larkAppId: 'app_other', cotId: 'cot_theirs', messageId: 'om_theirs' }));
+    await sweepOrphanCotMessages('app1');
+    // Own marker: closed and consumed. Sibling's: untouched on disk, no API
+    // call — its own daemon must close it (this one has no client for it).
+    expect(request.mock.calls.some(([req]) => String(req.url).includes('cot_mine'))).toBe(true);
+    expect(request.mock.calls.some(([req]) => String(req.url).includes('cot_theirs'))).toBe(false);
+    expect(readdirSync(orphanDir)).toEqual(['cot_theirs.json']);
+  });
+
   it('sweep is a no-op without a marker directory', async () => {
-    await expect(sweepOrphanCotMessages()).resolves.toBeUndefined();
+    await expect(sweepOrphanCotMessages('app1')).resolves.toBeUndefined();
+    expect(request).not.toHaveBeenCalled();
+  });
+});
+
+describe('abortCotMessage (worker died without turn_terminal)', () => {
+  it('settles a live bubble as interrupted and clears its marker', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('step 1')]));
+    await flush();
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(true);
+    abortCotMessage(ds);
+    await flush();
+    const last = pushedEvents().at(-1)!;
+    expect(last.type).toBe('RUN_FINISHED');
+    expect(last.content.status).toBe('interrupted');
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
+    // Idempotent: a repeat abort (or a late finalize) pushes nothing new.
+    const calls = request.mock.calls.length;
+    abortCotMessage(ds);
+    finalizeCotMessage(ds, 'om_turn1', 'completed');
+    await flush();
+    expect(request.mock.calls.length).toBe(calls);
+  });
+
+  it('closes a disabled-but-created bubble via explicit complete', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('step 1')]));
+    await flush();
+    request.mockRejectedValueOnce(new Error('network blip'));
+    handleCotThinkingUpdate(ds, upd([think('step 1'), think('step 2')]));
+    await flush(); // push fails → disabled, bubble still open
+    abortCotMessage(ds);
+    await flush();
+    const complete = request.mock.calls.find(([req]) => String(req.url).includes('/message_cot/complete/'));
+    expect(complete).toBeTruthy();
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
+  });
+
+  it('is a no-op when the session has no live CoT state', () => {
+    abortCotMessage(makeDs());
     expect(request).not.toHaveBeenCalled();
   });
 });

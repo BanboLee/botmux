@@ -4160,14 +4160,15 @@ let bridgePreambleSent = false;
 //
 // Cosmetic-only mirror of the Claude bridge's attribution: whenever an
 // assistant transcript event with `thinking` blocks is attributed to a Lark
-// turn, its text is accumulated here and shipped to the daemon as a throttled
-// `thinking_update` IPC (full accumulated text — the CardKit thinking card
-// diffs client-side). This channel must never influence turn settlement:
-// it bypasses emitReadyTurns entirely and is dropped on any error.
+// turn, its entries are accumulated here and shipped to the daemon as a
+// throttled `thinking_update` IPC (full cumulative entry list — the daemon's
+// cot-message pump pushes only unseen entries). This channel must never
+// influence turn settlement: it bypasses emitReadyTurns entirely and is
+// dropped on any error.
 const THINKING_EMIT_INTERVAL_MS = 1_500;
-/** Hard cap on the accumulated CoT shipped per turn. CardKit's streaming
- *  text element caps at 100k chars; stop well below so the daemon-side
- *  header/footer chrome never pushes the element over the API limit. */
+/** Hard cap on the accumulated CoT shipped per turn. Bounds the IPC payload
+ *  (every emit ships the full cumulative list) and the native CoT message
+ *  size; past the cap the timeline just ends with a「…」node. */
 const THINKING_ACCUMULATED_CAP = 60_000;
 let thinkingTurnKey: string | undefined;
 let thinkingTurn: { turnId: string; dispatchAttempt?: number } | undefined;
@@ -4234,8 +4235,6 @@ function scheduleThinkingEmit(): void {
     thinkingEmitTimer = null;
     if (!thinkingTurn || thinkingEntries.length === 0) return;
     thinkingLastEmitMs = Date.now();
-    // TEMP DEBUG (CoT live verify) — remove after verification
-    log(`[thinking] emit turn=${thinkingTurn.turnId.substring(0, 12)} entries=${thinkingEntries.length} len=${thinkingTotalChars}`);
     send({
       type: 'thinking_update',
       ...(sessionId ? { sessionId } : {}),

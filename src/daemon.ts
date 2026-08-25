@@ -22288,8 +22288,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   // Close CoT thinking bubbles orphaned by the previous daemon generation
   // (created mid-turn, never settled — their in-memory state died with the
-  // old process, so without this they spin on「执行中」forever).
-  void sweepOrphanCotMessages().catch(() => { /* cosmetic */ });
+  // old process, so without this they spin on「执行中」forever). Scoped to
+  // THIS bot's markers: the orphan dir is shared across per-bot PM2 daemons.
+  if (selfDaemonLarkAppId) {
+    void sweepOrphanCotMessages(selfDaemonLarkAppId).catch(() => { /* cosmetic */ });
+  }
 
   // Freeze the control plane of restored mojo sessions NOW, not at their next
   // worker fork. Restore completes before the dispatcher can deliver a message,

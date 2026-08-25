@@ -81,7 +81,7 @@ import {
 } from '../im/lark/md-card.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
-import { handleCotThinkingUpdate, finalizeCotMessage } from '../im/lark/cot-message.js';
+import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage } from '../im/lark/cot-message.js';
 import { replyToDocComment, chunkCommentText, unsubscribeDocFile, removeCommentReaction } from '../im/lark/doc-comment.js';
 import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
@@ -12536,6 +12536,11 @@ function setupWorkerHandlers(
       // posted so a late click cannot inject keys into a replacement worker.
       invalidateStuckWarning(ds, 'worker_exit');
       invalidateTuiPrompt(ds, 'worker_exit');
+      // A crashed/killed worker never sends turn_terminal (the only finalize
+      // path) — settle any live CoT thinking bubble as interrupted so it
+      // doesn't spin until the next daemon restart. Cosmetic, self-catching.
+      abortCotMessage(ds);
+      ds.lastThinkingUpdate = undefined;
       // Fence this lifetime before a polling dispatcher can observe its last
       // ACK. Keeping the old receipt is useful audit evidence, but the
       // persisted current generation advances immediately so it cannot count

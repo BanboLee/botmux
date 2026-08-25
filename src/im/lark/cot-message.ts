@@ -102,11 +102,17 @@ function clearCotOrphanMarker(state: CotState): void {
 
 /**
  * Close CoT bubbles orphaned by a previous daemon generation. Call once at
- * startup after the bot registry is loaded (needs per-bot clients). Markers
- * are consumed regardless of outcome: a bubble the API already closed (or a
- * deleted bot) just drops its marker.
+ * startup after this daemon's bot is registered (needs its client).
+ *
+ * `selfLarkAppId` scoping is load-bearing: per-bot PM2 daemons share one
+ * dataDir, so cot-orphans/ holds every bot's markers and daemons restart
+ * concurrently. Each daemon may only consume ITS OWN markers — touching a
+ * sibling's would delete the marker without being able to close the bubble
+ * (its client isn't registered here), recreating the forever-spinning bubble
+ * this mechanism exists to prevent. Unreadable/incomplete markers are the one
+ * exception: no daemon could ever act on them, so they're swept as garbage.
  */
-export async function sweepOrphanCotMessages(): Promise<void> {
+export async function sweepOrphanCotMessages(selfLarkAppId: string): Promise<void> {
   let files: string[];
   try { files = readdirSync(cotOrphanDir()); } catch { return; } // no dir → nothing pending
   for (const f of files) {
@@ -114,6 +120,7 @@ export async function sweepOrphanCotMessages(): Promise<void> {
     try {
       const rec = JSON.parse(readFileSync(p, 'utf8')) as { larkAppId?: string; cotId?: string; messageId?: string };
       if (rec.larkAppId && rec.cotId && rec.messageId) {
+        if (rec.larkAppId !== selfLarkAppId) continue; // sibling daemon's marker — leave it
         const c = getBotClient(rec.larkAppId);
         await c.request({
           method: 'POST',
@@ -359,6 +366,30 @@ export function handleCotThinkingUpdate(
   state.pendingEntries = msg.entries;
   void pump(ds, state);
   return true;
+}
+
+/**
+ * Best-effort close of the session's live bubble when its worker dies WITHOUT
+ * a turn_terminal (crash / kill — the only path that calls finalize). Without
+ * this the bubble spins until the next daemon restart's orphan sweep, and the
+ * daemon may not restart for days. Idempotent; no-op when nothing is live.
+ */
+export function abortCotMessage(ds: DaemonSession): void {
+  const state = states.get(ds);
+  if (!state || state.settled) return;
+  if (state.disabled) {
+    if (state.cotId) {
+      state.settled = true;
+      apiComplete(ds, state, 'error')
+        .catch(() => { /* best-effort */ })
+        .finally(() => clearCotOrphanMarker(state));
+    }
+    return;
+  }
+  if (!state.finishStatus) {
+    state.finishStatus = 'interrupted';
+    void pump(ds, state);
+  }
 }
 
 /**
