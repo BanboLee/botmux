@@ -190,7 +190,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
@@ -268,6 +268,7 @@ import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionId
 import { sessionReadyHookCommand } from './adapters/hook-command.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import { ompSessionDir } from './adapters/cli/oh-my-pi.js';
+import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
 import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
@@ -4399,7 +4400,9 @@ function failedBridgeFallbackContent(errorCode?: string, summary?: string, parti
       ? 'worker.empty_final_failed_auth'
       : errorCode === CODEX_CONNECTION_ERROR_CODE
         ? 'worker.empty_final_failed_connection'
-        : 'worker.empty_final_failed';
+        : errorCode === CODEX_UPSTREAM_ERROR_CODE
+          ? 'worker.empty_final_failed_upstream'
+          : 'worker.empty_final_failed';
   const failure = t(key, { cliName: cliName(), reason });
   const visiblePartialText = stripTrailingOaiMemoryCitation(partialText ?? '').trim();
   return visiblePartialText ? `${visiblePartialText}\n\n${failure}` : failure;
@@ -7368,6 +7371,10 @@ function emitReadyCodexTurns(): void {
       lastUuid: turn.turnId,
       turnId: turn.turnId,
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+      // Failure-fallback notice (not a model answer): lets the daemon add a
+      // human @mention so e.g. a model-gateway outage doesn't scroll by
+      // silently in bot-to-bot sessions.
+      ...(fallbackKind === 'failed' ? { turnFailed: true } : {}),
     });
   }
   for (const turn of ready) {
@@ -13469,6 +13476,27 @@ async function spawnCli(
       // Preserve the existing fail-safe: the adapter probe / two-tier fallback
       // below still decides whether resume is possible.
       log(`WARN Claude resume transcript sync failed: ${(err as Error).message}`);
+    }
+  }
+  // Pre-exact-dir OMP versions stored transcripts in cwd-derived shared
+  // buckets. Only a cold, non-adopt resume may copy one uniquely attributable
+  // legacy JSONL into the exact effective-id directory. The adapter probe below
+  // intentionally stays synchronous and pure: it only decides whether this
+  // preflight published an exact resume target.
+  if (cfg.cliId === 'oh-my-pi' && effectiveResume && !willReattachPersistent && !cfg.adoptMode) {
+    const exactOmpSessionDir = ompSessionDir(effectiveAdapterSessionId);
+    const migrated = migrateLegacyOmpSession(
+      effectiveAdapterSessionId,
+      cfg.workingDir,
+      exactOmpSessionDir,
+    );
+    if (migrated.status === 'migrated') {
+      log(`OMP legacy resume transcript migrated: ${migrated.sourcePath} → ${migrated.targetPath}`);
+      if (migrated.artifactDirectoryPreserved) {
+        log(`OMP legacy artifact directory preserved outside sandbox: ${migrated.sourcePath.slice(0, -'.jsonl'.length)}`);
+      }
+    } else if (migrated.reason !== 'no-match' && migrated.reason !== 'exact-history-exists') {
+      log(`WARN OMP legacy resume migration skipped (${migrated.reason}${migrated.detail ? `: ${migrated.detail}` : ''})`);
     }
   }
   // Hermes stores sessions in a SQLite state.db (not cwd-scoped JSONL). Resolve

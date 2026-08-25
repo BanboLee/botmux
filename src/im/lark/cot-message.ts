@@ -286,12 +286,17 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
     while (!state.disabled) {
       if (!state.cotId) {
         await apiCreate(ds, state);
+        // Record the orphan marker the moment the bubble exists — before the
+        // prologue append. If the prologue fails (or the daemon restarts
+        // before the turn settles), the next generation can still close it;
+        // recording it after the append would leave a markerless window where
+        // a created-but-never-settled bubble spins forever.
+        recordCotOrphanMarker(ds, state);
         await apiAppend(ds, state, [
           ev('RUN_STARTED', { threadId: ds.session.sessionId, runId: state.turnId }),
           ev('REASONING_START', { messageId: reasoningId(state, 0) }),
         ]);
         logger.info(`[cot] created cot=${state.cotId} msg=${state.messageId} turn=${state.turnId.substring(0, 12)}`);
-        recordCotOrphanMarker(ds, state);
       }
       const pending = state.pendingEntries;
       state.pendingEntries = undefined;

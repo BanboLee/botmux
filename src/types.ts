@@ -1249,7 +1249,8 @@ export type WorkerToDaemon =
    * renders as its own node in the native CoT message: thinking paragraphs,
    * tool calls, and tool results, in transcript order. Append-only: earlier
    * entries never change. Worker-side throttled; currently emitted by the
-   * Claude bridge only. Cosmetic channel: it must never influence turn
+   * Claude (transcript attribution) and Codex (bridge-queue cot observer)
+   * bridges. Cosmetic channel: it must never influence turn
    * settlement, final_output attribution, or durable receipts. */
   | { type: 'thinking_update'; sessionId?: string; entries: CotEntry[]; turnId: string; dispatchAttempt?: number }
   /** Executor-observed Codex tier, bound to this worker + rollout generation.
@@ -1322,6 +1323,12 @@ export type WorkerToDaemon =
       // worker stitching label + user + assistant into one markdown blob,
       // which mixes presentation with payload).
       kind?: 'bridge' | 'local-turn' | 'local-turn-headless';
+      /** True when `content` is the worker's FAILED-turn fallback notice (a
+       *  provider/gateway error card), not a model answer. The daemon uses it
+       *  to @mention a human on the failure card when the session has no human
+       *  recipient (bot-to-bot dispatch), so model-service outages don't pass
+       *  silently. Presentation-only — never affects turn settlement. */
+      turnFailed?: boolean;
       userText?: string;
       /** Two-phase Codex App final settlement; daemon persists before ACKing worker. */
       codexAppSettlement?: {
