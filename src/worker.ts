@@ -8919,11 +8919,26 @@ function handleVisibleStartupInteraction(data: string): boolean {
 
   trustHandled = true;
   log('Trust dialog detected, auto-accepting...');
-  if (backend && 'sendSpecialKeys' in backend) {
-    (backend as any).sendSpecialKeys('Enter');
-  } else {
-    backend?.write('\r');
-  }
+  // Codex 0.149 的按键处理器在信任框渲染的瞬间尚未就绪，同步发出的 Enter 会
+  // 落进死输入队列被静默丢弃（上游 openai/codex#39487）：确认从未提交，直到
+  // ~20s 后 submit_unconfirmed 兜底。延迟一个短 tick 再发，让按键处理器就绪；
+  // trustHandled 已同步置位，后续 chunk 重复命中同一文案不会重入。
+  // 围栏：400ms 内若发生 respawn（崩溃/配置切换/restart），旧 timer 不得把
+  // Enter 发进新会话的 backend（与本文件其它延迟回调的围栏约定一致）。
+  const backendAtSchedule = backend;
+  const generationAtSchedule = cliSpawnGeneration;
+  setTimeout(() => {
+    if (backend !== backendAtSchedule || cliSpawnGeneration !== generationAtSchedule) return;
+    try {
+      if (backend && 'sendSpecialKeys' in backend) {
+        (backend as any).sendSpecialKeys('Enter');
+      } else {
+        backend?.write('\r');
+      }
+    } catch {
+      // tmux session 已退出等场景：空 Enter 无意义，静默丢弃
+    }
+  }, 400);
   return true;
 }
 
