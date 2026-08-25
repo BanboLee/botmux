@@ -1331,10 +1331,15 @@ export const messages: Record<string, string> = {
   'sg.receipt': '✅ 已为本次会话创建专属群，后续请在群里继续：{link}',
   'sg.birth_failed': '⚠️ 建群失败（{error}），本次会话回退为私聊话题。',
   'sg.cmd_unsupported': '⚠️ 会话群不支持 {cmd}：会话群由 bot 自动创建和管理，固定为连续会话模式。',
-  'sg.tag_auth_nudge': '🏷️ 会话群已创建，但侧边栏分组还挂不上（{reason}）：消息分组是你的个人数据，需要你授权一次。点此授权：\n{url}\n\n⚠️ 授权完成后浏览器会跳到一个打不开的本机回调地址（127.0.0.1）——这是正常的，请把浏览器地址栏的完整链接复制发给我即可完成授权。也可以在 Dashboard 改用「群标签」模式（无需任何授权）。',
+  // 回跳地址按本次链接实际用的 redirect_uri 填（{redirect}），不写死 127.0.0.1：
+  // 配了 oauthRedirectBase / 平台绑定 / 反代的机器压根不会跳 loopback。
+  'sg.tag_auth_nudge': '🏷️ 会话群已创建，但侧边栏分组还挂不上（{reason}）：消息分组是你的个人数据，需要你授权一次。点此授权：\n{url}\n\n⚠️ 授权完成后浏览器会跳到回调地址（{redirect}）；如果那个页面打不开是正常的，请把浏览器地址栏的完整链接复制发给我即可完成授权。也可以在 Dashboard 改用「群标签」模式（无需任何授权）。',
   'sg.tag_scope_nudge': '🏷️ 会话群已创建，但群标签还打不上：应用缺少「{scope}」租户权限。点此一键开通（管理员，无需授权流程，即时生效）：\n{url}\n\n开通后新建的会话群会自动打上标签。若无法开通（部分租户权限目录中没有该权限），可在 Dashboard 会话设置中把标签模式改为 feed-group（用户消息分组，授权一次即可）或 off。',
   'cmd.login.tags_title': '🏷️ 会话群标签授权（消息分组）',
-  'cmd.login.tags_footer': '授权后，新建的会话群会自动进入侧边栏「Botmux群会话」分组（一次授权长期有效，token 自动续期）。',
+  'cmd.login.tags_title': '🏷️ 会话群标签授权（消息分组）',
+  // 分组名不再写死：默认是「<bot 名>会话」，也可以在 Dashboard 里自定义，所以这里
+  // 只说「侧边栏分组」，不点名具体分组。
+  'cmd.login.tags_footer': '授权后，新建的会话群会自动进入侧边栏对应的消息分组（一次授权长期有效，token 自动续期）。',
   'cmd.cot.operator_only': '⚠️ 仅授权用户（allowedUsers）可以使用 /cot。',
   'cmd.cot.off_ok': '🔕 已关闭本群思考过程消息，turn 进行中不再出思考气泡。/cot on 恢复。',
   'cmd.cot.on_ok': '🧠 已恢复本群思考过程消息，下个 turn 生效。',
@@ -1353,4 +1358,5 @@ export const messages: Record<string, string> = {
   'cot.tool.search': '搜索',
   'cot.tool.task': '任务管理',
   'cot.tool.default': '调用 {name}',
+};
 };
