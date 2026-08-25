@@ -1669,6 +1669,19 @@ export interface BotConfig {
    */
   disableStreamingCard?: boolean;
   /**
+   * Stream the model's thinking process (CoT) into a native Feishu CoT
+   * message per turn: a fixed-height scrolling bubble showing thinking
+   * paragraphs and tool calls as nodes, auto-collapsing when the turn settles.
+   * Default ON (absent/undefined = on); only an explicit false disables.
+   * Requires a transcript-backed CLI (claude-code and codex today); other
+   * CLIs simply never emit the thinking channel. Per-chat opt-out via
+   * {@link noCotChats} (`/cot off`).
+   */
+  thinkingCard?: boolean;
+  /** chat_id list: chats where the CoT (thinking process) message is suppressed
+   *  even when {@link thinkingCard} is on. Written by `/cot off|on`. */
+  noCotChats?: string[];
+  /**
    * When true, suppress the lightweight GoGoGo → DONE message reactions used as
    * progress markers in card-off sessions. Missing/false preserves the current
    * card-off reaction behavior.
@@ -3088,6 +3101,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? undefined
         : normalizeUsageDisplay(entry),
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      // Default ON: only an explicit false is meaningful/persisted (undefined = on).
+      thinkingCard: entry.thinkingCard === false ? false : undefined,
+      noCotChats: Array.isArray(entry.noCotChats)
+        ? entry.noCotChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())
+        : undefined,
       silentTurnReactions: entry.silentTurnReactions === true || undefined,
       receivedReactionEmoji: typeof entry.receivedReactionEmoji === 'string' && entry.receivedReactionEmoji.trim()
         ? entry.receivedReactionEmoji.trim() : undefined,

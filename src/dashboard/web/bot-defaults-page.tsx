@@ -681,6 +681,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     codexAppCleanInput: body.codexAppCleanInput,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
+    thinkingCard: body.thinkingCard,
     summaryMemory: body.summaryMemory,
     summaryMemoryPath: body.summaryMemoryPath,
     botToBotSameDir: body.botToBotSameDir,
@@ -3201,6 +3202,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
+  const [thinkingCard, setThinkingCard] = useState(bot.thinkingCard !== false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -3210,7 +3212,8 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
     setPrivateCard(bot.privateCard === true);
-  }, [bot.disableStreamingCard, bot.privateCard, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+    setThinkingCard(bot.thinkingCard !== false);
+  }, [bot.disableStreamingCard, bot.privateCard, bot.thinkingCard, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     setBusy(key);
@@ -3274,6 +3277,19 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             />
             <p role="status" data-card-pref-moot className="bd-card-mode-note">{tr('botDefaults.manualCardHint')}</p>
           </div>
+          <ToggleRow
+            checked={thinkingCard}
+            disabled={busy !== null}
+            dataAction="toggle-thinking-card"
+            title={tr('botDefaults.thinkingCard')}
+            description={tr('botDefaults.thinkingCardDescription')}
+            help={tr('botDefaults.thinkingCardHelp')}
+            onChange={checked => {
+              const previous = thinkingCard;
+              setThinkingCard(checked);
+              void savePatch({ thinkingCard: checked }, 'thinking', () => setThinkingCard(previous));
+            }}
+          />
         </section>
 
         <section className="bd-card-setting-group" data-card-content-group>
