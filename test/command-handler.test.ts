@@ -493,11 +493,16 @@ vi.mock('../src/services/cot-mode-store.js', () => ({
   setCotMode: vi.fn(async () => ({ ok: true })),
 }));
 
+vi.mock('../src/im/lark/cot-message.js', () => ({
+  handleCotThinkingUpdate: vi.fn(() => true),
+}));
+
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { setCotMode } from '../src/services/cot-mode-store.js';
+import { handleCotThinkingUpdate } from '../src/im/lark/cot-message.js';
 import { writeRoleFile, deleteRoleFile, writeTeamRoleFile, deleteTeamRoleFile, resolveRole, resolveRoleFile } from '../src/core/role-resolver.js';
 import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
 import {
@@ -6484,6 +6489,37 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot bogus', deps);
     expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('用法');
     expect(setCotMode).not.toHaveBeenCalled();
+  });
+
+  it('/cot show without a live session replies no_active_session', async () => {
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('没有活跃');
+    expect(handleCotThinkingUpdate).not.toHaveBeenCalled();
+  });
+
+  it('/cot show mid-turn: forces the session and renders the cached thinking immediately', async () => {
+    botWith({ thinkingCard: false }); // switches off — show overrides anyway
+    const ds = makeDaemonSession();
+    ds.lastThinkingUpdate = { entries: [{ kind: 'thinking', text: 'so far' }], turnId: 'om_turn9' };
+    const deps = makeDeps(ds);
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
+    expect(ds.cotForced).toBe(true);
+    expect(handleCotThinkingUpdate).toHaveBeenCalledWith(ds, expect.objectContaining({
+      type: 'thinking_update',
+      turnId: 'om_turn9',
+      entries: [{ kind: 'thinking', text: 'so far' }],
+    }));
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('已召唤');
+  });
+
+  it('/cot show while idle: arms the one-shot force for the next turn', async () => {
+    const ds = makeDaemonSession();
+    const deps = makeDeps(ds);
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
+    expect(ds.cotForced).toBe(true);
+    expect(handleCotThinkingUpdate).not.toHaveBeenCalled();
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('下个 turn');
   });
 });
 

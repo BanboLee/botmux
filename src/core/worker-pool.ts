@@ -10762,6 +10762,9 @@ function setupWorkerHandlers(
         // failure disables it for the turn (self-catching, logged as [cot]).
         if (!ownsLifecycleMutation()) break;
         if (msg.sessionId && msg.sessionId !== ds.session.sessionId) break;
+        // Cache even when the CoT switches are off — `/cot show` uses this to
+        // summon the bubble mid-turn with everything accumulated so far.
+        ds.lastThinkingUpdate = { entries: msg.entries, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt };
         handleCotThinkingUpdate(ds, msg);
         break;
       }
@@ -11828,8 +11831,12 @@ function setupWorkerHandlers(
         }
         // Settle this turn's native CoT message, if one is live. Cosmetic and
         // self-catching — must never delay or fail the terminal path
-        // (RUN_FINISHED auto-completes the CoT server-side).
+        // (RUN_FINISHED auto-completes the CoT server-side). Also consumes the
+        // one-shot `/cot show` force and drops the mid-turn thinking cache (a
+        // post-terminal summon would create a bubble nobody ever finishes).
         finalizeCotMessage(ds, msg.turnId, msg.status);
+        ds.cotForced = undefined;
+        ds.lastThinkingUpdate = undefined;
         const isClaudeProviderFailure = msg.status !== 'completed'
           && sessionCliId(ds, botCfg) === 'claude-code'
           && (msg.errorCode?.startsWith('provider_') ?? false);

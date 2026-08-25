@@ -72,6 +72,7 @@ import { ttadkConfigModelChoices } from '../setup/cli-selection.js';
 import { publishAttentionPatch, announcePendingRepoSession } from './session-activity.js';
 import { setCardMode } from '../services/card-mode-store.js';
 import { setCotMode } from '../services/cot-mode-store.js';
+import { handleCotThinkingUpdate } from '../im/lark/cot-message.js';
 import { canOperate } from '../im/lark/event-dispatcher.js';
 import { buildSafeInsightReport } from '../services/insight/report.js';
 import type { SafeInsightReport } from '../services/insight/types.js';
@@ -1249,15 +1250,20 @@ export async function handleCardCommand(
 
 /**
  * Handle `/cot` (operator-only). The CoT (thinking process) message twin of
- * `/card`, deliberately simpler: no summon and no private variant — the CoT
- * bubble is a chat-level native message with no ephemeral form, and it only
- * exists while a turn is running. Works without a live session (it just
- * toggles per-chat config).
+ * `/card`. No private variant — the CoT bubble is a chat-level native message
+ * with no ephemeral form. off/on/status work without a live session (they
+ * only touch per-chat config); show needs one.
  *
  * off    -> suppress the thinking bubble for this chat (add to noCotChats).
  * on     -> restore it for this chat (remove from noCotChats); hints when the
  *           bot-level master switch (`thinkingCard`) is off, since the bubble
  *           won't appear until that is enabled too.
+ * show   -> one-shot peek while the switches are off: force the bubble for the
+ *           current turn (rendered immediately with everything accumulated so
+ *           far, via the daemon-side thinking cache) or, when idle, the next
+ *           turn. Auto-reverts when that turn settles — unlike `/card show`
+ *           this is a single peek, not a sticky per-session override, because
+ *           the bubble is ephemeral per turn anyway.
  * ''/status -> report the effective state (master switch + this chat).
  */
 export async function handleCotCommand(
@@ -1294,6 +1300,24 @@ export async function handleCotCommand(
       return;
     }
     await reply(masterOn ? t('cmd.cot.on_ok', undefined, loc) : t('cmd.cot.on_master_off', undefined, loc));
+    return;
+  }
+  if (sub === 'show') {
+    const ds = deps.activeSessions.get(sessionKey(rootId, larkAppId));
+    if (!ds) {
+      await reply(t('cmd.no_active_session', undefined, loc));
+      return;
+    }
+    ds.cotForced = true;
+    if (ds.lastThinkingUpdate) {
+      // Turn in flight with thinking already accumulated — render right away
+      // (the worker only emits on NEW entries, so waiting could miss a turn
+      // whose thinking phase is over).
+      handleCotThinkingUpdate(ds, { type: 'thinking_update', ...ds.lastThinkingUpdate });
+      await reply(t('cmd.cot.show_now', undefined, loc));
+    } else {
+      await reply(t('cmd.cot.show_armed', undefined, loc));
+    }
     return;
   }
   if (sub === '' || sub === 'status') {

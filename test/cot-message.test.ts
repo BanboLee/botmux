@@ -174,6 +174,15 @@ describe('handleCotThinkingUpdate', () => {
     expect(handleCotThinkingUpdate(ds, upd([think('x')]))).toBe(true);
   });
 
+  it('cotForced (/cot show) overrides both switches for the session, but never apiOnly', () => {
+    const ds = makeDs();
+    ds.cotForced = true;
+    vi.mocked(getBot).mockReturnValue({ config: { thinkingCard: false, noCotChats: ['oc_chat1'] } } as any);
+    expect(handleCotThinkingUpdate(ds, upd([think('x')]))).toBe(true);
+    vi.mocked(getBot).mockReturnValue({ config: { apiOnly: true } } as any);
+    expect(handleCotThinkingUpdate(ds, upd([think('x')]))).toBe(false);
+  });
+
   it('does nothing when the chat is muted via noCotChats (/cot off)', () => {
     const ds = makeDs();
     vi.mocked(getBot).mockReturnValue({ config: { thinkingCard: true, noCotChats: ['oc_chat1'] } } as any);
