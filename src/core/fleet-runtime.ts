@@ -16,7 +16,9 @@ import { resolveEntrySpawn } from './self-spawn.js';
 import { readFleetState } from './fleet-state-store.js';
 import { enqueueFleetCommand } from './fleet-command-queue.js';
 import type { FleetProcState, FleetState } from './fleet-supervisor-policy.js';
+import { FLEET_GRACEFUL_EXIT_CODE } from './fleet-supervisor-policy.js';
 import { botProcessName } from '../setup/bot-config-editor.js';
+import { resolveBotmuxDataDir } from './data-dir.js';
 
 const CONFIG_DIR = join(homedir(), '.botmux');
 const HEAPSHOT_DIR = join(CONFIG_DIR, 'heapshots');
@@ -58,6 +60,27 @@ export function resolveFleetDaemonEnv(): NodeJS.ProcessEnv {
   // Legacy: the daemon reads ~/.botmux/.env for global settings. We surface the
   // file's presence to the caller by NOT parsing here — index-daemon's own
   // dotenvConfig loads it. Keeping env pass-through avoids double-parsing.
+  //
+  // MIGRATION-CRITICAL: pin SESSION_DATA_DIR for every supervised child. The old
+  // pm2 ecosystem injected `SESSION_DATA_DIR: DATA_DIR` into both the bot daemons
+  // AND the dashboard; the pm2→supervisor migration deleted that ecosystem and
+  // did NOT re-inject it. Without it, `config.session.dataDir` (a lazy getter,
+  // `process.env.SESSION_DATA_DIR ?? packagedDataDir`) has NO env to read and no
+  // breadcrumb fallback of its own — the daemon/dashboard entrypoints don't run
+  // the CLI's `??= resolveDataDir()` — so it resolves to the PACKAGE dir
+  // (<pkg>/data) instead of ~/.botmux/data. On an upgrade that silently moves the
+  // whole fleet's data root: every existing session / pairing / federation / VC
+  // binding under ~/.botmux/data becomes invisible (a fresh install has no old
+  // data, so this never shows in author self-test — but a live upgrade always
+  // hits it). resolveBotmuxDataDir() reproduces the CLI's resolution
+  // (SESSION_DATA_DIR env > ~/.botmux/.data-dir breadcrumb > ~/.botmux/data), and
+  // `??=` keeps any explicitly-set ambient value (e.g. a test/dev override).
+  env.SESSION_DATA_DIR ??= resolveBotmuxDataDir();
+  // Parity with the old ecosystem's stop_exit_codes:[90] sentinel — restores the
+  // graceful-exit code for self-exit paths (e.g. dashboard self-update) that read
+  // it. The supervisor's own restart suppression already covers operator stops via
+  // explicitStop/stopping, so this is belt-and-suspenders, not load-bearing.
+  env.BOTMUX_PM2_GRACEFUL_EXIT_CODE ??= String(FLEET_GRACEFUL_EXIT_CODE);
   return env;
 }
 

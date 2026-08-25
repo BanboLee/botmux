@@ -109,7 +109,7 @@ export class FleetSupervisor {
     // Record our supervisor identity + reconcile the persisted proc set against
     // reality before deciding what to (re)spawn.
     //
-    // TAKEOVER SAFETY: a proc that is 'online' with a live pid but which THIS
+    // OWNERSHIP SAFETY: a proc that is 'online' with a live pid but which THIS
     // supervisor process did not spawn (not in `this.children`) is an orphan from
     // a previous supervisor generation that died hard (SIGKILL/OOM/panic) while
     // its daemon children kept running. If we left it 'online', planStart would
@@ -118,17 +118,20 @@ export class FleetSupervisor {
     // supervisor exits immediately, leaving the whole fleet (bot daemons AND the
     // dashboard) running unsupervised, with `botmux start/restart` unable to bring
     // it back. A supervisor must OWN every live member, so we kill these orphans
-    // here and let planStart respawn them under our ownership. (On the same
-    // supervisor re-reconciling — priorPid === our pid — the children we spawned
-    // ARE in `this.children`, so nothing is killed: idempotent re-start is safe.)
-    const priorPid = readFleetState(this.opts.statePath)?.supervisorPid ?? 0;
-    const isTakeover = priorPid !== process.pid;
-    if (isTakeover) {
-      for (const p of readFleetState(this.opts.statePath)?.procs ?? []) {
-        if (specByName.has(p.name) && p.status === 'online' && pidAlive(p.pid) && !this.children.has(p.name)) {
-          try { process.kill(p.pid, 'SIGTERM'); } catch { /* already gone */ }
-          this.log(`takeover: reclaiming orphan ${p.name} (pid ${p.pid}) from a prior supervisor — SIGTERM + respawn`);
-        }
+    // here and let planStart respawn them under our ownership.
+    //
+    // The `!this.children.has` ownership check is the whole criterion — no pid /
+    // generation comparison. On the SAME supervisor re-reconciling (idempotent
+    // re-start), every child it spawned IS in `this.children`, so this loop and
+    // the reconcile branch below are both natural no-ops; only genuinely unowned
+    // live procs are reclaimed. (Relying on pid-inequality would miss the corner
+    // where the OS recycles the dead supervisor's pid onto the new one.)
+    const unowned = (p: FleetProcState): boolean =>
+      specByName.has(p.name) && p.status === 'online' && pidAlive(p.pid) && !this.children.has(p.name);
+    for (const p of readFleetState(this.opts.statePath)?.procs ?? []) {
+      if (unowned(p)) {
+        try { process.kill(p.pid, 'SIGTERM'); } catch { /* already gone */ }
+        this.log(`reclaiming unowned live ${p.name} (pid ${p.pid}) from a prior supervisor — SIGTERM + respawn`);
       }
     }
     mutateFleetState(this.opts.statePath, (cur) => {
@@ -141,15 +144,13 @@ export class FleetSupervisor {
         cur.supervisorStartedAt = new Date().toISOString();
       }
       cur.supervisorPid = process.pid;
-      // Drop procs no longer configured; mark dead 'online' procs as such so
-      // planStart re-spawns them (reconcile after a supervisor restart). On a
-      // takeover, the live orphans we just SIGTERM'd above are also marked
-      // not-online here so planStart respawns them under our ownership — an
-      // orphan we don't hold a handle to is not a member we supervise.
+      // Drop procs no longer configured; mark not-online any proc we don't own a
+      // live handle to (dead pid, OR alive-but-unowned orphan we just SIGTERM'd)
+      // so planStart respawns it under our ownership — an orphan we hold no handle
+      // to is not a member we supervise.
       cur.procs = cur.procs.filter((p) => specByName.has(p.name));
       for (const p of cur.procs) {
-        const owned = this.children.has(p.name);
-        if (p.status === 'online' && (!pidAlive(p.pid) || (isTakeover && !owned))) { p.pid = 0; p.status = 'stopped'; }
+        if (p.status === 'online' && (!pidAlive(p.pid) || !this.children.has(p.name))) { p.pid = 0; p.status = 'stopped'; }
       }
       return cur;
     });

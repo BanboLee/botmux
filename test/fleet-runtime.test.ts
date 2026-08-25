@@ -1,8 +1,8 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { projectFleetStatus, readFleetStatus, waitFleetOnline } from '../src/core/fleet-runtime.js';
+import { projectFleetStatus, readFleetStatus, waitFleetOnline, resolveFleetDaemonEnv } from '../src/core/fleet-runtime.js';
 import { writeFleetState } from '../src/core/fleet-state-store.js';
 import { freshProc, type FleetState } from '../src/core/fleet-supervisor-policy.js';
 
@@ -110,5 +110,38 @@ describe('waitFleetOnline', () => {
     const r = waitFleetOnline(['botmux-0'], 300, join(tmp(), 'absent.json'));
     expect(r.healthy).toBe(false);
     expect(r.pending).toEqual(['botmux-0']);
+  });
+});
+
+describe('resolveFleetDaemonEnv (migration: SESSION_DATA_DIR must survive pm2→supervisor)', () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it('REGRESSION #4: injects SESSION_DATA_DIR so supervised children keep ~/.botmux/data', () => {
+    // The old pm2 ecosystem injected `SESSION_DATA_DIR: DATA_DIR` into every bot
+    // daemon AND the dashboard. The pm2→supervisor migration deleted the ecosystem
+    // and did NOT re-inject it — so daemons/dashboard fell back to <pkg>/data
+    // (config.session.dataDir is `SESSION_DATA_DIR ?? packagedDataDir`, and the
+    // daemon entrypoints don't run the CLI's `??= resolveDataDir()`), silently
+    // moving the data root on upgrade. resolveFleetDaemonEnv must pin it.
+    const home = mkdtempSync(join(tmpdir(), 'fleet-home-'));
+    dirs.push(home);
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('SESSION_DATA_DIR', ''); // simulate a clean CLI env (env unset)
+    // stubEnv('') sets an empty string; delete it so `??=` sees genuinely-unset.
+    delete process.env.SESSION_DATA_DIR;
+
+    const env = resolveFleetDaemonEnv();
+    // Resolves to the stable user data dir (~/.botmux/data under the stubbed HOME),
+    // NOT the package dir — this is exactly what the old ecosystem's DATA_DIR was.
+    expect(env.SESSION_DATA_DIR).toBe(join(home, '.botmux', 'data'));
+  });
+
+  it('does NOT override an explicitly-set SESSION_DATA_DIR (??= keeps ambient value)', () => {
+    const home = mkdtempSync(join(tmpdir(), 'fleet-home-'));
+    dirs.push(home);
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('SESSION_DATA_DIR', '/custom/data/root');
+    const env = resolveFleetDaemonEnv();
+    expect(env.SESSION_DATA_DIR).toBe('/custom/data/root'); // ambient override wins
   });
 });
