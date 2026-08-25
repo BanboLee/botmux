@@ -81,6 +81,7 @@ import {
 } from '../im/lark/md-card.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
+import { handleCotThinkingUpdate, finalizeCotMessage } from '../im/lark/cot-message.js';
 import { replyToDocComment, chunkCommentText, unsubscribeDocFile, removeCommentReaction } from '../im/lark/doc-comment.js';
 import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
@@ -10754,6 +10755,17 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'thinking_update': {
+        // Cosmetic CoT channel — never touches settlement. Same stale-worker
+        // guard as screen_update; sessionId echo is validated when present.
+        // Renders as a native CoT message (message_cot AG-UI stream); any API
+        // failure disables it for the turn (self-catching, logged as [cot]).
+        if (!ownsLifecycleMutation()) break;
+        if (msg.sessionId && msg.sessionId !== ds.session.sessionId) break;
+        handleCotThinkingUpdate(ds, msg);
+        break;
+      }
+
       case 'screen_update': {
         if (!ownsLifecycleMutation()) break;
         // Wait for worker init, independently of Web Terminal availability.
@@ -11814,6 +11826,10 @@ function setupWorkerHandlers(
           && ds.managedTurnOrigin.dispatchAttempt === msg.dispatchAttempt) {
           ds.managedTurnOrigin = undefined;
         }
+        // Settle this turn's native CoT message, if one is live. Cosmetic and
+        // self-catching — must never delay or fail the terminal path
+        // (RUN_FINISHED auto-completes the CoT server-side).
+        finalizeCotMessage(ds, msg.turnId, msg.status);
         const isClaudeProviderFailure = msg.status !== 'completed'
           && sessionCliId(ds, botCfg) === 'claude-code'
           && (msg.errorCode?.startsWith('provider_') ?? false);
