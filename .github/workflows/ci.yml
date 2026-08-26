@@ -70,33 +70,21 @@ jobs:
       # Known-failing-before-this-branch specs (v3-goal-cli, plugin-mcp-sandbox,
       # worker-dsh-turn) must not mask the timing data, hence not gating here.
       - name: Test with per-file timing (diagnostic)
-        id: timed_test
         continue-on-error: true
-        timeout-minutes: 45
         env:
-          BOTMUX_TEST_TIMING_FILE: ${{ runner.temp }}/test-timing.tsv
+          BOTMUX_TEST_TIMING_FILE: test-timing.tsv
         run: pnpm exec vitest run --project unit --reporter=./scripts/vitest-timing-reporter.mjs
 
       - name: Slowest test files (diagnostic)
         if: always()
-        run: |
-          F="${{ runner.temp }}/test-timing.tsv"
-          if [ ! -s "$F" ]; then echo "no timing data captured"; exit 0; fi
-          echo "files recorded: $(wc -l < "$F")"
-          echo "total wall across files: $(awk -F'\t' '{s+=$2} END {printf "%.1f min", s/60000}' "$F")"
-          echo
-          echo "=== slowest 40 ==="
-          sort -t$'\t' -k2 -rn "$F" | head -40 | awk -F'\t' '{printf "%8.1fs  %-8s %s\n", $2/1000, $3, $4}'
-          echo
-          echo "=== non-passing ==="
-          awk -F'\t' '$3!="passed"' "$F" | awk -F'\t' '{printf "%8.1fs  %-8s %s\n", $2/1000, $3, $4}'
+        run: node scripts/report-test-timing.mjs test-timing.tsv
 
       - name: Upload timing data (diagnostic)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-timing
-          path: ${{ runner.temp }}/test-timing.tsv
+          path: test-timing.tsv
           if-no-files-found: warn
           retention-days: 7
 
