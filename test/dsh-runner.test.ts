@@ -5,11 +5,12 @@
  * Run: pnpm vitest run test/dsh-runner.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnTsScript } from './helpers/ts-runner.js';
 
 const RUNNER_PATH = resolve('src/dsh-runner.ts');
 const FAKE_SERVER = resolve('test/fixtures/fake-dsh-server.mjs');
@@ -59,7 +60,7 @@ function spawnRunner(
 ): Harness {
   const home = homeOverride ?? mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
   const logPath = join(home, 'prompts.jsonl');
-  const child = spawn(process.execPath, ['--import', 'tsx', RUNNER_PATH,
+  const child = spawnTsScript(RUNNER_PATH, [
     '--session-id', 'test-session',
     '--dsh-bin', FAKE_SERVER,
     '--cwd', home,
@@ -75,7 +76,7 @@ function spawnRunner(
       DSH_CORDIS_CONFIG: '',
       ...envOverrides,
     },
-  });
+  }) as ChildProcessWithoutNullStreams;
   liveChildren.add(child);
   const h: Harness = { child, home, logPath, stdout: '', stderr: '' };
   child.stdout.setEncoding('utf8');

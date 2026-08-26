@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { FleetSupervisor, pidAlive, type FleetBotSpec } from '../src/core/fleet-supervisor.js';
 import { readFleetState, mutateFleetState } from '../src/core/fleet-state-store.js';
+import { spawnTsScript } from './helpers/ts-runner.js';
 
 const dirs: string[] = [];
 const hostProcs: ChildProcess[] = [];
@@ -273,7 +274,7 @@ describe('FleetSupervisor (live, integration)', () => {
     // keep restarting under the backoff.
     const distDir = fakeDist(root, `process.exit(1);`);
     const host = resolve('test/fixtures/fleet-supervisor-host.ts');
-    const child = spawn(process.execPath, ['--import', 'tsx', host, statePath, distDir, root], {
+    const child = spawnTsScript(host, [statePath, distDir, root], {
       stdio: 'ignore',
     });
     hostProcs.push(child);
