@@ -11,9 +11,29 @@ const dirs: string[] = [];
 const hostProcs: ChildProcess[] = [];
 const strayPids: number[] = [];
 function tmp(): string { const d = mkdtempSync(join(tmpdir(), 'fleet-sup-')); dirs.push(d); return d; }
+/**
+ * Queue a pid for SIGKILL at teardown — but ONLY a real one.
+ *
+ * A stopped/launching proc carries `pid = 0` (fleet-supervisor's markStopped and
+ * the reconcile paths all reset it), and several specs read a pid straight out of
+ * fleet-state AFTER asserting the bot is stopped. Passing 0 through to
+ * `process.kill` is not a harmless no-op: POSIX `kill(0, sig)` signals EVERY
+ * process in the CALLER's process group, so the cleanup SIGKILLed vitest itself.
+ * That is what made this file die at ~8s with exit 137 (memory flat, no OOM record
+ * anywhere — it was never an OOM). Negative pids are worse still: `kill(-N, sig)`
+ * targets process GROUP N.
+ */
+function killLater(pid: number | undefined): void {
+  if (typeof pid === 'number' && pid > 0) strayPids.push(pid);
+}
 afterEach(() => {
   for (const p of hostProcs.splice(0)) { try { p.kill('SIGKILL'); } catch { /* gone */ } }
-  for (const pid of strayPids.splice(0)) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
+  // Defence in depth: the guard above is the contract, but a future spec pushing
+  // straight into strayPids must not be able to reintroduce the self-kill.
+  for (const pid of strayPids.splice(0)) {
+    if (pid <= 0) continue;
+    try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
+  }
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
@@ -314,12 +334,12 @@ describe('FleetSupervisor (live, integration)', () => {
     // start-bot lands INSIDE the backoff window.
     sup.startOneBot(bots[0]);
     const startBotPid = readFleetState(statePath)!.procs[0].pid;
-    strayPids.push(startBotPid);
+    killLater(startBotPid);
     // Wait past the original timer's deadline: a stale timer, if not cancelled,
     // would fire here and spawn a second child (changing the pid).
     await delay(2000);
     const afterPid = readFleetState(statePath)!.procs[0].pid;
-    strayPids.push(afterPid);
+    killLater(afterPid);
     // Single owned (re)spawn: the stale timer was cancelled, so no second spawn.
     expect(afterPid).toBe(startBotPid);
 
@@ -340,7 +360,7 @@ describe('FleetSupervisor (live, integration)', () => {
     const statePath = join(root, 'fleet.json');
     // Orphan daemon from the "previous" supervisor generation (still alive).
     const orphan = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
-    strayPids.push(orphan.pid!);
+    killLater(orphan.pid!);
     await waitFor(() => pidAlive(orphan.pid!));
     // State records it online, under a prior (now-dead) supervisor pid.
     mutateFleetState(statePath, () => ({
@@ -358,7 +378,7 @@ describe('FleetSupervisor (live, integration)', () => {
     });
     expect(reclaimed).toBe(true);
     const newPid = readFleetState(statePath)!.procs[0].pid;
-    strayPids.push(newPid);
+    killLater(newPid);
     expect(newPid).not.toBe(orphan.pid);
     // The old orphan was SIGTERM'd (it was a plain `setInterval` with no SIGTERM
     // handler, so it dies) — no longer running unsupervised.
@@ -394,7 +414,7 @@ describe('FleetSupervisor (live, integration)', () => {
     // Wait well past the original 1.5s backoff: a leaked timer would revive it.
     await delay(2000);
     const after = readFleetState(statePath)!.procs[0];
-    strayPids.push(after.pid);
+    killLater(after.pid);
     expect(after.status).toBe('stopped'); // did NOT come back online
     expect(pidAlive(after.pid)).toBe(false);
 

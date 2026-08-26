@@ -16,12 +16,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # TEMPORARY: raised from 20 for the per-file timing diagnostic below ONLY.
-    # A job-level cap overrides a step-level one, so leaving this at 20 would kill
-    # the diagnostic before it finishes and produce zero data again (a cancelled
-    # job also discards its logs). MUST go back to 20 together with the diagnostic
-    # steps — the point is to find and fix the cost, not to normalise a slower CI.
-    timeout-minutes: 50
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v6
@@ -49,45 +44,13 @@ jobs:
       - run: npm install -g pnpm@9.5.0
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
-
-      # TEMPORARY DIAGNOSTIC (remove once the cost centre is known).
-      #
-      # This job was cancelled at its 20-minute timeout with `pnpm test` at
-      # 23m48s+, while the same suite takes 8m07s on a current-master branch and
-      # took 6m08s on this branch on Aug 22. Local investigation could not find the
-      # extra ~16 minutes: every file measured was either unchanged from master or
-      # ≤2s, and the box cannot run the full suite (OOM) and has 64 cores against
-      # this runner's 2-4, so local numbers do not extrapolate.
-      #
-      # So measure HERE. `--reporter=json` cannot help: it writes only at the end
-      # of a run, and a cancelled job discards its logs too (the logs API returns
-      # BlobNotFound), which is why the first timeout produced zero data. The
-      # custom reporter appends one line per file AS EACH FILE FINISHES, verified
-      # to survive SIGKILL, so even a re-timeout leaves a usable ranking.
-      #
-      # `continue-on-error` + a raised timeout so the run reaches the end and the
-      # ranking is complete; the summary step below prints the slowest files.
-      # Known-failing-before-this-branch specs (v3-goal-cli, plugin-mcp-sandbox,
-      # worker-dsh-turn) must not mask the timing data, hence not gating here.
-      - name: Test with per-file timing (diagnostic)
-        continue-on-error: true
-        env:
-          BOTMUX_TEST_TIMING_FILE: test-timing.tsv
-        run: pnpm exec vitest run --project unit --reporter=./scripts/vitest-timing-reporter.mjs
-
-      - name: Slowest test files (diagnostic)
-        if: always()
-        run: node scripts/report-test-timing.mjs test-timing.tsv
-
-      - name: Upload timing data (diagnostic)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-timing
-          path: test-timing.tsv
-          if-no-files-found: warn
-          retention-days: 7
-
+      # TEMPORARY DIAGNOSTIC: same `vitest run --project unit` as `pnpm test`, plus
+      # a reporter that appends one line per file as each file finishes. The job was
+      # cancelled at 20min with `pnpm test` at 23m48s+ while a current-master branch
+      # takes 8m07s, and a cancelled job discards its logs — so `--reporter=json`
+      # (end-of-run only) leaves nothing to read. Revert this line to `pnpm test`
+      # once the cost centre is known.
+      - run: pnpm exec vitest run --project unit --reporter=./scripts/vitest-timing-reporter.mjs
       - run: pnpm workflow-core:test
 
   # The Bun single-file executable is a SHIPPED artifact (attached to every
