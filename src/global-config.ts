@@ -161,8 +161,8 @@ export interface GlobalConfig {
    *  preserves legacy behavior; set false to stop accepting new VC meetings
    *  and skip restore/readiness for this host. */
   vcMeetingAgent?: VcMeetingAgentGlobalConfig;
-  /** Machine-wide v3 Workflow kill-switch. Missing / enabled !== false keeps
-   *  the feature ON (legacy behavior); set false to disable it host-wide. The
+  /** Machine-wide v3 Workflow switch. Missing / enabled !== true keeps the
+   *  feature OFF; set true to enable it host-wide. The
    *  `BOTMUX_WORKFLOW_ENABLED` env var overrides this when set. */
   workflow?: WorkflowFeatureGlobalConfig;
   /** Optional HTTP(S) proxy for the daemon's own outbound downloads (e.g. the
