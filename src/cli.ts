@@ -147,7 +147,7 @@ import {
   resolveGlobalInstallPlan,
   UnsupportedGlobalInstallError,
 } from './utils/global-install.js';
-import { isLocalDevInstall, botmuxCliEntryAt } from './utils/install-info.js';
+import { isLocalDevInstall, botmuxCliEntryAt, bakedBinaryVersion } from './utils/install-info.js';
 import {
   resolveLocalDevCheckoutDir,
   isGitWorktree,
@@ -11827,6 +11827,11 @@ async function cmdPresetExport(rest: string[]): Promise<void> {
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 function getVersion(): string {
+  // The compiled single-file executable has no package.json on disk (the module
+  // graph is in the virtual read-only /$bunfs), so this read always failed there
+  // and `--version` printed `unknown`. The build bakes the version in instead.
+  const baked = bakedBinaryVersion();
+  if (baked) return baked;
   const pkgPath = join(PKG_ROOT, 'package.json');
   try {
     const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
