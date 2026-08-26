@@ -694,9 +694,27 @@ jobs:
           node scripts/smoke-bun-binary.mjs "$BIN"
 
       - name: Checksums
+        # `sha256sum` is GNU coreutils and DOES NOT EXIST on the macOS runner —
+        # BSD userland ships `shasum -a 256` instead. The darwin leg failed here
+        # with `sha256sum: command not found` (exit 127) AFTER both darwin
+        # binaries had built and smoke-passed, and because `binary-subpackages`
+        # and `release` both `needs` this job, that one missing command skipped
+        # the entire publish chain.
+        #
+        # Both commands print `<hash>  <filename>`, which is the format
+        # install.sh parses (`cut -d' ' -f1`), so this fallback keeps the
+        # published .sha256 files byte-compatible with what the installer and any
+        # already-released assets expect.
         run: |
           cd dist-bin
-          for f in botmux-*; do sha256sum "$f" > "$f.sha256"; done
+          if command -v sha256sum >/dev/null 2>&1; then
+            hash_cmd() { sha256sum "$1"; }
+          elif command -v shasum >/dev/null 2>&1; then
+            hash_cmd() { shasum -a 256 "$1"; }
+          else
+            echo "no sha256 tool available (need sha256sum or shasum)"; exit 1
+          fi
+          for f in botmux-*; do hash_cmd "$f" > "$f.sha256"; done
           ls -la
 
       - name: Upload binaries as workflow artifacts
