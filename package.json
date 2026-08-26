@@ -9,6 +9,7 @@
   },
   "files": [
     "dist/",
+    "scripts/postinstall-bin.mjs",
     "ecosystem.config.cjs",
     "README.md",
     "README.en.md",
@@ -59,6 +60,7 @@
     "desktop:pack": "pnpm desktop:pack:local",
     "desktop:pack:local": "node scripts/desktop-pack-local.mjs",
     "prepublishOnly": "npm run build",
+    "postinstall": "node scripts/postinstall-bin.mjs",
     "prepare": "git config core.hooksPath scripts/git-hooks 2>/dev/null || true"
   },
   "dependencies": {

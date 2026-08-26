@@ -1,6 +1,6 @@
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync, realpathSync } from 'node:fs';
 import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
@@ -24,6 +24,7 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
 import { botmuxWrapperFiles, resolveBotmuxWrapperBinDir } from './core/botmux-wrapper.js';
+import { isStandaloneBinary } from './core/self-spawn.js';
 import {
   evaluateOverload,
   formatOverloadAlert,
@@ -3781,14 +3782,33 @@ function writePidFile(): void {
 
   // Write a thin wrapper script so `botmux` is always in PATH for CLI sessions,
   // regardless of whether the package was installed globally.  The wrapper
-  // points at THIS daemon's dist/cli.js, so it's always the same version.
+  // points at THIS daemon's dist/cli.js — or, when we ARE a compiled binary, at
+  // the binary itself (see botmuxWrapperFiles' standalone branch: there is no
+  // cli.js on disk, only a process-private /$bunfs/ path).
   try {
     mkdirSync(BOTMUX_BIN_DIR, { recursive: true });
     const cliScript = join(__dirname, 'cli.js');  // dist/cli.js
+    const standalone = isStandaloneBinary();
     // POSIX `sh` wrapper always; plus a `botmux.cmd` on Windows so native shells
     // resolve `botmux` (otherwise `botmux send` from a Windows CLI session fails).
-    for (const file of botmuxWrapperFiles(cliScript, process.execPath)) {
+    for (const file of botmuxWrapperFiles(cliScript, process.execPath, process.platform, standalone)) {
       const wrapper = join(BOTMUX_BIN_DIR, file.name);
+      // NEVER overwrite the running executable. install.sh installs the compiled
+      // binary to exactly this path (~/.botmux/bin/botmux), so without this guard
+      // the daemon replaced its own 94MB executable with a 47-byte script on every
+      // boot — verified, inode and all. The `existing !== file.content` check below
+      // is NOT protection: a binary's bytes never equal the wrapper text, so it
+      // rewrote every single start. Compare resolved real paths because either side
+      // may be a symlink, and skip rather than fail: the binary already IS a working
+      // `botmux` on PATH, so there is nothing a wrapper needs to add.
+      let isRunningBinary = false;
+      try {
+        isRunningBinary = realpathSync(wrapper) === realpathSync(process.execPath);
+      } catch { /* wrapper absent (first boot) or unreadable → not the binary */ }
+      if (isRunningBinary) {
+        logger.info(`Wrapper skipped: ${wrapper} is this running executable (self-contained binary already on PATH)`);
+        continue;
+      }
       // Only write if changed (avoid unnecessary disk writes on every restart)
       let existing = '';
       try { existing = readFileSync(wrapper, 'utf-8'); } catch { /* doesn't exist yet */ }
@@ -3796,7 +3816,7 @@ function writePidFile(): void {
         // 原子写：并发会话随时在 exec 这个 wrapper，半截脚本会让它们的
         // `botmux send` 全体失败。
         atomicWriteFileSync(wrapper, file.content, { mode: file.mode });
-        logger.info(`Wrapper script written: ${wrapper} → ${cliScript}`);
+        logger.info(`Wrapper script written: ${wrapper} → ${standalone ? process.execPath : cliScript}`);
       }
     }
   } catch (err: any) {
