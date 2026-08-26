@@ -50,6 +50,3 @@ src/desktop/assets/*.png
 
 # OMO 计划产物（.omo/ 计划、草稿、证据），绝不提交
 .omo/
-
-# 临时诊断产物：CI 每文件耗时 tsv（随诊断一起撤时可删）
-test-timing.tsv

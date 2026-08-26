@@ -16,14 +16,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # TEMPORARY: 20 → 50 for the per-file timing diagnostic below. Measured: the
-    # test step alone needs 22+ minutes on this branch (one run reached 23m25s and
-    # was still going), so a 20-minute cap guarantees the job is killed — and a
-    # cancelled/timed-out job DISCARDS ITS LOGS, which is exactly how the first
-    # two diagnostic attempts produced zero data. Raised only so the run reaches
-    # the summary step. MUST return to 20 with the diagnostic removed: the goal is
-    # to fix the cost, not to normalise a slower CI.
-    timeout-minutes: 50
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v6
@@ -51,28 +44,7 @@ jobs:
       - run: npm install -g pnpm@9.5.0
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
-      # TEMPORARY DIAGNOSTIC: same `vitest run --project unit` as `pnpm test`, plus
-      # a reporter that appends one line per file as each file finishes. The job was
-      # cancelled at 20min with `pnpm test` at 23m48s+ while a current-master branch
-      # takes 8m07s, and a cancelled job discards its logs — so `--reporter=json`
-      # (end-of-run only) leaves nothing to read. Revert this line to `pnpm test`
-      # once the cost centre is known.
-      #
-      # `continue-on-error` because three specs already fail on clean master with
-      # dist built (v3-goal-cli, plugin-mcp-sandbox, worker-dsh-turn — each verified
-      # against a clean master worktree). Without it the step goes red and the
-      # summary step never prints the ranking, which is the whole point.
-      - run: pnpm exec vitest run --project unit --reporter=./scripts/vitest-timing-reporter.mjs
-        continue-on-error: true
-        env:
-          BOTMUX_TEST_TIMING_FILE: test-timing.tsv
-
-      # Print the ranking even when the step above failed or the file is missing
-      # (the script handles an absent file and exits 0).
-      - name: Slowest test files (diagnostic)
-        if: always()
-        run: node scripts/report-test-timing.mjs test-timing.tsv
-
+      - run: pnpm test
       - run: pnpm workflow-core:test
 
   # The Bun single-file executable is a SHIPPED artifact (attached to every
