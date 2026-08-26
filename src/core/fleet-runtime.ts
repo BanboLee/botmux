@@ -14,6 +14,7 @@ import type { FleetBotSpec } from './fleet-supervisor.js';
 import { pidAlive } from './fleet-supervisor.js';
 import { resolveEntrySpawn } from './self-spawn.js';
 import { readFleetState } from './fleet-state-store.js';
+import { resolveBotmuxDataDir } from './data-dir.js';
 import { enqueueFleetCommand } from './fleet-command-queue.js';
 import type { FleetProcState, FleetState } from './fleet-supervisor-policy.js';
 import { botProcessName } from '../setup/bot-config-editor.js';
@@ -51,13 +52,30 @@ export function fleetDaemonNodeArgs(): string[] {
   return ['--max-old-space-size=8192', `--diagnostic-dir=${HEAPSHOT_DIR}`];
 }
 
-/** The shared env every daemon child inherits. Loads the legacy global .env for
- *  backward compat (WEB_HOST etc.), same as index-daemon did via dotenv. */
+/** The shared env every supervised member (bot daemons + the dashboard) inherits.
+ *  Loads the legacy global .env for backward compat (WEB_HOST etc.), same as
+ *  index-daemon did via dotenv. */
 export function resolveFleetDaemonEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   // Legacy: the daemon reads ~/.botmux/.env for global settings. We surface the
   // file's presence to the caller by NOT parsing here — index-daemon's own
   // dotenvConfig loads it. Keeping env pass-through avoids double-parsing.
+
+  // Pin SESSION_DATA_DIR for every member, mirroring what pm2's ecosystem config
+  // used to bake into each app's env block. This is not cosmetic:
+  //   • Code paths deliberately read `process.env.SESSION_DATA_DIR` INSTEAD of
+  //     `config.session.dataDir` and degrade when it is absent — e.g.
+  //     session-manager's effectivePromptHookConfigPath, whose comment states
+  //     "daemon 进程必有此 env" and which silently falls back to the GLOBAL hook
+  //     config (losing per-bot isolation) when it is not set. Those readers are
+  //     invisible to any config.ts-level fix, so the env itself must be present.
+  //   • It guarantees the dashboard reads the SAME store as the bot daemons. The
+  //     old ecosystem comment spelled out the failure otherwise: a dashboard on a
+  //     different data dir breaks /pair codes, reports hubsSynced:0, and answers
+  //     remote-group not_a_member.
+  // Resolved through the canonical HOME-based resolver, and only when the
+  // operator has not already pinned it explicitly.
+  if (!env.SESSION_DATA_DIR?.trim()) env.SESSION_DATA_DIR = resolveBotmuxDataDir({ env });
   return env;
 }
 
