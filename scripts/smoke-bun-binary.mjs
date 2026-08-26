@@ -13,6 +13,10 @@
  * layers that carry real risk under `bun build --compile`:
  *
  *   1. capabilities   — CLI graph loads at all (cheap canary, kept).
+ *   1b. version       — the binary reports its own version rather than the
+ *                       `unknown` sentinel. Compiled mode has no package.json on
+ *                       disk, so every version read failed and 3.18.0-canary.2
+ *                       shipped printing `botmux vunknown`.
  *   2. self-spawn     — the `__supervisor` hidden entry re-execs THIS binary
  *                       (the /$bunfs argv[1] path), starts a fleet, and the
  *                       supervisor stays alive.
@@ -100,6 +104,34 @@ try {
   console.log('smoke: ✅ capabilities — CLI graph loads');
 } catch (err) {
   fail('capabilities', err instanceof Error ? err.message : String(err));
+}
+
+// ── 1b. version: the binary knows what it is ─────────────────────────────────
+// Every runtime version lookup ends at a readFileSync of the install root's
+// package.json, which DOES NOT EXIST in compiled mode (the module graph is in
+// the virtual read-only /$bunfs, and the package-root walk ends at `/`). So
+// `botmux --version` printed `unknown` on the published 3.18.0-canary.2 and the
+// help banner read `botmux vunknown`. The build bakes the version in via
+// `define`; this asserts the baked value actually survives into the binary.
+//
+// Checked for shape, not a specific number, because this script runs both in
+// release (a real tag) and on developer machines (the unbuilt 0.0.0 placeholder).
+// The regression was a sentinel string, so rejecting sentinels is what has teeth:
+// verified by rebuilding without `define`, which yields exactly `unknown`.
+try {
+  const raw = execFileSync(binary, ['--version'], {
+    cwd: home, env: childEnv, encoding: 'utf-8', timeout: 60_000,
+  }).trim();
+  if (raw === 'unknown' || raw === '') {
+    fail('version', `--version returned the "${raw}" sentinel: the compiled binary cannot read its own version. `
+      + 'The build must bake it in (scripts/build-bun-binary.mjs `define`), because compiled mode has no package.json on disk.');
+  }
+  if (!/^\d+\.\d+\.\d+/.test(raw)) {
+    fail('version', `--version output is not a semver-looking string: ${JSON.stringify(raw.slice(0, 120))}`);
+  }
+  console.log(`smoke: ✅ version — binary reports ${raw} (not the "unknown" sentinel)`);
+} catch (err) {
+  fail('version', err instanceof Error ? err.message : String(err));
 }
 
 // ── 2/3. self-spawn + dashboard boots and reaches online ─────────────────────
