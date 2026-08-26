@@ -90,5 +90,11 @@ jobs:
       - name: Smoke-test the compiled binary
         # Runs from a scratch HOME with an empty bots.json — no Feishu
         # credentials, no live fleet, no interference with anything on the runner.
+        #
+        # The empty bots.json is why checks 1-4 cannot reach the daemon: it refuses
+        # to start with 0 bots ("Invalid BOTMUX_BOT_INDEX=0"), so writePidFile —
+        # and the wrapper write that once overwrote the binary itself — is
+        # structurally unreachable. Check 5 in the script covers that path directly
+        # instead of booting a credentialed bot.
         run: node scripts/smoke-bun-binary.mjs dist-bin/botmux-linux-x64
 
