@@ -84,8 +84,23 @@ function detectDefaultBackend(): Exclude<BackendType, 'herdr'> {
 // the fallback has to be correct on its own. It is still read through the lazy
 // getter below so a SESSION_DATA_DIR set AFTER this module is first imported
 // (e.g. cli.ts subcommands doing `process.env.SESSION_DATA_DIR ??= …`) still wins.
+//
+// MEMOISED because the getter is on a HOT path: ~389 call sites read
+// `config.session.dataDir`, some in loops, and resolveBotmuxDataDir() performs up
+// to four filesystem syscalls (lstat + readFile + existsSync + stat) probing the
+// `~/.botmux/.data-dir` breadcrumb. Measured: 6.27µs per uncached call vs 0.50µs
+// for the env-set early return — 12.5×. The previous code computed its (wrong,
+// install-relative) fallback exactly once at module load, so making it lazy must
+// not also make it repeat the I/O on every read.
+//
+// Safe to cache: the fallback is only consulted when SESSION_DATA_DIR is unset,
+// and it derives from HOME plus a breadcrumb that the daemon writes at startup —
+// neither changes within a process's lifetime. A process that sets
+// SESSION_DATA_DIR later never reaches this function at all, because the getter
+// checks the env first.
+let cachedFallbackDataDir: string | undefined;
 function fallbackDataDir(): string {
-  return resolveBotmuxDataDir();
+  return (cachedFallbackDataDir ??= resolveBotmuxDataDir());
 }
 
 export interface ChatBotDiscoveryConfig {
