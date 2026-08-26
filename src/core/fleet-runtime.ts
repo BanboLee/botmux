@@ -17,6 +17,7 @@ import { readFleetState } from './fleet-state-store.js';
 import { resolveBotmuxDataDir } from './data-dir.js';
 import { enqueueFleetCommand } from './fleet-command-queue.js';
 import type { FleetProcState, FleetState } from './fleet-supervisor-policy.js';
+import { FLEET_GRACEFUL_EXIT_CODE } from './fleet-supervisor-policy.js';
 import { botProcessName } from '../setup/bot-config-editor.js';
 
 const CONFIG_DIR = join(homedir(), '.botmux');
@@ -60,22 +61,38 @@ export function resolveFleetDaemonEnv(): NodeJS.ProcessEnv {
   // Legacy: the daemon reads ~/.botmux/.env for global settings. We surface the
   // file's presence to the caller by NOT parsing here — index-daemon's own
   // dotenvConfig loads it. Keeping env pass-through avoids double-parsing.
-
-  // Pin SESSION_DATA_DIR for every member, mirroring what pm2's ecosystem config
-  // used to bake into each app's env block. This is not cosmetic:
-  //   • Code paths deliberately read `process.env.SESSION_DATA_DIR` INSTEAD of
-  //     `config.session.dataDir` and degrade when it is absent — e.g.
-  //     session-manager's effectivePromptHookConfigPath, whose comment states
-  //     "daemon 进程必有此 env" and which silently falls back to the GLOBAL hook
-  //     config (losing per-bot isolation) when it is not set. Those readers are
-  //     invisible to any config.ts-level fix, so the env itself must be present.
-  //   • It guarantees the dashboard reads the SAME store as the bot daemons. The
-  //     old ecosystem comment spelled out the failure otherwise: a dashboard on a
-  //     different data dir breaks /pair codes, reports hubsSynced:0, and answers
-  //     remote-group not_a_member.
-  // Resolved through the canonical HOME-based resolver, and only when the
-  // operator has not already pinned it explicitly.
+  //
+  // MIGRATION-CRITICAL: pin SESSION_DATA_DIR for every supervised child. The old
+  // pm2 ecosystem injected `SESSION_DATA_DIR: DATA_DIR` into both the bot daemons
+  // AND the dashboard; the pm2→supervisor migration deleted that ecosystem and
+  // did NOT re-inject it. Without it, `config.session.dataDir` (a lazy getter)
+  // had NO env to read and the daemon/dashboard entrypoints don't run the CLI's
+  // `??= resolveDataDir()` — so it resolved to the PACKAGE dir (<pkg>/data)
+  // instead of ~/.botmux/data. On an upgrade that silently moves the whole
+  // fleet's data root: every existing session / pairing / federation / VC
+  // binding under ~/.botmux/data becomes invisible (a fresh install has no old
+  // data, so this never shows in author self-test — but a live upgrade always
+  // hits it). resolveBotmuxDataDir() reproduces the CLI's resolution
+  // (SESSION_DATA_DIR env > ~/.botmux/.data-dir breadcrumb > ~/.botmux/data).
+  //
+  // Two further reasons the ENV must be present, beyond config.session.dataDir
+  // (whose own fallback is now the same canonical resolver — see config.ts):
+  //   • Some readers deliberately consult `process.env.SESSION_DATA_DIR` INSTEAD
+  //     of config.session.dataDir and DEGRADE when absent — e.g. session-manager's
+  //     effectivePromptHookConfigPath, whose comment asserts "daemon 进程必有此
+  //     env" and which silently falls back to the GLOBAL hook config (losing
+  //     per-bot isolation). A config.ts-level fix cannot reach those.
+  //   • It guarantees the dashboard reads the SAME store as the bot daemons.
+  //
+  // Blank-guarded rather than plain `??=`: `??=` keeps an empty/whitespace value,
+  // and every downstream `resolve('')` would then silently mean CWD. A blank is
+  // treated as unset; a real explicit value (test/dev override) is preserved.
   if (!env.SESSION_DATA_DIR?.trim()) env.SESSION_DATA_DIR = resolveBotmuxDataDir({ env });
+  // Parity with the old ecosystem's stop_exit_codes:[90] sentinel — restores the
+  // graceful-exit code for self-exit paths (e.g. dashboard self-update) that read
+  // it. The supervisor's own restart suppression already covers operator stops via
+  // explicitStop/stopping, so this is belt-and-suspenders, not load-bearing.
+  env.BOTMUX_PM2_GRACEFUL_EXIT_CODE ??= String(FLEET_GRACEFUL_EXIT_CODE);
   return env;
 }
 
@@ -415,7 +432,16 @@ export function stopBotViaSupervisor(
     return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行', name: spec.name };
   }
   const existing = readFleetStatus().rows.find((r) => r.name === spec.name);
-  if (!existing || existing.status !== 'online' || !existing.alive) {
+  // Short-circuit as already-stopped ONLY when the bot is genuinely at rest with
+  // no supervisor-side work pending: absent, 'stopped' (pid 0), or 'errored'
+  // (parked, no restart timer). A 'launching' bot is mid-crash-backoff — the
+  // supervisor still holds a pending restart timer that WILL respawn it, so it is
+  // NOT stopped; reporting 'already-stopped' here would be a lie and the bot
+  // reappears ~200ms later. 'online' (with or without a live pid) likewise needs
+  // the supervisor to act. In all those cases we must enqueue + SIGHUP so the
+  // supervisor's stopOneBot cancels the timer and marks it stopped authoritatively.
+  const atRest = !existing || existing.status === 'stopped' || existing.status === 'errored';
+  if (atRest) {
     return { ok: true, state: 'already-stopped', name: spec.name };
   }
   enqueueFleetCommand(fleetCommandPath(), {
@@ -424,11 +450,13 @@ export function stopBotViaSupervisor(
   try { process.kill(supervisorPid, 'SIGHUP'); } catch {
     return { ok: false, reason: 'fleet_down', message: 'supervisor 已不在运行', name: spec.name };
   }
-  // Poll until the bot leaves online+alive (stopped), or timeout.
+  // Poll until the bot has actually come to rest (stopped/errored/absent), or
+  // timeout. 'launching' and 'online' both mean the supervisor is still working
+  // (or the restart timer hasn't been cancelled yet), so keep waiting.
   const deadline = Date.now() + Math.max(0, timeoutMs);
   for (;;) {
     const row = readFleetStatus().rows.find((r) => r.name === spec.name);
-    if (!row || row.status !== 'online' || !row.alive) return { ok: true, state: 'stopped', name: spec.name };
+    if (!row || row.status === 'stopped' || row.status === 'errored') return { ok: true, state: 'stopped', name: spec.name };
     if (Date.now() >= deadline) return { ok: false, reason: 'timeout', message: `${spec.name} 未在超时时间内停止`, name: spec.name };
     sleepSyncMs(150);
   }
