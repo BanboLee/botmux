@@ -41,8 +41,14 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
+import { withBotSteerDirective } from './core/bot-steer-directive.js';
 import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
-import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
+import {
+  enableAutostart,
+  disableAutostart,
+  autostartStatus,
+  refreshAutostart,
+} from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
 import {
@@ -546,7 +552,24 @@ function printCopyHint(filePath: string): void {
   console.log('');
 }
 
-function printRemainingSteps(appId: string, brand: 'feishu' | 'lark'): void {
+/**
+ * 手动提示里要让用户填的重定向 URL 列表。
+ *
+ * 写死 `http://127.0.0.1:9768/callback` 是错的：配了 `oauthRedirectBase` / 接了中心
+ * 平台 / 自建反代时，实际发起授权用的是 `<base>/oauth/callback`，只填 loopback 那条
+ * 照样 20029。这里按当前配置实时算（与自动写白名单用的是同一个函数）。
+ * `collectBotmuxRedirectUrls` 内部逐项 try/catch，理论上不抛；再兜一层是因为这段只是
+ * 「打印提示」，任何意外都不该把 setup 本身弄挂。
+ */
+function safeCollectBotmuxRedirectUrls(collect: () => string[]): string[] {
+  try {
+    const urls = collect();
+    if (urls.length > 0) return urls;
+  } catch { /* 配置读不动：退回最核心的那一条 */ }
+  return ['http://127.0.0.1:9768/callback'];
+}
+
+function printRemainingSteps(appId: string, brand: 'feishu' | 'lark', redirectUrls: string[]): void {
   // 同时覆盖 Web 企业自建应用与 SDK PersonalAgent fallback：后者的 bot / 事件
   // 步骤通常已完成，但重复核对无害；前者在自动化中途失败时必须补齐这些步骤。
   const home = `${larkHosts(brand).openApi}/app/${appId}`;
@@ -576,10 +599,13 @@ function printRemainingSteps(appId: string, brand: 'feishu' | 'lark'): void {
   }
   console.log('');
 
-  console.log('  4. 添加重定向 URL (用于 botmux 内 `/login` 拿用户 UAT 获取卡片消息)');
+  console.log('  4. 添加重定向 URL (群聊模式 p2pMode=group / 会话群标签 feed-group / `/login` 必需)');
   console.log(`     申请链接: ${home}/safe → 进入「安全设置」→「重定向 URL」`);
-  console.log('     填入: http://127.0.0.1:9768/callback');
-  console.log('     不需要 `/login` 拿卡片消息的话, 这一步可以跳过.\n');
+  // 多条时逐行列出：配了 oauthRedirectBase / 平台绑定 / 反代的机器少填一条就还是 20029。
+  console.log(redirectUrls.length === 1 ? `     填入: ${redirectUrls[0]}` : '     以下每一条都要填入:');
+  if (redirectUrls.length > 1) for (const url of redirectUrls) console.log(`       - ${url}`);
+  console.log('     用于 botmux 内 `/login` 拿用户 UAT 获取卡片消息; 白名单里没有它,');
+  console.log('     这三种用法点授权会直接报 20029, 连飞书授权页都进不去.\n');
 
   console.log('  5. 在「版本管理与发布」创建版本并提交发布');
   console.log(`     配置链接: ${home}/version`);
@@ -592,13 +618,24 @@ function printRemainingSteps(appId: string, brand: 'feishu' | 'lark'): void {
 async function finishOpenPlatformSetup(
   appId: string,
   brand: 'feishu' | 'lark',
-  options: { reuseOnly?: boolean; forceQrLogin?: boolean; quiet?: boolean } = {},
+  options: {
+    reuseOnly?: boolean;
+    forceQrLogin?: boolean;
+    quiet?: boolean;
+    /** 本次 setup 刚创建出这个应用 —— 只有它允许 redirect 白名单在读失败时盲写覆盖。 */
+    appJustCreated?: boolean;
+  } = {},
 ): Promise<SetupOpenPlatformOutcome> {
   const say = (...args: unknown[]) => { if (!options.quiet) console.log(...args); };
-  const { parseSetupOpenPlatformAutoFlag, automateOpenPlatformSetup } = await import('./setup/open-platform-automation.js');
+  const {
+    parseSetupOpenPlatformAutoFlag,
+    automateOpenPlatformSetup,
+    collectBotmuxRedirectUrls,
+  } = await import('./setup/open-platform-automation.js');
+  const redirectUrls = safeCollectBotmuxRedirectUrls(collectBotmuxRedirectUrls);
   if (!parseSetupOpenPlatformAutoFlag(process.argv.slice(3))) {
     say('\n已跳过开放平台自动配置 (--no-open-platform-auto)。');
-    if (!options.quiet) printRemainingSteps(appId, brand);
+    if (!options.quiet) printRemainingSteps(appId, brand, redirectUrls);
     return { status: 'skipped' };
   }
 
@@ -616,6 +653,7 @@ async function finishOpenPlatformSetup(
     forceQrLogin: options.forceQrLogin,
     disableQrLogin: options.reuseOnly,
     disableBytedcliFallback: options.reuseOnly || options.forceQrLogin,
+    appJustCreated: options.appJustCreated,
   });
   const outcome = classifySetupOpenPlatformOutcome(result);
   if (result.ok) {
@@ -629,7 +667,15 @@ async function finishOpenPlatformSetup(
     } else if (result.scopeCount === 0) {
       say('   ⚠️ 本次没有成功导入任何权限，请到开放平台「权限管理」手动导入 ~/.botmux/lark-scopes.json。');
     }
-    say(`   已配置 redirect URL: http://127.0.0.1:9768/callback`);
+    // redirect 白名单是独立的一步，失败不阻断建 bot —— 但也绝不能无条件报「已配置」。
+    // 白名单缺了这条，群聊模式 / 会话群标签 / `/login` 点授权直接 20029。
+    if (result.redirectConfigured) {
+      say(`   已配置 redirect URL: ${redirectUrls.join('、')}`);
+    } else {
+      say(`   ⚠️ redirect URL 未配置成功：${result.redirectWarning ?? '未知原因'}`);
+      say(`      请到开放平台「安全设置」→「重定向 URL」手动添加: ${redirectUrls.join('、')}`);
+      say('      缺了它，群聊模式 p2pMode=group / 会话群标签 / `/login` 点授权会直接报 20029。');
+    }
     if (result.versionId) say(`   已提交发布版本: ${result.versionId}`);
     else say('   已创建版本；未从响应中解析到 versionId，请到开放平台确认是否需要手动发布。');
     say('');
@@ -639,7 +685,7 @@ async function finishOpenPlatformSetup(
   say(`${outcome.status === 'manual' ? 'ℹ️ ' : '⚠️ '} 开放平台自动配置${outcome.status === 'manual' ? '需要手动完成' : '失败'} (${result.reason}): ${result.message}`);
   if (result.sessionFile) say(`   botmux session 文件: ${result.sessionFile}`);
   say('   请按下面的手动步骤继续完成开放平台配置。');
-  if (!options.quiet) printRemainingSteps(appId, brand);
+  if (!options.quiet) printRemainingSteps(appId, brand, redirectUrls);
   return outcome;
 }
 
@@ -733,9 +779,22 @@ async function pickExistingAppCredentials(
  * - secret 不进 argv / 日志 / 错误链 (registerApp 内部 safeMsg 已做; 手动模式下
  *   AppSecret 通过 rl.question 异步读取, 不会出现在 process.argv)
  * - 任何失败都返回结构化对象, 不抛 (调用方根据 ok=false 回退)
+ *
+ * export 是给单测用的取值缝：`appJustCreated` 只在这里按来源分支置位，下游
+ * (`promptBotConfig` → SETUP_APP_JUST_CREATED → finishOpenPlatformSetup) 只是原样透传，
+ * 所以「哪条来源算刚创建」必须在这一层锁住。生产代码没有别的调用方。
  */
-async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promise<
-  | { ok: true; appId: string; appSecret: string; brand: Brand; userOpenId?: string; webSessionReady?: boolean }
+export async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promise<
+  | {
+      ok: true;
+      appId: string;
+      appSecret: string;
+      brand: Brand;
+      userOpenId?: string;
+      webSessionReady?: boolean;
+      /** 这个应用是本次 setup 现场创建出来的（而不是「选择已有」/「手动输入」的存量应用）。 */
+      appJustCreated?: boolean;
+    }
   | { ok: false; reason: 'cancelled' }
 > {
   const interactive = process.stdin.isTTY && process.stdout.isTTY;
@@ -823,6 +882,7 @@ async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promis
           appSecret: webResult.appSecret,
           brand: 'feishu',
           webSessionReady: true,
+          appJustCreated: true,
         };
       }
 
@@ -868,6 +928,13 @@ async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promis
           appSecret: result.appSecret,
           brand: result.brand,
           userOpenId: result.userOpenId,
+          // tryRegisterApp 只有「device flow 现场注册一个新应用」这一条语义（见
+          // setup/register-app.ts：SDK 打 `app/registration` 的 begin/poll），没有
+          // 「复用已有应用」的分支，所以这里恒为刚创建。漏了它，兼容模式建出的新应用
+          // 在 finishOpenPlatformSetup 里拿不到 allowBlindWrite —— 读不到白名单时会
+          // 按「保护存量用户条目」零写入，可新应用本来就没有任何条目可保护，结果就是
+          // redirect 白名单一条都没写，authorize 直接 20029。
+          appJustCreated: true,
         };
       }
       console.log(`\n⚠️  SDK 扫码失败 (${result.error}): ${result.message}`);
@@ -1081,13 +1148,26 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   if (creds.webSessionReady) {
     Object.defineProperty(normalized, SETUP_WEB_SESSION_READY, { value: true, enumerable: false });
   }
+  if (creds.appJustCreated) {
+    Object.defineProperty(normalized, SETUP_APP_JUST_CREATED, { value: true, enumerable: false });
+  }
   return normalized;
 }
 
 const SETUP_WEB_SESSION_READY = Symbol('setup-web-session-ready');
+/**
+ * 「这个应用是本次 setup 刚创建的」。与 {@link SETUP_WEB_SESSION_READY} 分开两个
+ * 符号：后者只说明「本机有可复用的 Web 登录态」，把它当「刚建的应用」用会在
+ * 「选择已有应用」路径上误判——那条路径同样有登录态，但应用是存量的。
+ */
+const SETUP_APP_JUST_CREATED = Symbol('setup-app-just-created');
 
 function hasSetupWebSession(bot: Record<string, any>): boolean {
   return Boolean((bot as any)[SETUP_WEB_SESSION_READY]);
+}
+
+function wasAppJustCreatedBySetup(bot: Record<string, any>): boolean {
+  return Boolean((bot as any)[SETUP_APP_JUST_CREATED]);
 }
 
 function formatOptionalValue(v: unknown): string {
@@ -1326,7 +1406,7 @@ async function writeSingleBotConfig(): Promise<boolean> {
 
   writeBotsJsonAtomic([bot]);
   console.log(`\n✅ 配置已写入: ${BOTS_JSON_FILE}`);
-  await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), { reuseOnly: hasSetupWebSession(bot) });
+  await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), { reuseOnly: hasSetupWebSession(bot), appJustCreated: wasAppJustCreatedBySetup(bot) });
   console.log(`下一步:`);
   console.log(`  1. botmux start              启动 daemon`);
   console.log(`  2. botmux autostart enable   注册开机自启（推荐：${process.platform === 'darwin' ? 'mac launchd' : process.platform === 'linux' ? 'linux user systemd' : process.platform === 'win32' ? 'Windows Task Scheduler' : '当前平台暂不支持'}，无需 sudo）`);
@@ -1761,6 +1841,9 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
           brand: botBrand(bot),
         }),
         quiet: cmd.json,
+        // 只认「本次命令确实创建出了这个 appId」这一条硬证据：--app-id/--app-secret
+        // 直接传进来的存量应用绝不能拿到盲写授权。
+        appJustCreated: createdAppId !== undefined && createdAppId === bot.larkAppId,
       });
     }
 
@@ -2014,7 +2097,7 @@ async function cmdSetup(): Promise<void> {
       console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak`);
       writeBotsJsonAtomic([newBot]);
       console.log(`✅ 配置已写入: ${BOTS_JSON_FILE}`);
-      await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot) });
+      await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot), appJustCreated: wasAppJustCreatedBySetup(newBot) });
       console.log(`下一步: botmux restart\n`);
       return;
     }
@@ -2132,7 +2215,7 @@ async function cmdSetup(): Promise<void> {
     writeBotsJsonAtomic([...bots, newBot]);
     console.log(`\n✅ 已添加机器人 ${newBot.larkAppId}，共 ${bots.length + 1} 个`);
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
-    await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot) });
+    await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot), appJustCreated: wasAppJustCreatedBySetup(newBot) });
     await printAddBotLiveHint(newBot.larkAppId);
     return;
     }
@@ -2189,7 +2272,7 @@ async function cmdSetup(): Promise<void> {
     console.log(`\n✅ 已迁移到多机器人配置`);
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
     console.log(`   旧配置已备份: ${ENV_FILE}.bak`);
-    await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot) });
+    await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot), appJustCreated: wasAppJustCreatedBySetup(newBot) });
     await printAddBotLiveHint(newBot.larkAppId);
 
   } else {
@@ -2235,6 +2318,10 @@ function preflightNodeSanity(): void {
 }
 
 async function cmdStart(): Promise<void> {
+  // `--systemd-service` and the PM2-God ownership gating that used to live here
+  // are gone with pm2 itself: the built-in supervisor owns single-owner exclusion
+  // via fleet-state (pid + kill-0 under the fleet mutation lock), so there is no
+  // God process whose cgroup/generation has to be proven before starting.
   if (!hasConfig()) {
     console.error('❌ 未找到配置文件');
     console.error('   请先运行: botmux setup');
@@ -2243,11 +2330,12 @@ async function cmdStart(): Promise<void> {
   ensureConfigDir();
   await ensureSystemDependencies();
 
-  // 启动前快速校验每个 bot 的凭证. Codex review 边界 #5: 凭证无效是
-  // 唯一应该阻塞 start 的情况; scope/event 缺失在 daemon 起来后用 WARN
-  // + 私信处理 (event-dispatcher.checkRequiredScopes).
-  //
-  // 失败时打印明确的 appId 前缀和错误码, 不打印 secret, 不 spawn pm2 进程.
+  const botsForCheck = await preflightConfiguredBotCredentials();
+  await startConfiguredFleet(botsForCheck);
+}
+
+/** Validate before systemd handoff so a predictable failure cannot stop the old fleet. */
+async function preflightConfiguredBotCredentials() {
   const botsForCheck = loadBotsJson();
   if (botsForCheck.length > 0) {
     const { validateCredentials } = await import('./setup/verify-permissions.js');
@@ -2275,6 +2363,13 @@ async function cmdStart(): Promise<void> {
       process.exit(1);
     }
   }
+  return botsForCheck;
+}
+
+async function startConfiguredFleet(
+  botsForCheck: ReturnType<typeof loadBotsJson>,
+  options: { systemdServiceStart?: boolean } = {},
+): Promise<void> {
 
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
     await withFileLock(BOTS_JSON_FILE, async () => {
@@ -2303,7 +2398,9 @@ async function cmdStart(): Promise<void> {
       }
     }, { maxWaitMs: 5_000 });
   }, { maxWaitMs: 5_000 });
-  await reconcilePluginServicesForCli(undefined, { autoOnly: true });
+  await reconcilePluginServicesForCli(undefined, {
+    autoOnly: true,
+  });
   const bots = loadBotsJson();
   const count = bots.length || 1;
   console.log(`\n✅ daemon 已启动${count > 1 ? ` (${count} 个机器人, 每个独立进程)` : ''}`);
@@ -2311,8 +2408,13 @@ async function cmdStart(): Promise<void> {
   console.log(`   状态: botmux status`);
   // If the user previously enabled autostart, sync the unit file in case
   // node/cli.js paths changed since (nvm switch, npm upgrade, etc.).
-  if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
-    console.log(`   autostart unit 已同步到当前 Node/cli.js 路径`);
+  // A Type=forking unit necessarily has a live start Job/activating state
+  // until this ExecStart child returns. The parent repair transaction already
+  // wrote and daemon-reloaded the unit; self-refresh here would reject that
+  // expected in-flight state and make every systemd start fail.
+  if (!options.systemdServiceStart
+      && refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
+    console.log(`   autostart 主 unit 已同步到当前 Node/cli.js 路径`);
   }
   await printDashboardHintWithRetry();
 }
@@ -2359,6 +2461,7 @@ function cleanupLegacyPm2(_op?: 'stop' | 'restart'): boolean {
   return r.found;
 }
 
+
 async function cmdStop(): Promise<void> {
   const includePluginServices = process.argv.includes('--with-plugin');
   ensureConfigDir();
@@ -2383,6 +2486,14 @@ async function cmdStop(): Promise<void> {
     console.log(`✅ daemon 已停止 (supervisor pid ${result.supervisorPid})`);
   }, { maxWaitMs: 5_000 });
 }
+
+interface RestartLifecycleFlags {
+  includePm2: boolean;
+  includePluginServices: boolean;
+  bootstrapShutdownProtocol: boolean;
+  bootstrapConfirmed: boolean;
+}
+
 
 async function cmdRestart(): Promise<void> {
   const restartLeaseId = process.env.BOTMUX_RESTART_LEASE_ID;
@@ -2475,7 +2586,7 @@ async function cmdRestart(): Promise<void> {
 
     await reconcilePluginServicesForCli(undefined, { autoOnly: true });
     if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
-      console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
+      console.log(`autostart 主 unit 已同步到当前 Node/cli.js 路径`);
     }
     console.log('✅ daemon 已重启');
     await printDashboardHintWithRetry();
@@ -2752,6 +2863,9 @@ function warnIfLegacyBotmuxAlive(): void {
   }
 }
 
+// #877 的纯文件 tail：fleet 停止时也能看日志，且永不创建 God。
+// #919 的 external-God fail-closed 检查随 pm2 一起移除：没有 God 进程可归属，
+// 也就没有「外部 God 抢占」这个状态需要拒绝；「fleet 停了也能看历史」不变。
 async function cmdLogs(): Promise<void> {
   warnIfLegacyBotmuxAlive();
   const lines = process.argv.includes('--lines')
@@ -2837,6 +2951,11 @@ async function cmdStatus(): Promise<void> {
     const exitCol = r.lastExitCode === null ? '-' : String(r.lastExitCode);
     console.log(`  ${r.name.padEnd(nameW)}  ${pidCol.padStart(7)}  ${shown.padEnd(9)}  ${String(r.restarts).padStart(4)}  ${exitCol}`);
   }
+  warnIfLegacyBotmuxAlive();
+  // The pm2 read-only projection print is gone: the fleet-state table above IS
+  // the authoritative status now (supervisor-owned), so there is no second
+  // registry to reconcile against. Legacy pm2 still gets surfaced by
+  // warnIfLegacyBotmuxAlive above, which is what a pre-migration host needs.
 }
 
 function cmdUpgrade(): void {
@@ -5760,8 +5879,13 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
     @ 硬门：每条回复须三选一 --mention/--mention-back/--no-mention，否则报错不发。
     按内容价值选：有实质结论要对方看/确认/决策→--mention-back(或--mention点名)；
     纯记录/低优先级进度/简短确认→--no-mention；没信息量的"收到"不如不发。
+    Bot→Bot 默认进入 Queue；要显式调整对方活跃的 Codex App turn，把 @steer 写成
+    正文首个语义行（可放在收件人 @ 行之后）。接收端会消费该指令，不交给模型。
     （可设 BOTMUX_REQUIRE_MENTION_DECISION=false 关闭硬门）
   bots list                            列出当前群聊中的机器人（含 open_id）
+  bots invite --chat <chatId> --team <id> --agent <appId>...
+                                       往「已存在的团队群」补人：把同团队、已 opt-in 的 agent + 各自 owner 一起拉进；
+                                       详见 \`botmux bots invite --help\`
   history [--limit N] [--scope session|thread|chat|ambient] [--with-card-json]
                                        拉取当前会话的消息历史 (JSON)。默认按 session scope：话题/话题群 → 话题内，普通群 → 整群；
                                        thread 会话里可用 --scope ambient 读取 thread 外的群聊上下文；
@@ -5862,6 +5986,7 @@ interface CurrentSession {
   larkAppId?: string;
   chatType?: 'group' | 'p2p';
   scope?: 'thread' | 'chat';
+  ownerOpenId?: string;
 }
 
 /** Detect current session info from ancestor marker + session files. */
@@ -5879,6 +6004,7 @@ function detectCurrentSession(): CurrentSession | null {
     larkAppId: s.larkAppId,
     chatType: s.chatType,
     scope: s.scope,
+    ownerOpenId: s.ownerOpenId,
   };
 }
 
@@ -6293,13 +6419,18 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       console.error('无法推断 chat-id。请加上 --chat-id <CHAT_ID>，或从 Lark 话题内的 CLI 会话中运行本命令。');
       process.exit(1);
     }
+    // Default to group top-level: a schedule created inside a topic session
+    // (including an adopted one) must not pin its results to that topic.
+    // --topic opts in explicitly; p2p sessions keep the legacy inference.
     const executionPosition: 'top-level' | 'topic' | 'new-topic' = wantsNewTopic
       ? 'new-topic'
       : wantsTopLevel
         ? 'top-level'
         : wantsTopic
           ? 'topic'
-          : cur?.scope === 'chat' ? 'top-level' : rootMessageId ? 'topic' : 'top-level';
+          : cur?.chatType === 'p2p'
+            ? (cur?.scope === 'chat' ? 'top-level' : rootMessageId ? 'topic' : 'top-level')
+            : 'top-level';
     const scope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
     if (scope === 'thread' && !rootMessageId) {
       console.error('话题下执行需要 --root-msg-id <ROOT_MESSAGE_ID>，或从 Lark 话题会话中运行。');
@@ -6331,11 +6462,18 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         prompt: promptArg,
         workingDir,
         chatId,
-        rootMessageId,
+        // Only topic execution keeps the captured root; at top-level the root
+        // is dropped so toggles can never pull execution back into the
+        // originating (e.g. adopted) topic.
+        rootMessageId: executionPosition === 'topic' ? rootMessageId : undefined,
         larkAppId,
         creatorChatId: cur?.chatId,
         creatorRootMessageId: cur?.rootMessageId,
         creatorLarkAppId: cur?.larkAppId,
+        // Stamp the creator (sandboxed session owner) so the task's scheduled
+        // turns can authenticate workflow commands as them. The daemon
+        // re-checks the owner is still allowed at every run mutation.
+        ownerOpenId: process.env.BOTMUX_OWNER_OPEN_ID ?? cur?.ownerOpenId,
         chatType: cur?.chatType === 'p2p' ? 'p2p' : 'topic_group',
         scope,
         executionPosition,
@@ -9231,8 +9369,9 @@ async function cmdDispatch(rest: string[]): Promise<void> {
                         派单前按双方 receiver 视角建立并回读 talk-only exact chatGrant，
                         发送后等待目标 session 接单确认；不支持 --repo 管理命令
   --bot <spec>          兼容外部/旧链路；spec = open_id[:名字[:角色]]，不保证本机双向授权
-  --brief <text>        子项目简报 / 追加内容
+  --brief <text>        子项目简报 / 追加内容；首个语义行写 @steer 可显式调整活跃 Codex App turn
   --brief-file <path>   从文件读取简报
+  --steer               在简报前注入通用 @steer 指令；普通 dispatch 默认仍进入 Queue
   --repo <path>         预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）
   --standby             仅 --repo 待命，不派简报
   --into <root_id>      回到已有话题线程追加（与 --title/种子互斥）
@@ -9252,6 +9391,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const repo = argValue(rest, '--repo');
   const intoRoot = argValue(rest, '--into');
   const standby = rest.includes('--standby');
+  const steer = rest.includes('--steer');
   const botSpecs = argValues(rest, '--bot');
   const botAppSpecs = argValues(rest, '--bot-app');
 
@@ -9274,6 +9414,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('--standby 与 --into 不能同用。');
     process.exit(1);
   }
+  if (standby && steer) {
+    console.error('--standby 与 --steer 不能同用（待命模式没有简报可调整当前 turn）。');
+    process.exit(1);
+  }
   if (botAppSpecs.length > 0 && repo) {
     console.error('--bot-app 仅自动建立 talk-only chatGrant，不能授权 /repo 管理命令；请使用驻守 Bot 的默认工作目录，或另走显式 operate 信任链路。');
     process.exit(1);
@@ -9282,6 +9426,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('缺少简报。用 --brief 或 --brief-file 指定（仅 --standby 模式可省略）。');
     process.exit(1);
   }
+  if (steer) brief = withBotSteerDirective(brief);
   if (!intoRoot && !title.trim()) {
     console.error('新开话题需要 --title。往已有话题追加请用 --into <root_id>。');
     process.exit(1);
@@ -11036,6 +11181,22 @@ async function cmdUserPromptHook(): Promise<void> {
 async function cmdBots(sub: string, rest: string[]): Promise<void> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
 
+  if (sub === '--help' || sub === '-h' || sub === 'help') {
+    console.log(`
+botmux bots — 机器人协作花名册 / 团队补人
+
+子命令:
+  bots list [--scope chat|team] [--team <id>] [--session-id ID]
+             列出机器人。默认 chat scope：当前飞书群内的 bot（含 open_id、能力标签、能否可靠 @到）；
+             --scope team：跨机列出同团队、已 opt-in 的 agent（按专长发现，供拉群 / 补人）。
+  bots invite --chat <chatId> --team <id> --agent <appId>...
+             往「已存在的团队群」补人：把同团队、已 opt-in 的 agent + 各自 owner 一起拉进。
+
+补人（invite）的完整参数与 403 前置条件见 \`botmux bots invite --help\`。
+`);
+    return;
+  }
+
   // `bots invite`：往**已存在的团队群**补人（同 team、已 opt-in 的 agent + 各自 owner），
   // 打平台端点4（machine-auth）。独立子命令——与「建新群」的 create-group 语义分开，
   // 不再靠 create-group --chat 区分（那个入口易被误读成"建群"）。在会话/transport 闸门前分流。
@@ -11047,6 +11208,7 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
   if (sub !== 'list' && sub !== 'ls' && sub !== '') {
     console.error('用法: botmux bots list [--scope chat|team] [--team <id>] [--session-id ID]');
     console.error('      botmux bots invite --chat <chatId> --team <id> --agent <appId>...');
+    console.error('（完整说明见 botmux bots --help）');
     process.exit(1);
   }
 
@@ -11242,6 +11404,48 @@ async function tryAutoAddPlatformBot(
  * {ok, chatId, invalidBotIds, invalidOwnerUnionIds, teamId}；invalid* 非空 → 非零退出。
  */
 async function cmdBotsInvite(rest: string[]): Promise<void> {
+  if (rest.includes('--help') || rest.includes('-h')) {
+    console.log(`
+botmux bots invite — 往「已存在的团队群」补人（同团队、已 opt-in 的 agent + 各自 owner）
+
+用法:
+  botmux bots invite --chat <chatId> --team <teamId> --agent <appId> [--agent ...]
+                     [--json-status]
+
+参数:
+  --chat <chatId>  必填。目标群 chatId（oc_...）。须满足下列前置条件（否则平台按 403 拒绝，见下）。
+  --team <teamId>  团队 id。省略时：本机唯一团队自动用它，多个团队要求显式指定（不猜）。
+  --agent <appId>  至少一个、可多次、按 appId 去重。appId 从 \`botmux bots list --scope team\` 发现。
+  --json-status    可选；在 stdout 单行 chatId 后追加一行 {ok, chatId, invalidBotIds,
+                   invalidOwnerUnionIds, teamId}；invalid* 非空 → 非零退出。
+
+行为:
+  - 全程 machine-auth，只认 appId、不需要 @（发起人在别人 bot 进群前根本 @不到它）。
+  - 补人恒把 agent + 各自 owner 一起拉进群；已在群内视作成功（幂等）。
+  - 授权 / opt-in 闸 / 大厅排除全在平台，CLI 零判断、只如实展示平台判定。
+  - 平台机器人（BotmuxPlatform）不在目标群时，会自动用群内本机 bot 当代理把它拉进群再重试；
+    自动添加失败（需群主审批 / 代理 bot 无成员管理 scope）时给出手动添加引导。
+
+前置条件（不满足平台按 403 拒绝，平台按 error code 分型）:
+  - 平台机器人（BotmuxPlatform）已在群里     → 否则 platform_bot_not_in_chat（先把它拉进群）
+  - 你本人已在该群                          → 否则 requester_not_in_chat（只能往你自己在场的群补人）
+  - 非机器人大厅                            → 否则 chat_is_hall（大厅是 bot-only 身份登记群）
+  - 每个 --agent 都已 opt-in 进该团队        → 否则 not_in_team_bots（其 owner 需在平台「管理机器人」把它加进团队；
+                                              提示会点出具体被拒的 agent，部分失败也会在 invalidBotIds 里列出）
+
+与相邻命令的区别（别混）:
+  - create-group --team：把同团队、已 opt-in 的别人机器上的 agent + 各自 owner 新建成一个聚焦新群。
+  - bots invite --chat：群已经在了、且平台机器人也在，往里补同团队的人（含各自 owner）。
+  - /invite（飞书群内 slash）：把 bot 加进当前群，走飞书原生加成员，限同租户；命令本身只拉 bot，
+    owner 由被拉 bot 的 daemon 在入群事件里补拉（默认开启，可 per-bot 关，且需其 daemon 在线）——
+    区别于本命令/create-group 由平台原子带上 owner（不依赖对方 daemon 在线）。
+
+输出:
+  - 成功 stdout 输出单行 chatId（与 create-group 一致）；失败 / 部分失败 stderr 打提示并非零退出。
+`);
+    return;
+  }
+
   const { addTeamGroupMembers, fetchTeams, describeTeamAgentsFailure, rateLimitRetryHint, shouldTryAutoAddPlatformBot } =
     await import('./platform/team-agents-client.js');
   const jsonStatus = rest.includes('--json-status');
@@ -11893,7 +12097,7 @@ async function reconcilePluginServicesForCli(
   options: { autoOnly?: boolean } = {},
 ): Promise<void> {
   const { startPluginServices } = await import('./core/plugins/service-manager.js');
-  const reports = await startPluginServices(pluginIds, options);
+  const reports = await startPluginServices(pluginIds, { autoOnly: options.autoOnly });
   if (reports.length > 0) {
     console.log('\n插件 host service:');
     console.log(formatPluginServiceReports(reports));
@@ -11905,7 +12109,7 @@ async function stopPluginServicesForCli(
   options: { autoOnly?: boolean } = {},
 ): Promise<import('./core/plugins/service-manager.js').PluginServiceReport[]> {
   const { stopPluginServices } = await import('./core/plugins/service-manager.js');
-  const reports = await stopPluginServices(pluginIds, options);
+  const reports = await stopPluginServices(pluginIds, { autoOnly: options.autoOnly });
   if (reports.length > 0) {
     console.log('\n插件 host service:');
     console.log(formatPluginServiceReports(reports));

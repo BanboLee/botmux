@@ -103,6 +103,16 @@ export interface VcMeetingConsumerConfig {
   defaultAgentAppId?: string;
   /** Default profile ids used by defaultMode=agents. */
   defaultConsumerIds?: string[];
+  /**
+   * Per-bot default role picked from the fleet-shared consumer catalog. When a
+   * bot inherits the shared catalog (no own `consumerProfiles`), this single id
+   * overrides the catalog's global default for THIS bot — "not chosen = follow
+   * the global default". Unlike `defaultConsumerIds`, this field is independent
+   * of `consumerProfiles` (the bot doesn't own profiles; it inherits them), so
+   * it is normalized unconditionally and never triggers the legacy
+   * "consumerProfiles required" resolver gate.
+   */
+  catalogDefaultConsumerId?: string;
   /** Presence of this property opts into profile mode, including an explicit empty array. */
   consumerProfiles?: VcMeetingConsumerProfileConfig[];
   /** Generator provenance; never grants runtime authority. */
@@ -117,6 +127,30 @@ export interface VcMeetingConsumerConfig {
   minBatchItems?: number;
   /** Maximum time to hold a non-empty meeting delta before injecting to the agent. Defaults in daemon. */
   maxInjectIntervalMs?: number;
+  /**
+   * In-meeting TEXT output policy for the selected agent. `allow` sends managed
+   * text into the meeting without per-message human approval; `approval` (the
+   * pre-2026-08 behavior) requires the operator to approve each send via card;
+   * `deny` blocks it. Defaults to `allow` when unset. Voice stays gated on
+   * realtimeVoice regardless of this field.
+   */
+  textOutputPolicy?: 'deny' | 'approval' | 'allow';
+  /**
+   * In-meeting VOICE output policy. Only takes effect when realtime voice is
+   * enabled — and realtime voice is now ON BY DEFAULT (unset ⇒ enabled; only an
+   * explicit `realtimeVoice.enabled: false` disables it). `allow` (the default
+   * when unset) speaks WITHOUT per-utterance approval; `approval` reviews each
+   * utterance via card; `deny` blocks voice even while realtime voice is on.
+   *
+   * ⚠ Combined default: realtime-voice-on + voice policy defaulting to `allow`
+   * means a bot pulled into a meeting can, by default, speak aloud without the
+   * operator approving each utterance. Tighten per-bot to `approval`/`deny` via
+   * meetingConsumer.voiceOutputPolicy (dashboard-editable) when that is not
+   * wanted. (Voice is still gated behind the managed request-output/action gate
+   * + capability + realtime-voice enablement; `allow` only removes the per-send
+   * human approval step, not the authorization path.)
+   */
+  voiceOutputPolicy?: 'deny' | 'approval' | 'allow';
   /** Legacy allowlist. Omitted or [] dynamically shows usable online bots. */
   agentCandidates?: VcMeetingConsumerAgentConfig[];
 }
@@ -515,6 +549,19 @@ export interface Session {
   whiteboardId?: string;
   /** CLI-native resume id when it differs from botmux's sessionId (for example Codex thread id). */
   cliSessionId?: string;
+  /**
+   * A validated endpoint for an already-running Codex App Server that this
+   * session is allowed to attach to. It is frozen with the session rather than
+   * reread from live bot config so a later bot-level endpoint change can never
+   * redirect an existing conversation to another App Server.
+   *
+   * Only valid together with `cliId === 'codex'` and a pre-existing
+   * `cliSessionId`; worker startup turns this into
+   * `codex --remote <endpoint> resume <cliSessionId>`. This is intentionally
+   * separate from `codexRpcInput`: BotMux does not own or write JSON-RPC input
+   * to this external server.
+   */
+  existingAppServerEndpoint?: string;
   /** Provenance: the botmux sessionId this session was forked from (`/fork`).
    *  Purely informational — surfaced in UI/pickers so a fork is distinguishable
    *  from its parent. Does not affect routing or lifecycle. */
@@ -832,6 +879,17 @@ export interface ScheduledTask {
   creatorChatId?: string;
   creatorRootMessageId?: string;
   creatorLarkAppId?: string;
+  /** Creator's Lark open_id captured at creation time. Daemon-initiated
+   *  scheduled turns (`schedule:<taskId>:<uuid>`) authenticate workflow
+   *  commands as this identity. On the sandboxed relay path the daemon
+   *  re-checks it is still in the bot's resolvedAllowedUsers before every
+   *  run mutation; the default non-sandboxed signed-envelope route (and
+   *  `botmux workflow run`) verifies the shared secret but does not re-check
+   *  membership — see scheduled-turn-provenance for the exact boundary.
+   *  Absent for legacy tasks and CLI-created tasks without a resolvable
+   *  creator — those keep the historical behavior (scheduled turns cannot
+   *  run Saved Workflows). */
+  ownerOpenId?: string;
   enabled: boolean;
   createdAt: string;
   lastRunAt?: string;
@@ -1007,7 +1065,7 @@ export interface PendingRepoSetup {
 
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; turnTimeoutMs?: number; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexRpcInput?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; turnTimeoutMs?: number; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; existingAppServerEndpoint?: string; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
   /** `model` rides along on every turn for the SAME reason the restart IPC carries
    *  it: the crash-loop park recovery respawns the CLI from inside the worker on
    *  the next message, with no restart IPC to refresh the snapshot. Same
@@ -1105,6 +1163,15 @@ export type DaemonToWorker = DaemonToWorkerBase extends infer Message
     : Message
   : never;
 
+/** One node of the native CoT (thinking process) message, in transcript
+ *  order. `thinking` renders as a reasoning paragraph; `tool_call` /
+ *  `tool_result` render as the tool timeline (icon + args + result). The
+ *  worker truncates args/results before shipping. */
+export type CotEntry =
+  | { kind: 'thinking'; text: string }
+  | { kind: 'tool_call'; id: string; name: string; args: string }
+  | { kind: 'tool_result'; id: string; result: string };
+
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
   | {
@@ -1162,7 +1229,17 @@ export type WorkerToDaemon =
       reasoningEffort: string | null;
     }
   | { type: 'native_session_title_generated'; title: string }
-  | { type: 'claude_exit'; code: number | null; signal: string | null; logTail?: string; canParkDiagnostic?: boolean; turnId?: string; dispatchAttempt?: number }
+  | {
+    type: 'claude_exit';
+    code: number | null;
+    signal: string | null;
+    logTail?: string;
+    canParkDiagnostic?: boolean;
+    /** A Codex App thread is still owned by another app-server writer. */
+    codexAppActiveWriter?: boolean;
+    turnId?: string;
+    dispatchAttempt?: number;
+  }
   /** Worker-side close handler has crossed the point where it will no longer
    * read bridge send markers or emit transcript fallback for this session. */
   | { type: 'session_close_ready'; sessionId: string }
@@ -1178,6 +1255,15 @@ export type WorkerToDaemon =
    *  daemon 收到后才结束 `botmux session-ready` HTTP 请求。 */
   | { type: 'session_ready_ack'; requestId: string }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
+  /** Incremental model thinking (CoT) attributed to an active Lark turn.
+   * `entries` is the FULL cumulative list so far (not a delta) — each entry
+   * renders as its own node in the native CoT message: thinking paragraphs,
+   * tool calls, and tool results, in transcript order. Append-only: earlier
+   * entries never change. Worker-side throttled; currently emitted by the
+   * Claude (transcript attribution) and Codex (bridge-queue cot observer)
+   * bridges. Cosmetic channel: it must never influence turn
+   * settlement, final_output attribution, or durable receipts. */
+  | { type: 'thinking_update'; sessionId?: string; entries: CotEntry[]; turnId: string; dispatchAttempt?: number }
   /** Executor-observed Codex tier, bound to this worker + rollout generation.
    * `null` explicitly clears any previous generation's snapshot. */
   | { type: 'codex_service_tier'; snapshot: CodexServiceTierSnapshot | null }
@@ -1248,6 +1334,12 @@ export type WorkerToDaemon =
       // worker stitching label + user + assistant into one markdown blob,
       // which mixes presentation with payload).
       kind?: 'bridge' | 'local-turn' | 'local-turn-headless';
+      /** True when `content` is the worker's FAILED-turn fallback notice (a
+       *  provider/gateway error card), not a model answer. The daemon uses it
+       *  to @mention a human on the failure card when the session has no human
+       *  recipient (bot-to-bot dispatch), so model-service outages don't pass
+       *  silently. Presentation-only — never affects turn settlement. */
+      turnFailed?: boolean;
       userText?: string;
       /** Two-phase Codex App final settlement; daemon persists before ACKing worker. */
       codexAppSettlement?: {

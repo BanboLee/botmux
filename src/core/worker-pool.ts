@@ -52,6 +52,12 @@ import {
   type MojoLivePatch,
 } from '../adapters/backend/mojo-types.js';
 import { sanitizePerBotEnv } from './per-bot-env.js';
+import { normalizeExistingAppServerEndpoint } from './existing-app-server.js';
+import {
+  isExistingAppServerSharedAdoptPersistedSession,
+  isSharedAdoptPersistedSession,
+  isSharedAdoptSession,
+} from './shared-adopt.js';
 import { closeResidualClause } from './close-residual.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -76,6 +82,7 @@ import {
 } from '../im/lark/md-card.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
+import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage } from '../im/lark/cot-message.js';
 import { replyToDocComment, chunkCommentText, unsubscribeDocFile, removeCommentReaction } from '../im/lark/doc-comment.js';
 import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
@@ -91,7 +98,7 @@ import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, 
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
-import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
+import { getBot, getAllBots, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
@@ -454,6 +461,11 @@ import { recordDispatchInputCommit } from './dispatch.js';
 import { sendWorkerIpc } from './worker-ipc.js';
 import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
 import { REMOTE_ADMISSION_RESTORE_TIMEOUT_MS } from './shutdown-budgets.js';
+import {
+  MAX_STARTUP_AUTO_RETRIES,
+  isTransientStartupFailure,
+  startupAutoRetryDelayMs,
+} from './worker-startup-retry.js';
 import {
   managedOriginCapabilityPath,
   replaceManagedOriginCapabilityFile,
@@ -835,7 +847,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
     ds.currentImageKey,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     status === 'limited' ? ds.usageLimit : undefined,
@@ -857,7 +869,7 @@ function flushPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
 /** PATCH the live card when the executor reports a different active runtime.
  * Runtime identity stays attached to the streaming usage line. */
 function scheduleActiveRuntimePatch(ds: DaemonSession): void {
-  if (ds.session.vcMeetingReceiver || streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
+  if (streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
     ds.pendingActiveRuntimeCardRefresh = undefined;
     return;
   }
@@ -888,7 +900,7 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): void {
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
     ds.currentImageKey,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     status === 'limited' ? ds.usageLimit : undefined,
@@ -909,7 +921,7 @@ function flushPendingActiveRuntimePatch(ds: DaemonSession): void {
 
 /** PATCH a live card when rollout settings change, even if the PTY is static. */
 function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
-  if (ds.session.vcMeetingReceiver || streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
+  if (streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
     ds.pendingCodexTierCardRefresh = undefined;
     return;
   }
@@ -940,7 +952,7 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
     ds.currentImageKey,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     status === 'limited' ? ds.usageLimit : undefined,
@@ -1013,7 +1025,7 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
     ds.currentImageKey,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     cardUsageLimit(ds),
@@ -1100,7 +1112,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
     ds.currentImageKey,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     status === 'limited' ? ds.usageLimit : undefined,
@@ -1139,9 +1151,7 @@ function ordinaryTurnRecoveryEligible(
 ): boolean {
   return sessionCliId(ds, botCfg) === 'claude-code'
     && ds.session.status === 'active'
-    && !ds.adoptedFrom
-    && !ds.session.adoptedFrom
-    && ds.initConfig?.adoptMode !== true
+    && !isSharedAdoptSession(ds)
     && !ds.session.vcMeetingReceiver
     && larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly });
 }
@@ -1651,12 +1661,30 @@ function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: str
   }
 }
 
+/** 失败兜底卡片（turnFailed final_output）的兜底 @ 对象。仅当会话没有任何真人
+ *  footer 收件人时使用（典型：bot-to-bot 派发的 ownerless 会话遇到模型网关故障，
+ *  没人被 @，故障静默滑过）——回退到 bot 管理员（首个已授权真人 open_id，与
+ *  「缺权限警告私信对象」同口径）。返回 undefined = 没有可 @ 的真人，不加提及。 */
+function failureNoticeFallbackMentionOpenId(ds: DaemonSession): string | undefined {
+  const admin = getOwnerOpenId(ds.larkAppId);
+  if (!admin) return undefined;
+  try {
+    // 管理员名单里混入 bot open_id 时不 @：卡片里 @ 一个 bot 会触发它的新一轮，
+    // 失败通知不该产生二次派发。fail closed。
+    if (loadKnownBotOpenIdsForApp(ds.larkAppId).has(admin)) return undefined;
+  } catch { /* cross-ref 读取失败 → 仍然 @ 配置的管理员（admin 名单本就是真人为主） */ }
+  return admin;
+}
+
 export function clearUsageLimitState(ds: DaemonSession): void {
   if (ds.usageLimitRetryTimer) {
     clearTimeout(ds.usageLimitRetryTimer);
     ds.usageLimitRetryTimer = undefined;
   }
   ds.usageLimit = undefined;
+  // Re-arm the proactive rate-limit notification latch: the next limit episode
+  // (even one with the same usageLimitStateKey) must notify the owner again.
+  ds.rateLimitNotifiedKey = undefined;
   persistStreamCardState(ds);
 }
 
@@ -1665,10 +1693,6 @@ export function cardUsageLimit(ds: DaemonSession): CliUsageLimitState | undefine
 }
 
 function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
-  // Dedicated VC receivers keep limit state for dashboard/audit only. A timer
-  // must never revive or mutate an old/manual Lark card after the synchronous
-  // screen_update path has already suppressed auxiliary UI.
-  if (ds.session.vcMeetingReceiver) return;
   if (ds.lastScreenStatus !== 'limited') return;
   if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !workerHasInitialized(ds)) return;
 
@@ -1687,7 +1711,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
     ds.currentImageKey,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     ds.usageLimit,
@@ -1937,7 +1961,7 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefin
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
     ds.currentImageKey,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     status === 'limited' ? ds.usageLimit : undefined,
@@ -1968,7 +1992,7 @@ export async function postTurnStartingCard(
   if (!ds.streamCardPending || ds.streamCardPendingTurnId !== turnId) return false;
   if (remoteRetirementAdmissionPhase(ds)) return false;
   if (ds.streamCardId === CARD_POSTING_SENTINEL) return false;
-  if (ds.session.vcMeetingReceiver || streamingCardDisabled(ds, turnId)) return false;
+  if (streamingCardDisabled(ds, turnId)) return false;
   if (!workerHasInitialized(ds)) return false;
   if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return false;
 
@@ -2001,7 +2025,7 @@ export async function postTurnStartingCard(
     ds.displayMode ?? 'hidden',
     nonce,
     undefined,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     ds.usageLimit,
@@ -2098,9 +2122,6 @@ export async function postFreshStreamingCard(
   ds: DaemonSession,
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>,
 ): Promise<boolean> {
-  // Receiver terminals can contain meeting-derived private context. Never
-  // publish one into the listener chat as a streaming-card side channel.
-  if (ds.session.vcMeetingReceiver) return false;
   if (isDocNativeSession(ds)) return false;
   if (!workerHasInitialized(ds)) return false;
   const botCfg = getBot(ds.larkAppId).config;
@@ -2133,7 +2154,7 @@ export async function postFreshStreamingCard(
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
     ds.currentImageKey,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     cardUsageLimit(ds),
@@ -2317,7 +2338,7 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
       ds.session.title || sessionCliDisplayName(ds, botCfg),
       effectiveCliId,
       true,
-      !!ds.adoptedFrom,
+      isSharedAdoptSession(ds),
       localeForBot(ds.larkAppId),
       false,
       sessionRuntimeDisplayName(ds, botCfg),
@@ -2334,7 +2355,7 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
     ds.session.title || sessionCliDisplayName(ds, botCfg),
     effectiveCliId,
     true,             // showManageButtons — write-link card includes restart & close
-    !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
+    isSharedAdoptSession(ds), // shared adopt — disconnect, never close the source conversation
     localeForBot(ds.larkAppId),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     sessionRuntimeDisplayName(ds, botCfg),
@@ -2423,7 +2444,7 @@ function buildSubstituteControlCard(ds: DaemonSession): string | null {
     ds.session.title || sessionCliDisplayName(ds, botCfg),
     effectiveCliId,
     true,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     localeForBot(ds.larkAppId),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     sessionRuntimeDisplayName(ds, botCfg),
@@ -3110,9 +3131,9 @@ export async function detachWorkerForTransfer(
  * adopt-skip decision is unit-testable without spawning a worker.
  */
 export function shouldDestroyPaneBeforeRestart(
-  ds: Pick<DaemonSession, 'initConfig' | 'adoptedFrom'>,
+  ds: Pick<DaemonSession, 'initConfig' | 'adoptedFrom' | 'session'>,
 ): boolean {
-  return !ds.initConfig?.adoptMode && !ds.adoptedFrom;
+  return !isSharedAdoptSession(ds);
 }
 
 /**
@@ -3443,7 +3464,12 @@ function destroyOrphanedBackingSession(
     skipRemoteCancel?: boolean;
   } = {},
 ): void {
-  if (ds.initConfig?.adoptMode || ds.adoptedFrom) return;
+  // Traditional `/adopt` observes a user-owned tmux/zellij/Herdr target and
+  // must never destroy it. An App Server shared adopt is different: its
+  // persistent bmx-* pane is BotMux's own `codex --remote` client, so reclaim
+  // that pane while leaving the external App Server untouched.
+  if (!isExistingAppServerSharedAdoptPersistedSession(ds.session)
+      && isSharedAdoptSession(ds)) return;
   reclaimParkedCrashDiagnostic(ds);
   // Riff cancellation is asynchronous and cannot be made safe from this
   // synchronous best-effort helper. The authoritative closeSession path awaits
@@ -4213,7 +4239,10 @@ async function prepareRiffExplicitClose(
     };
   }
   if (backendType !== 'riff') return { ok: true };
-  if (ds?.initConfig?.adoptMode || ds?.adoptedFrom || session.adoptedFrom) return { ok: true };
+  if (
+    (ds && isSharedAdoptSession(ds))
+    || isSharedAdoptPersistedSession(session)
+  ) return { ok: true };
 
   if (ds?.worker && !ds.worker.killed) {
     if (!stored || stored.status !== 'active') {
@@ -4318,7 +4347,10 @@ async function prepareMojoExplicitClose(
 ): Promise<RemoteClosePreparation> {
   const session = ds?.session ?? stored;
   if (!session) return { ok: true };
-  if (ds?.initConfig?.adoptMode || ds?.adoptedFrom || session.adoptedFrom) return { ok: true };
+  if (
+    (ds && isSharedAdoptSession(ds))
+    || isSharedAdoptPersistedSession(session)
+  ) return { ok: true };
   // A row whose lineage was PARKED (restore-time quarantine moves the id here and
   // clears the active slot) still has a remote session running. It is reported as
   // a residual on every close of this row, including replays of an already-closed
@@ -5202,9 +5234,8 @@ function teardownAuthoritativePersistentBackingBeforeCloseImpl(
   const backendType = ds ? getSessionPersistentBackendType(ds) : session.backendType;
   if (
     backendType !== 'zmx'
-    || ds?.initConfig?.adoptMode
-    || ds?.adoptedFrom
-    || session.adoptedFrom
+    || (ds && isSharedAdoptSession(ds))
+    || isSharedAdoptPersistedSession(session)
     || session.queued
     || session.status === 'closed'
   ) return;
@@ -5241,7 +5272,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
     ds.currentImageKey,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     cardUsageLimit(ds),
@@ -5371,9 +5402,8 @@ export async function closeSession(
   const stored = sessionStore.getOwnedSession(sessionId);
   const closeFrozenBackendType = ds?.initConfig?.backendType
     ?? ds?.session.backendType ?? stored?.backendType;
-  const isOwnedClose = !ds?.initConfig?.adoptMode
-    && !ds?.adoptedFrom
-    && !stored?.adoptedFrom;
+  const isOwnedClose = !(ds && isSharedAdoptSession(ds))
+    && !(stored && isSharedAdoptPersistedSession(stored));
   const isOwnedRiffClose = isOwnedClose && closeFrozenBackendType === 'riff';
   const isOwnedMojoClose = isOwnedClose && closeFrozenBackendType === 'mojo';
   const closeJournal = ds?.session.mojoCloseJournal ?? stored?.mojoCloseJournal;
@@ -5877,10 +5907,11 @@ function persistedActiveSessionKey(
   fallbackLarkAppId: string,
 ): string {
   const larkAppId = session.larkAppId ?? fallbackLarkAppId;
-  const anchor = session.vcMeetingReceiver
-    ? `vc-receiver:${session.sessionId}`
-    : storedSessionAnchorId(session);
-  return sessionKey(anchor, larkAppId);
+  // Plan B: a VC meeting agent is an ordinary chat-scope session keyed by its
+  // normal chat anchor — this must stay in lockstep with activeSessionKey()
+  // (core/types.ts) so a restored meeting row re-registers at the SAME slot the
+  // live path uses. The vcMeetingReceiver marker is delivery metadata only.
+  return sessionKey(storedSessionAnchorId(session), larkAppId);
 }
 
 /**
@@ -6197,7 +6228,14 @@ function failOrdinaryImDelivery(record: OrdinaryImDelivery, reason: string): voi
     );
     return;
   }
-  if (record.ds.session.vcMeetingReceiver || isSilentScheduledTurn(record.ds, record.turnId)) return;
+  // Plan B: a meeting agent is an ordinary chat-scope session. This tracker only
+  // ever holds ORDINARY IM turns (durable transcript deliveries use the receipt
+  // path, not this map), so a plain user turn's delivery failure must be reported
+  // like any session — otherwise the user's message is silently dropped. Only a
+  // stamped meeting @mention follow-up stays fenced (isMeetingDrivenTurn); a
+  // silent scheduled turn stays suppressed as before. (isMeetingDrivenTurn
+  // supersedes the pre-Plan-B `vcMeetingReceiver` blanket check.)
+  if (isMeetingDrivenTurn(record.ds, record.turnId) || isSilentScheduledTurn(record.ds, record.turnId)) return;
   const loc = botLocale(getBot(record.ds.larkAppId).config);
   void requireCallbacks().sessionReply(
     sessionAnchorId(record.ds),
@@ -6311,8 +6349,13 @@ function shouldTrackOrdinaryImDelivery(
     && (message.turnId.startsWith('om_') || message.turnId.startsWith('bmx-recovery-'))
     && message.dispatchAttempt === undefined
     && (message.type !== 'init' || (!!message.prompt && !message.adoptMode))
-    && !ds.adoptedFrom
-    && !ds.session.vcMeetingReceiver
+    && !isSharedAdoptSession(ds)
+    // Plan B: a meeting agent is an ordinary chat-scope session. A plain user
+    // turn on it IS an ordinary IM delivery (track it for receipt-ACK + retry so
+    // its failure is reported). Only a meeting-driven turn — a stamped @mention
+    // follow-up here, since durable deliveries are already excluded by the
+    // dispatchAttempt===undefined guard above — stays on the receipt/lease path.
+    && !isMeetingDrivenTurn(ds, message.turnId, message.dispatchAttempt)
     && Number.isSafeInteger(ds.workerGeneration)
     && (ds.workerGeneration ?? 0) > 0
     && ds.session.workerGeneration === ds.workerGeneration;
@@ -6720,7 +6763,6 @@ export async function transferSession(
     runtimeWorkingDir: ds.workingDir,
     runtimeAdoptedFrom: ds.adoptedFrom,
   });
-  if (ds.session.vcMeetingReceiver) return { ok: false, error: 'vc_receiver_not_relayable' };
   if (hasProtectedSessionMutationOwnership(ds)) {
     return { ok: false, error: 'codex_app_dispatch_pending' };
   }
@@ -6794,7 +6836,7 @@ export async function transferSession(
   // Adopt sessions wrap a CLI process that botmux didn't spawn — the user
   // owns it inside their own tmux pane, so moving routing here would be
   // surprising and we don't control the tmux session's lifecycle. Refuse.
-  if (ds.session.adoptedFrom) return { ok: false, error: 'adopt_not_relayable' };
+  if (isSharedAdoptSession(ds)) return { ok: false, error: 'adopt_not_relayable' };
 
   // Busy worker: refuse immediately rather than waiting. An idle-wait loop
   // (previously 60s) created an asymmetry with the peer-dispatch HTTP
@@ -6874,7 +6916,6 @@ export async function transferSession(
     item.sessionId !== ds.session.sessionId
     && item.status === 'active'
     && (!item.larkAppId || item.larkAppId === ds.larkAppId)
-    && !item.vcMeetingReceiver
     && (item.scope === 'chat' ? item.chatId : item.rootMessageId) === targetAnchor
     && !runtimeIds.has(item.sessionId),
   );
@@ -7085,6 +7126,11 @@ export function isForkCapableSession(ds: DaemonSession): boolean {
   const botCfg = getBot(ds.larkAppId).config;
   const cliId = sessionCliId(ds, botCfg);
   if (!FORK_CAPABLE_CLI_IDS.has(cliId)) return false;
+  // An external App Server thread is not a local rollout. `codex fork` would
+  // resolve against the terminal client's own CODEX_HOME and could fork an
+  // unrelated/empty local session, so refuse rather than claiming a copy was
+  // made. A future server-side thread/fork primitive can add an explicit path.
+  if (ds.session.existingAppServerEndpoint) return false;
   // Codex terminal mode is forkable; Codex under Hybrid RPC input is not (the
   // thread is an app-server live session, no local rollout to `codex fork`).
   //
@@ -7149,10 +7195,9 @@ export async function forkSession(
 
   // ── Front guards (mirror transferSession; a fork needs a clean, complete
   //    source node exactly as a relay does) ──
-  if (ds.session.vcMeetingReceiver) return { ok: false, error: 'vc_receiver_not_forkable' };
   if (ds.pendingRepo) return { ok: false, error: 'not_started_yet' };
   if (!isRelayableRealSession(ds)) return { ok: false, error: 'not_started_yet' };
-  if (ds.session.adoptedFrom) return { ok: false, error: 'adopt_not_forkable' };
+  if (isSharedAdoptSession(ds)) return { ok: false, error: 'adopt_not_forkable' };
   if (isSessionLifecycleInFlight(ds)) return { ok: false, error: 'worker_busy' };
   const st = ds.lastScreenStatus;
   if (ds.worker && !ds.worker.killed && st !== 'idle' && st !== 'limited') {
@@ -8175,7 +8220,18 @@ export function mojoLivePatchForSession(ds: DaemonSession): { mojoLivePatch: Moj
 const mojoQuarantineNoticeInFlight = new Set<string>();
 
 /**
- * THE auxiliary-UI suppression policy. One definition, two call sites.
+ * Auxiliary-UI suppression policy for the **mojo quarantine notice** path.
+ *
+ * NOTE (Plan B merge, 2026-08): setupWorkerHandlers' `managedAuxUiSuppressed`
+ * no longer delegates here — it keeps its own inline copy that gates on
+ * `isMeetingDrivenTurn` instead of this function's pre-Plan-B blanket
+ * `ds.session.vcMeetingReceiver` check. That blanket check would re-suppress a
+ * plain user turn on a meeting-agent chat session (the "手动@不回复" regression),
+ * which is exactly why the streaming/aux path had to diverge. This function is
+ * therefore currently the mojo-quarantine caller's policy only; migrating it to
+ * `isMeetingDrivenTurn` (so the two converge again without the regression) is a
+ * tracked follow-up. ordinaryTurnRecoveryEligible (below) carries the same
+ * pre-Plan-B blanket and is on the same follow-up.
  *
  * Previously setupWorkerHandlers held this as a closure and the quarantine notice
  * COPIED three of its four checks — dropping `ordinaryManagedSuppression`, so a
@@ -8861,6 +8917,45 @@ export function forkWorker(
   const cb = requireCallbacks();
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
+  if (
+    botCfg.existingAppServer
+    && botCfg.cliId === 'codex'
+    && ds.session.existingAppServerEndpoint === undefined
+  ) {
+    throw new Error(
+      'this BotMux bot attaches only to an existing Codex App conversation; '
+      + 'use /adopt to select the thread before sending task input',
+    );
+  }
+  let existingAppServerEndpoint: string | undefined;
+  if (ds.session.existingAppServerEndpoint !== undefined) {
+    existingAppServerEndpoint = normalizeExistingAppServerEndpoint(
+      ds.session.existingAppServerEndpoint,
+      `session ${ds.session.sessionId} existingAppServerEndpoint`,
+    );
+    if (ds.session.cliId !== 'codex') {
+      throw new Error(
+        'existing Codex App Server session must use cliId "codex"; '
+        + 'refusing to launch another CLI against this thread',
+      );
+    }
+    if (!ds.session.cliSessionId) {
+      throw new Error(
+        'existing Codex App Server session has no selected thread id; '
+        + 'use /adopt to select a Codex App conversation first',
+      );
+    }
+    if (ds.session.sandbox === true || botCfg.readIsolation === true) {
+      throw new Error(
+        'existing Codex App Server attachment cannot run under sandbox/readIsolation; '
+        + 'the external app-server would remain outside that boundary',
+      );
+    }
+    // Remote TUI attach always resumes the explicitly selected remote thread.
+    // Never let later cold-resume/restart policy demote it into a new local
+    // Codex session.
+    resume = true;
+  }
   // A bare /repo placeholder (and a non-Codex empty group-join setup) owns no
   // model turn. Starting its CLI with an empty prompt must not mint a queued
   // activation token: the worker has nothing to submit and could never ACK it.
@@ -9009,7 +9104,7 @@ export function forkWorker(
   // worker left parked but couldn't clean (hard-killed while parked, daemon
   // still alive → next message reforks here). The fresh CLI spawns under the
   // real bmx-<sid>; without this, bmx-diag-<sid> + its .ansi file would leak.
-  if (!ds.initConfig?.adoptMode && !ds.adoptedFrom) reclaimParkedCrashDiagnostic(ds);
+  if (!isSharedAdoptSession(ds)) reclaimParkedCrashDiagnostic(ds);
 
   agentCfg = sessionAgentConfig(ds, botCfg);
   if (!initTurnId && prompt.length > 0 && agentCfg.cliId === 'codex-app') {
@@ -9018,7 +9113,7 @@ export function forkWorker(
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride);
   let nativeSessionTitle: string | undefined;
   let nativeSessionTitlePrompt: string | undefined;
-  if (agentCfg.cliId === 'codex' && !ds.adoptedFrom) {
+  if (agentCfg.cliId === 'codex' && !isSharedAdoptSession(ds)) {
     const isFreshNativeSession = !resume && !ds.session.cliSessionId;
     const titlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
       promptPayload.codexAppInput?.text ?? prompt,
@@ -9278,10 +9373,18 @@ export function forkWorker(
       reason: 'worker_fork_error',
       message: reason,
     });
-    // A dedicated VC receiver and a silent schedule have no auxiliary Lark
-    // output channel. Keep lifecycle/dashboard state above, but never leak a
-    // fork diagnostic into the chat.
-    if (ds.session.vcMeetingReceiver || isSilentScheduledTurn(ds, initAttributionTurnId)) {
+    // Plan B: a meeting agent is an ordinary chat-scope session. A fork
+    // diagnostic must stay out of the chat only for a genuinely meeting-driven
+    // opening — a durable transcript delivery (initDispatchAttempt set) or a
+    // stamped meeting @mention follow-up — because that path is fenced to the
+    // receipt/lease chain and could otherwise leak on a silent delivery. A plain
+    // user turn on this session gets its fork failure surfaced like any session
+    // (else the user's own turn fails silently). Silent scheduled turns stay
+    // suppressed as before.
+    const forkErrorMeetingDriven = !!ds.session.vcMeetingReceiver
+      && (initDispatchAttempt !== undefined
+        || resolveVcMeetingImTurnOrigin(ds.session, initAttributionTurnId) !== undefined);
+    if (forkErrorMeetingDriven || isSilentScheduledTurn(ds, initAttributionTurnId)) {
       logger.info(
         `[${t}] Managed/silent fork failure kept out of auxiliary Lark UI `
         + `turn=${initAttributionTurnId?.slice(0, 12) ?? '-'} attempt=${initDispatchAttempt}: ${reason}`,
@@ -9296,7 +9399,9 @@ export function forkWorker(
       'text',
       ds.larkAppId,
       fallbackTurnId(ds, initAttributionTurnId),
-      ds.session.vcMeetingReceiver
+      // A meeting-driven turn (listener_thread delivery) that DOES surface must
+      // still attribute to the meeting session so the send policy resolves it.
+      forkErrorMeetingDriven
         ? { sourceSessionId: ds.session.sessionId }
         : undefined,
     ).catch(replyErr => logger.error(`[${t}] Failed to deliver worker fork error to Lark: ${replyErr}`));
@@ -9341,8 +9446,17 @@ export function forkWorker(
     // dsh runner turn timeout: read live from bot config so tuning bots.json
     // takes effect on the next worker fork without recreating the session.
     turnTimeoutMs: botCfg.turnTimeoutMs,
+    // dsh runtime variant (official runner vs dsh-tui PTY TUI).
+    dshRuntime: botCfg.dshRuntime,
     disableCliBypass: botCfg.disableCliBypass === true,
-    codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
+    codexBrowser: botCfg.codexBrowser,
+    // Existing App Server attachment owns neither an app-server nor a JSON-RPC
+    // input channel. It is a normal official remote TUI, so all user input goes
+    // through its terminal and must never trigger BotMux's self-owned RPC engine.
+    codexRpcInput: existingAppServerEndpoint
+      ? false
+      : botCfg.codexRpcInput === true || config.codexRpcInputDefault,
+    ...(existingAppServerEndpoint ? { existingAppServerEndpoint } : {}),
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.
@@ -9715,6 +9829,27 @@ function invalidateTuiPrompt(
   publishAttentionPatch(ds);
 }
 
+/**
+ * Plan B: a VC meeting agent is an ordinary chat-scope session that hosts BOTH
+ * meeting transcript deliveries and plain user IM turns. A turn is
+ * "meeting-driven" only when it is a durable transcript delivery (dispatchAttempt
+ * set) or a stamped meeting @mention follow-up (vcMeetingImTurnOrigin). Only
+ * meeting-driven turns are subject to the durable silent/listener_thread output
+ * policy and the receipt-fenced auxiliary-UI suppression; a plain user turn on
+ * this session is an ordinary turn and must post / notify normally (else the
+ * user's own reply is silently swallowed — the "手动@机器人也不回复" bug). Shared
+ * across setupWorkerHandlers and deliverFinalOutput so every gate stays aligned.
+ */
+function isMeetingDrivenTurn(
+  ds: DaemonSession,
+  turnId?: string,
+  dispatchAttempt?: number,
+): boolean {
+  if (!ds.session.vcMeetingReceiver) return false;
+  if (dispatchAttempt !== undefined) return true;
+  return resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined;
+}
+
 function setupWorkerHandlers(
   ds: DaemonSession,
   worker: ChildProcess,
@@ -9806,14 +9941,32 @@ function setupWorkerHandlers(
   };
   /** Auxiliary worker UI is never an authorized output channel for a dedicated
    * VC receiver. Dashboard/audit state is still updated before these guards. */
-  // Delegates to the shared policy (auxUiSuppressedFor) so this and the mojo
-  // quarantine notice cannot drift apart. Suppressing here is the authoritative
-  // fix, NOT a fake "success" message id from sessionReply (a synthetic id would
-  // get stored as streamCardId and later scheduleCardPatch → updateMessage would
-  // still dial Feishu). Dashboard/web-terminal state is updated before these
-  // guards, so the terminal view is unaffected.
-  const managedAuxUiSuppressed = (turnId?: string, dispatchAttempt?: number): boolean =>
-    auxUiSuppressedFor(ds, turnId, dispatchAttempt);
+  const managedAuxUiSuppressed = (turnId?: string, dispatchAttempt?: number): boolean => {
+    // No-transport session (apiOnly bot or HTTP virtual chat): there is no real
+    // Feishu chat to render a card/reaction into. Suppress ALL auxiliary UI at
+    // the single source every aux-UI handler funnels through — this is the
+    // authoritative fix, NOT a fake "success" message id from sessionReply (a
+    // synthetic id would get stored as streamCardId and later scheduleCardPatch
+    // → updateMessage would still dial Feishu). Dashboard/web-terminal state is
+    // still updated before these guards, so the terminal view is unaffected.
+    if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return true;
+    if (isSilentScheduledTurn(ds, turnId)) return true;
+    // Plan B: a VC meeting agent is an ordinary chat-scope session, so the live
+    // STREAMING CARD is no longer gated here at all — it surfaces through the
+    // normal post/patch path like any group session (that was the "看不到流式
+    // 卡片" report; those sites dropped their VC guard). What remains funnelled
+    // through managedAuxUiSuppressed is out-of-band auxiliary UI (startup-failure
+    // notices, usage-limit patches, exit UI): for a genuinely meeting-driven turn
+    // — a durable transcript delivery (dispatchAttempt set) or a stamped meeting
+    // @mention follow-up — that diagnostic stays fenced to the receipt/retry
+    // chain and must never leak out-of-band (a silent delivery especially). A
+    // plain user turn on this session has neither marker and notifies normally.
+    // (isMeetingDrivenTurn supersedes the pre-Plan-B per-bot-receiver blanket
+    // check that master's auxUiSuppressedFor still uses — keeping this inline is
+    // the load-bearing "手动@不回复" fix.)
+    if (isMeetingDrivenTurn(ds, turnId, dispatchAttempt)) return true;
+    return ordinaryManagedSuppression(turnId, dispatchAttempt);
+  };
   /** final_output is the sole exception: listener_thread and exact IM replies
    * may proceed into the durable action ledger; silent/stale attempts do not. */
   const managedFinalOutputSuppressed = (
@@ -9822,13 +9975,16 @@ function setupWorkerHandlers(
   ): boolean => {
     if (isSilentScheduledTurn(ds, turnId)) return true;
     if (isTriggerFinalSuppressed(ds, turnId)) return true;
-    if (!ds.session.vcMeetingReceiver) {
+    // Only a genuinely meeting-driven turn is subject to the durable meeting-send
+    // policy; a plain user turn on this session posts through the ordinary path
+    // (see isMeetingDrivenTurn).
+    if (!isMeetingDrivenTurn(ds, turnId, dispatchAttempt)) {
       return ordinaryManagedSuppression(turnId, dispatchAttempt);
     }
     // Resolve every Lark-facing worker event against durable origin state. The
     // receipt freezes responseMode, so terminal→idle updates and daemon restore
     // cannot become loud merely because an in-memory suppression map was
-    // cleared/lost. Missing attribution on a dedicated receiver fails closed.
+    // cleared/lost. Missing attribution on a meeting-driven turn fails closed.
     const decision = evaluateVcMeetingManagedSend(config.session.dataDir, {
       receiverSessionId: ds.session.sessionId,
       receiverSession: true,
@@ -9874,10 +10030,73 @@ function setupWorkerHandlers(
       logger.error(`[${t}] Failed to deliver worker startup failure to Lark: ${err?.message ?? err}`);
     }
   };
+  /**
+   * Daemon-side self-heal for TRANSIENT startup/relaunch failures (see
+   * worker-startup-retry.ts; 2026-08-23 tmux restart-storm incident). Returns
+   * true when a silent bounded retry was scheduled INSTEAD of a user-visible
+   * notify. Scope is deliberately narrow:
+   *   - only turn-less failures — a turn-carrying failure has a waiting sender
+   *     and (for durable VC/at-most-once turns) its own delivery state machine
+   *     that must keep owning retries;
+   *   - only reasons the classifier deems transient host/backend pressure;
+   *   - bounded by MAX_STARTUP_AUTO_RETRIES per failing streak (reset on a
+   *     worker generation reaching `ready`), so a persistent failure still
+   *     surfaces to the user with the standard card.
+   * The retry itself is a blank re-fork (`forkWorker(ds, '', true)`) — exactly
+   * what a daemon restart or the next inbound message would do: re-attach when
+   * the backing pane survived (the 08-23 case — pane and CLI were alive, only
+   * the worker had died), cold `--resume` otherwise.
+   */
+  const scheduleTransientStartupRetry = (
+    reason: string,
+    turnId?: string,
+    dispatchAttempt?: number,
+  ): boolean => {
+    if (turnId !== undefined || dispatchAttempt !== undefined) return false;
+    if (startupState.failureNotified) return false;
+    if (!isTransientStartupFailure(reason)) return false;
+    if (ds.session.status !== 'active') return false;
+    const attempts = (ds.startupAutoRetry?.attempts ?? 0) + 1;
+    if (attempts > MAX_STARTUP_AUTO_RETRIES) return false;
+    // Mark this generation handled so the pre-ready exit guard cannot post a
+    // duplicate start_exited_early card behind the scheduled retry.
+    startupState.failureNotified = true;
+    const delayMs = startupAutoRetryDelayMs(ds.session.sessionId, attempts);
+    logger.warn(
+      `[${t}] Transient worker startup failure (${reason}); `
+      + `auto-retry ${attempts}/${MAX_STARTUP_AUTO_RETRIES} in ${Math.round(delayMs / 1000)}s`,
+    );
+    const timer = setTimeout(() => {
+      if (ds.startupAutoRetry?.timer === timer) ds.startupAutoRetry.timer = undefined;
+      // Lifecycle guards: the session may have been closed, replaced in the
+      // registry, or revived by an inbound message while the timer slept.
+      if (ds.session.status !== 'active') return;
+      if (ds.worker && !ds.worker.killed) return;
+      if (activeSessionsRegistry && activeSessionsRegistry.get(activeSessionKey(ds)) !== ds) return;
+      logger.info(
+        `[${t}] Auto-retrying worker start (${attempts}/${MAX_STARTUP_AUTO_RETRIES}) `
+        + 'after transient startup failure',
+      );
+      try {
+        forkWorker(ds, '', true);
+      } catch (err: any) {
+        logger.error(`[${t}] Startup auto-retry fork failed: ${err?.message ?? err}`);
+      }
+    }, delayMs);
+    timer.unref?.();
+    // An inbound message can revive the session between two failing
+    // generations; if the replacement fails too, the previous generation's
+    // still-pending timer must not survive as an orphan (its guards make a
+    // double blank re-fork merely wasteful, not harmful — but one streak owns
+    // exactly one pending retry).
+    if (ds.startupAutoRetry?.timer) clearTimeout(ds.startupAutoRetry.timer);
+    ds.startupAutoRetry = { attempts, timer };
+    return true;
+  };
 
   // Adopt mode flags — computed once, used in all buildStreamingCard calls.
   // Bridge mode (the v3 default for /adopt) hides the legacy takeover button.
-  const isAdopt = !!ds.adoptedFrom;
+  const isAdopt = isSharedAdoptSession(ds);
   const showTakeover = false;
 
   worker.on('message', async (msg: WorkerToDaemon) => {
@@ -10039,6 +10258,13 @@ function setupWorkerHandlers(
         }
         startupState.ready = true;
         ds.workerReady = true;
+        // A generation reached ready: the transient-startup failing streak is
+        // over. Clear the budget and any still-pending retry timer (an inbound
+        // message may have revived the session while a retry slept).
+        if (ds.startupAutoRetry) {
+          if (ds.startupAutoRetry.timer) clearTimeout(ds.startupAutoRetry.timer);
+          ds.startupAutoRetry = undefined;
+        }
         // Restore the daemon-owned display mode BEFORE any card handling: a
         // fresh worker always boots with displayMode='hidden', and every early
         // break below (managed / replyAlreadySent / streamingCardDisabled /
@@ -10334,7 +10560,7 @@ function setupWorkerHandlers(
               ds.session.title || sessionCliDisplayName(ds, botCfg),
               effectiveCliId,
               undefined,
-              !!ds.adoptedFrom,
+              isSharedAdoptSession(ds),
               loc,
               localCliReadyAtBuild,
               sessionRuntimeDisplayName(ds, botCfg),
@@ -10353,7 +10579,7 @@ function setupWorkerHandlers(
                 ds.session.title || sessionCliDisplayName(ds, botCfg),
                 effectiveCliId,
                 undefined,
-                !!ds.adoptedFrom,
+                isSharedAdoptSession(ds),
                 loc,
                 true,
                 sessionRuntimeDisplayName(ds, botCfg),
@@ -10546,6 +10772,20 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'thinking_update': {
+        // Cosmetic CoT channel — never touches settlement. Same stale-worker
+        // guard as screen_update; sessionId echo is validated when present.
+        // Renders as a native CoT message (message_cot AG-UI stream); any API
+        // failure disables it for the turn (self-catching, logged as [cot]).
+        if (!ownsLifecycleMutation()) break;
+        if (msg.sessionId && msg.sessionId !== ds.session.sessionId) break;
+        // Cache even when the CoT switches are off — `/cot show` uses this to
+        // summon the bubble mid-turn with everything accumulated so far.
+        ds.lastThinkingUpdate = { entries: msg.entries, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt };
+        handleCotThinkingUpdate(ds, msg);
+        break;
+      }
+
       case 'screen_update': {
         if (!ownsLifecycleMutation()) break;
         // Wait for worker init, independently of Web Terminal availability.
@@ -10608,14 +10848,18 @@ function setupWorkerHandlers(
           });
           // Usage ledger: any settle-to-idle/limited edge records the delta.
           // Turn reactions are stricter — only flip ✋→✅ after a real busy
-          // period (working/analyzing). Cold-start starting→idle (or the first
-          // prompt-ready before the turn has gone working) must NOT DONE a
-          // message that is still about to be / just being processed. Grok
-          // card-off sessions hit this when the ready-gate settle fired idle
-          // ~seconds after GoGoGo while the CLI was still running the prompt.
+          // period (working/analyzing) that settles to IDLE. A limited settle
+          // is a blocked turn, not completion: DONE-ing ✋ on working→limited
+          // made users think the task finished while the CLI was stuck (the
+          // rate-limit notification below owns that attention instead).
+          // Cold-start starting→idle (or the first prompt-ready before the turn
+          // has gone working) must NOT DONE a message that is still about to be
+          // / just being processed. Grok card-off sessions hit this when the
+          // ready-gate settle fired idle ~seconds after GoGoGo while the CLI
+          // was still running the prompt.
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
-            if (prevStatus === 'working' || prevStatus === 'analyzing') {
+            if (ds.lastScreenStatus === 'idle' && (prevStatus === 'working' || prevStatus === 'analyzing')) {
               void finishTurnReactions(ds);
             }
           }
@@ -10637,6 +10881,46 @@ function setupWorkerHandlers(
         }
 
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) { clearUsageRefreshTimer(ds); break; }
+
+        // Proactive rate/usage-limit notification. The streaming-card PATCH
+        // (card-on) carries no unread/mention signal, and card-off sessions
+        // skip card output entirely — so without a fresh message here the owner
+        // never learns the CLI is blocked (the turn just stalls). Fire on the
+        // working/other→limited edge, AFTER the managed/silent fence above but
+        // BEFORE the card-off early-break below (card-off sessions must still
+        // get this ping), once per limit episode: the latch is keyed on
+        // usageLimitStateKey and reset by clearUsageLimitState (self-heal /
+        // turn end), so the same episode's repeated limited ticks stay quiet
+        // while the next episode notifies again.
+        //
+        // Recovery-window exclusion: usageLimit is in-memory. When the CLI got
+        // limited WHILE the daemon was down (common for tmux/adopt restores),
+        // restore has no usageLimit to seed lastScreenStatus='limited' from,
+        // so the first post-restart limited tick is a false (empty→limited)
+        // edge. The in-memory latch also died with the old process, so without
+        // this guard the restart-silence contract would be broken by one @owner
+        // ping. The owner already got the private recovery DM summary; hold the
+        // ping until a real user turn clears suppressRecoveryCard.
+        if (
+          ds.lastScreenStatus === 'limited'
+          && prevStatus !== 'limited'
+          && ds.usageLimit
+          && !ds.suppressRecoveryCard
+          && ds.rateLimitNotifiedKey !== usageLimitStateKey(ds.usageLimit)
+        ) {
+          ds.rateLimitNotifiedKey = usageLimitStateKey(ds.usageLimit);
+          const limit = ds.usageLimit;
+          const notifyBody = tr(
+            limit.kind === 'usage' ? 'worker.rate_limit_notify.usage' : 'worker.rate_limit_notify.rate',
+            { cliName: sessionCliDisplayName(ds, botCfg), retryLabel: limit.retryLabel },
+            loc,
+          );
+          const ownerOpenId = ds.session.ownerOpenId;
+          const notifyText = ownerOpenId ? `<at id=${ownerOpenId}></at> ${notifyBody}` : notifyBody;
+          scopedReply(notifyText, 'text', msg.turnId).catch((err: any) => {
+            logger.debug(`[${t}] Failed to deliver rate-limit notification: ${err?.message ?? err}`);
+          });
+        }
 
         // Bot opted out of the streaming card — dashboard SSE above already got
         // the status patch; just don't touch any Lark card. Turn-exact: a
@@ -11196,9 +11480,47 @@ function setupWorkerHandlers(
         }
         const suppressExitUi = managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
 
+        if (msg.codexAppActiveWriter === true && effectiveCliId === 'codex-app') {
+          // `thread/resume` was explicitly rejected because another Codex
+          // app-server currently owns the persisted thread. This is a safe,
+          // expected handoff conflict — never spend restart budget or let the
+          // generic second-restart policy drop cliSessionId and create a fresh
+          // context. Park the logical Botmux session so its next message
+          // retries the SAME thread after the external writer releases it.
+          const thread = ds.session.cliSessionId ?? ds.session.sessionId;
+          logger.warn(
+            `[${t}] Codex App resume blocked by external active writer; preserving `
+            + `thread ${thread.substring(0, 12)}`,
+          );
+          const suspended = suspendWorker(ds, 'codex_app_active_writer');
+          if (!suspended) {
+            // The runner process already exited and there is no safe live
+            // backend suspension path. Retire only this Node worker; never
+            // destroy the external app-server that owns the thread.
+            retireWorkerProcessOnly(ds, 'codex_app_active_writer');
+            ds.hasHistory = true;
+            ds.session.suspendedColdResume = true;
+            sessionStore.updateSession(ds.session);
+          }
+          if (!suppressExitUi) {
+            const threadLabel = `${thread.substring(0, 16)}…`;
+            const message = loc === 'zh'
+              ? `⚠️ Codex App 历史会话（${threadLabel}）当前正由另一个 Codex App / app-server 持有。`
+                + 'BotMux 已保留原上下文，不会新建空会话；请在 App 侧释放该会话后，再发送一条消息重试恢复。'
+              : `⚠️ Codex App thread (${threadLabel}) is currently held by another Codex App / app-server writer. `
+                + 'BotMux preserved the original context and did not create a fresh session; release it in the App, then send another message to retry.';
+            try {
+              await scopedReply(message, 'text', msg.turnId);
+            } catch (replyErr) {
+              logger.error(`[${t}] Failed to report Codex App active-writer conflict: ${replyErr}`);
+            }
+          }
+          break;
+        }
+
         // Do NOT auto-restart in adopt mode — there's nothing to restart
-        if (ds.adoptedFrom) {
-          logger.info(`[${t}] Adopted session ended`);
+        if (isSharedAdoptSession(ds)) {
+          logger.info(`[${t}] Shared adopted session ended`);
           // Freeze the streaming card
           if (!suppressExitUi && ds.streamCardId && workerHasInitialized(ds)) {
             const readUrl = readableTerminalUrlFor(ds);
@@ -11354,7 +11676,11 @@ function setupWorkerHandlers(
         logger.error(`[${t}] Worker error: ${msg.message}`);
         // `error` is a fatal launch-generation signal. It normally arrives
         // during init, but can also follow a previously-ready worker whose CLI
-        // recovery/restart fails; that later failure must remain user-visible.
+        // recovery/restart fails; that later failure must remain user-visible —
+        // UNLESS it is a turn-less transient (post-outage restart storm), where
+        // a bounded silent re-fork self-heals without waking anyone (08-23:
+        // idle sessions got "会话启动失败" cards while their panes were alive).
+        if (scheduleTransientStartupRetry(msg.message, msg.turnId, msg.dispatchAttempt)) break;
         await notifyStartupFailure(msg.message, msg.turnId, msg.dispatchAttempt);
         break;
       }
@@ -11564,6 +11890,14 @@ function setupWorkerHandlers(
           && ds.managedTurnOrigin.dispatchAttempt === msg.dispatchAttempt) {
           ds.managedTurnOrigin = undefined;
         }
+        // Settle this turn's native CoT message, if one is live. Cosmetic and
+        // self-catching — must never delay or fail the terminal path
+        // (RUN_FINISHED auto-completes the CoT server-side). Also consumes the
+        // one-shot `/cot show` force and drops the mid-turn thinking cache (a
+        // post-terminal summon would create a bubble nobody ever finishes).
+        finalizeCotMessage(ds, msg.turnId, msg.status);
+        ds.cotForced = undefined;
+        ds.lastThinkingUpdate = undefined;
         const isClaudeProviderFailure = msg.status !== 'completed'
           && sessionCliId(ds, botCfg) === 'claude-code'
           && (msg.errorCode?.startsWith('provider_') ?? false);
@@ -12238,14 +12572,19 @@ function setupWorkerHandlers(
       ds.worker = null;
       ds.workerReady = false;
       ds.workerPort = null;
+      // A dead worker can no longer refresh its card/usage view.
+      clearUsageRefreshTimer(ds);
+      // A worker owns the terminal HTTP listener. Persisting its former port
+      // after exit leaves the Dashboard proxy routing `/terminal/<session>` to
+      // a dead socket until some later ready event overwrites it. Clear both
+      // durable and aggregated state now so a persistent backend can be
+      // re-attached on demand instead of returning a stale 502.
+      ds.session.webPort = undefined;
       // A queued suspend for THIS generation is now moot — the worker it was
       // about is gone. Leaving it set would suspend the replacement on its
       // first idle (the deferred checkpoint's own "worker gone" branch cannot
       // help: it only runs on a screen update that will never arrive).
       clearPendingSuspendClaim(ds, 'worker exited');
-      // Dead worker generation — stop the periodic usage refresh immediately
-      // instead of waiting a tick for it to self-clear on !workerHasInitialized.
-      clearUsageRefreshTimer(ds);
       ds.workerToken = null;
       ds.workerViewToken = null;
       ds.managedTurnOrigin = undefined;
@@ -12258,6 +12597,11 @@ function setupWorkerHandlers(
       // posted so a late click cannot inject keys into a replacement worker.
       invalidateStuckWarning(ds, 'worker_exit');
       invalidateTuiPrompt(ds, 'worker_exit');
+      // A crashed/killed worker never sends turn_terminal (the only finalize
+      // path) — settle any live CoT thinking bubble as interrupted so it
+      // doesn't spin until the next daemon restart. Cosmetic, self-catching.
+      abortCotMessage(ds);
+      ds.lastThinkingUpdate = undefined;
       // Fence this lifetime before a polling dispatcher can observe its last
       // ACK. Keeping the old receipt is useful audit evidence, but the
       // persisted current generation advances immediately so it cannot count
@@ -12276,6 +12620,13 @@ function setupWorkerHandlers(
       const exitedPreviewTarget = takeSessionPreviewTarget(ds.session);
       sessionStore.updateSession(ds.session);
       if (exitedPreviewTarget !== undefined) publishSessionPreviewCleared(ds.session.sessionId);
+      dashboardEventBus.publish({
+        type: 'session.update',
+        body: {
+          sessionId: ds.session.sessionId,
+          patch: { webPort: null, workerPid: null },
+        },
+      });
     }
     if (!transferRetirement) {
       try {
@@ -12425,9 +12776,11 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
   if (!list || list.length === 0) return;
   // Detach the batch first so a second idle edge can't double-flip it.
   ds.pendingAckReactions = [];
-  // A dedicated receiver has no progress-reaction channel. Clear any stale
-  // in-memory entries restored from an older build without touching Lark.
-  if (ds.session.vcMeetingReceiver) return;
+  // Plan B: a meeting agent is an ordinary chat-scope session. Pending ack
+  // reactions only ever exist for a real inbound user message (the ✋ is placed
+  // when that message arrives — transcript deliveries have no inbound message to
+  // react to), so a non-empty list here always belongs to a plain user turn and
+  // must settle to ✅ like any session. No VC special-case.
   const silent = silentTurnReactions(ds);
   const doneEmoji = doneReactionEmojiFor(ds);
   for (const ack of list) {
@@ -12644,7 +12997,14 @@ function deliverFinalOutput(
       const imOrigin = msg.dispatchAttempt === undefined
         ? resolveVcMeetingImTurnOrigin(ds.session, msg.turnId)
         : undefined;
-      const managedDecision = ds.session.vcMeetingReceiver
+      // Plan B: the meeting agent is an ordinary chat-scope session, so it also
+      // delivers plain user turns. Apply the durable meeting-send policy ONLY to
+      // a genuinely meeting-driven turn (a durable transcript delivery, or a
+      // stamped meeting @mention follow-up). A plain user turn is not
+      // meeting-driven → managedDecision stays undefined → it delivers through
+      // the ordinary path. Without this gate a plain user reply resolves
+      // `origin_unproven` and is silently dropped (the "手动@机器人也不回复" bug).
+      const managedDecision = isMeetingDrivenTurn(ds, msg.turnId, msg.dispatchAttempt)
         ? evaluateVcMeetingManagedSend(config.session.dataDir, {
             receiverSessionId: ds.session.sessionId,
             receiverSession: true,
@@ -12664,7 +13024,7 @@ function deliverFinalOutput(
         return;
       }
       const revalidateManagedSend = (): void => {
-        if (!ds.session.vcMeetingReceiver) return;
+        if (!isMeetingDrivenTurn(ds, msg.turnId, msg.dispatchAttempt)) return;
         const current = evaluateVcMeetingManagedSend(config.session.dataDir, {
           receiverSessionId: ds.session.sessionId,
           receiverSession: true,
@@ -12739,6 +13099,15 @@ function deliverFinalOutput(
         ? undefined
         : imOrigin?.replyTargetSenderOpenId
           ?? daemonCardFooterRecipientOpenId(ds, effectiveCliId);
+      // 失败兜底通知正文 @ 真人。有 footer 收件人（真人 owner / 触发者）时其 <at>
+      // 已经会提醒，不重复；仅当没有任何真人收件人时（bot-to-bot 派发的会话）回退
+      // @ bot 管理员，让模型网关类故障有人看见而不是静默滑过。
+      const failureMentionOpenId = msg.turnFailed === true && !managedReceiver && !recipientOpenId
+        ? failureNoticeFallbackMentionOpenId(ds)
+        : undefined;
+      const deliveredAssistantText = failureMentionOpenId
+        ? `<at id=${failureMentionOpenId}></at> ${safeAssistantText}`
+        : safeAssistantText;
       const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
       // forkWorker snapshots the effective policy for this worker lifetime.
       // Keep daemon fallback delivery aligned with the same frozen policy the
@@ -12747,11 +13116,14 @@ function deliverFinalOutput(
       const feedbackRequesterSubjectId = recipientOpenId;
       const feedback = feedbackPolicy && feedbackRequesterSubjectId ? { policy: feedbackPolicy } : undefined;
       cardUsage ??= getDaemonReplyCardUsageSnapshot(ds, effectiveCliId);
+      const localTurnTitle = msg.kind === 'local-turn-headless'
+        ? tr('card.local_turn_resumed', undefined, localeForBot(ds.larkAppId))
+        : isExistingAppServerSharedAdoptPersistedSession(ds.session)
+          ? tr('card.codex_app_shared_turn', undefined, localeForBot(ds.larkAppId))
+          : tr('card.local_turn', undefined, localeForBot(ds.larkAppId));
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
-            title: msg.kind === 'local-turn-headless'
-              ? tr('card.local_turn_resumed', undefined, localeForBot(ds.larkAppId))
-              : tr('card.local_turn', undefined, localeForBot(ds.larkAppId)),
+            title: localTurnTitle,
             userText: msg.kind === 'local-turn' ? safeUserText ?? '' : undefined,
             assistantText: safeAssistantText,
             assistantLabel: storedSessionCliDisplayName(ds),
@@ -12764,7 +13136,7 @@ function deliverFinalOutput(
             ...(feedback ? { feedback } : {}),
           })
         : buildCanonicalFinalReplyCard({
-            markdown: safeAssistantText,
+            markdown: deliveredAssistantText,
             ...(feedback ? { feedback } : {}),
             recipientOpenId,
             brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
@@ -13233,6 +13605,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     cliSessionId: isStructuredBridge ? adopted.sessionId : undefined,
     model: agentCfg.model,
     turnTimeoutMs: botCfg.turnTimeoutMs,
+    dshRuntime: botCfg.dshRuntime,
     disableCliBypass: botCfg.disableCliBypass === true,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
     // Adopt is normally observe-only (prompt=''), driven later by 'message'
@@ -13462,7 +13835,17 @@ export function killStalePids(
     try {
       // Check if process exists (signal 0 doesn't kill, just checks)
       process.kill(session.pid, 0);
-      // Process exists — kill its process group
+      // Existing-App-Server share: the worker and its BotMux-owned remote TUI
+      // can be in one process group. Reap only the stale worker PID; killing
+      // the group would also terminate `codex --remote`, even though the
+      // replacement daemon is expected to reattach that client. The external
+      // App Server itself is never ours to signal.
+      if (isExistingAppServerSharedAdoptPersistedSession(session)) {
+        logger.info(`Killing stale shared-App-Server worker only (pid: ${session.pid}, session: ${session.sessionId})`);
+        try { process.kill(session.pid, 'SIGTERM'); } catch { /* already gone */ }
+        continue;
+      }
+      // Ordinary managed sessions own their complete process group.
       logger.info(`Killing stale CLI process (pid: ${session.pid}, session: ${session.sessionId})`);
       try {
         process.kill(-session.pid, 'SIGTERM');
@@ -13720,6 +14103,11 @@ function cleanupPersistentBackendSessions(
     killManagedExactHerdrTargets(true);
     for (const session of activeSessions_) {
       if (!belongsToBackend(session)) continue;
+      // The remote TUI deliberately uses cliId=codex even when the Bot's
+      // default/new-session runtime remains codex-app. This is a shared-adopt
+      // binding, not a stale CLI selection, so keep its bmx-* client alive for
+      // the restore path. Explicit /detach remains responsible for cleanup.
+      if (isExistingAppServerSharedAdoptPersistedSession(session)) continue;
       const sessionCliId = session.cliId;
       if (!sessionCliId || !session.larkAppId) continue;
       let botCliId: CliId | undefined;

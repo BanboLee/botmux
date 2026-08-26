@@ -16,6 +16,7 @@ import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
 import { encodeRunnerInput } from '../src/adapters/cli/runner-input.js';
+import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from '../src/services/codex-app-runner-protocol.js';
 import {
   CodexAppControlFinalAssembler,
   CodexAppControlLineDecoder,
@@ -2196,6 +2197,38 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
+  it('preserves a thread owned by another app-server writer instead of starting a fresh thread', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-active-writer-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(
+      fakeCodex,
+      dir,
+      logPath,
+      '0.147.0',
+      'resume-active-writer',
+      control.bootstrap.path,
+      { threadId: 'thread-existing' },
+    );
+    try {
+      const exitCode = await new Promise<number | null>(resolvePromise => harness.child.once('exit', resolvePromise));
+      const requests = readRequests(logPath);
+      expect(exitCode).toBe(CODEX_APP_ACTIVE_WRITER_EXIT_CODE);
+      expect(requests.filter(request => request.method === 'thread/resume')).toHaveLength(1);
+      expect(requests.filter(request => request.method === 'thread/start')).toHaveLength(0);
+      expect(harness.stderr).toContain('currently owned by another app-server writer');
+      expect(control.states).toEqual([]);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('preserves the full legacy prompt on codex < 0.135 even if the server ignores new fields', async () => {
     const result = await exerciseRunner({ version: '0.134.9' });
     const turns = result.requests.filter(request => request.method === 'turn/start');
@@ -2476,6 +2509,39 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       expect(threadStart).toBeTruthy();
       expect(threadStart.params.model).toBe('gpt-5.6-terra');            // top-level model
       expect(threadStart.params.config?.model_reasoning_effort).toBe('xhigh'); // NOT downgraded
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('registers the bounded browser dynamic tool only when the bridge is enabled', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-browser-tool-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', control.bootstrap.path, {
+      extraArgs: ['--browser-family', 'chrome'],
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitFor(harness, () => control.finals.length >= 1);
+      const threadStart = readRequests(logPath).find(r => r.method === 'thread/start');
+      expect(threadStart?.params.dynamicTools).toEqual([
+        expect.objectContaining({
+          type: 'function',
+          name: 'botmux_browser',
+          inputSchema: expect.objectContaining({
+            additionalProperties: false,
+            required: ['operation'],
+          }),
+        }),
+      ]);
     } finally {
       await stopChild(harness.child);
       await control.close();

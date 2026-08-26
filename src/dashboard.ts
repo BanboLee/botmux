@@ -29,6 +29,7 @@ import { AuthSessionConnectionRegistry } from './dashboard/auth-session-connecti
 import { createDashboardEventsStream, type DashboardEventAudience } from './dashboard/events-sse.js';
 import {
   ControlCsrfTokens,
+  classifyManagementUpgrade,
   guardControlRequest,
   injectControlCsrfMeta,
   managementUpgradeOrigin,
@@ -109,6 +110,10 @@ import {
   TerminalControlManager,
   terminalControlTtlFromEnv,
 } from './dashboard/terminal-control.js';
+import {
+  matchTerminalControlRoute,
+  resolveTerminalControlAction,
+} from './dashboard/terminal-control-route.js';
 import { PreviewInteractionManager } from './dashboard/preview-interaction.js';
 import { createPreviewGuardPage } from './dashboard/preview-guard-page.js';
 import { handleWorkbenchDoctor } from './dashboard/workbench-doctor.js';
@@ -134,6 +139,11 @@ import {
   TTADK_DEFAULT_MODEL,
   TTADK_MODEL_SUGGESTIONS,
 } from './setup/cli-selection.js';
+import {
+  staticModelChoices,
+  isKnownSelectionKey,
+  buildModelChoicesResponse,
+} from './services/model-catalog.js';
 import { checkCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
@@ -249,7 +259,7 @@ import {
 import { effectiveDefaultWorkingDir, getBot, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
 import { addChatToFeedGroup, createFeedGroup, FEED_GROUP_SCOPES, FeedGroupApiError, listFeedGroups } from './dashboard/feed-groups.js';
 import { generateAuthUrl, handleCallbackUrl, isCallbackUrl } from './utils/user-token.js';
-import { findEntryIndex, readRawConfig, requireConfigPath, writeRawConfigAtomic } from './services/config-store.js';
+import { findEntryIndex, readRawConfig, requireConfigPath, rmwBotEntry, writeRawConfigAtomic } from './services/config-store.js';
 import {
   emitCodexNotifierOutboxItem,
   installCodexNotifierHook,
@@ -271,16 +281,12 @@ import {
   handleVcMeetingConsumerProfilesPut,
   type VcMeetingConsumerProfilesApiDeps,
 } from './dashboard/vc-consumer-profiles-api.js';
-import {
-  buildVcMeetingConsumerBootstrapAgents,
-  seedVcMeetingDefaultConsumerProfile,
-} from './services/vc-meeting-consumer-profile-bootstrap.js';
 import { evaluateVcMeetingConsumerIsolation } from './services/vc-meeting-consumer-isolation.js';
 import { resolvePairedSpawnBackendType } from './core/persistent-backend.js';
 import {
-  readVcMeetingConsumerProfiles,
-  updateVcMeetingConsumerProfiles,
-} from './services/vc-meeting-consumer-profile-store.js';
+  readVcMeetingSharedConsumerCatalogSnapshot,
+  updateVcMeetingSharedConsumerCatalog,
+} from './services/vc-meeting-shared-consumer-catalog-store.js';
 import { isValidRoleProfileId } from './services/role-profile-store.js';
 import { mergeSafeInsightOverviews } from './services/insight/report.js';
 import type { SafeInsightOverview } from './services/insight/types.js';
@@ -297,6 +303,7 @@ import {
 import { isDashboardChunkJsPath, missingDashboardChunkModule } from './dashboard/stale-chunk-module.js';
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
 import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
+import { repairOpenPlatformRedirects } from './setup/open-platform-redirect-repair.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
 import { maybeInstallTraexPluginOnSettingsChange, TRAEX_RECOMMENDED_SOURCE, TRAEX_RECOMMENDED_REF } from './setup/ensure-herdr-integrations.js';
 import { deriveCreateGroupName, selectCreateSessionTargets } from './core/session-create.js';
@@ -740,6 +747,11 @@ aggregator.on(sessionPresentation.onEvent);
 // 让 owner 从熟悉的目录起终端复现问题；都没有时模块内退回 homedir。
 const debugTerminalManager = createDebugTerminalManager({
   getActiveToken: currentDashboardToken,
+  // WS 升级不经 HTTP auth gate，所以在这里把 `/api/debug-terminal` 那条 `legacyAuthed`
+  // 门禁原样喂进去：解析出的身份必须是本机 legacy 管理身份，平台隧道注入的角色
+  // （X-Botmux-Role）不算——它带的也是本机活跃 cookie，只比 cookie 会把裸 shell
+  // 开放给平台上的任何人。
+  isLegacyManagementRequest: (req) => dashboardRequestIdentity(req)?.kind === 'legacy-dashboard',
   defaultWorkingDirs: () => {
     const dirs = new Set<string>();
     for (const s of aggregator.getSessions()) {
@@ -888,14 +900,6 @@ interface ResolvedDashboardSettings {
   /** Machine-wide VC meeting listener kill-switch. Default ON. */
   vcMeetingAgent: {
     enabled: boolean;
-    listenerBotAppId?: string | null;
-    listenerBotOptions: Array<{
-      larkAppId: string;
-      botName?: string | null;
-      cliId?: string;
-      vcMeetingAgentEnabled: boolean;
-      hasLarkCliProfile: boolean;
-    }>;
     /** Detected lark-cli version, or null if not installed. */
     larkCliVersion?: string | null;
     /** True when the installed lark-cli meets the VC bot minimum version. */
@@ -919,6 +923,10 @@ interface ResolvedDashboardSettings {
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
+  /** OAuth 授权回跳基址（`<base>/oauth/callback`），null = 未配置 ⇒ 退回
+   *  `http://127.0.0.1:9768/callback` 的手工粘贴流程。见 global-config 的
+   *  `oauthRedirectBase`。 */
+  oauthRedirectBase: string | null;
   /** Configured schedule-task timezone override (IANA), or null when unset
    *  ⇒ the scheduler follows `hostTimeZone`. */
   scheduleTimeZone: string | null;
@@ -929,43 +937,6 @@ interface ResolvedDashboardSettings {
    *  "currently effective" — never reconstruct it from configured||host, which
    *  ignores the env override. */
   effectiveScheduleTimeZone: string;
-}
-
-function vcMeetingListenerBotOptions(): ResolvedDashboardSettings['vcMeetingAgent']['listenerBotOptions'] {
-  try {
-    const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
-    // Exclude core-only (apiOnly) bots: a VC listener attends real Feishu
-    // meetings and needs open-platform scopes + a live Lark connection, which a
-    // no-Feishu bot categorically cannot have. Offering it would let setup
-    // raw-fetch token/application APIs with its synthetic/empty credentials.
-    return loadBotConfigs().filter(bot => bot.apiOnly !== true).map(bot => ({
-      larkAppId: bot.larkAppId,
-      botName: bot.displayName ?? onlineByAppId.get(bot.larkAppId)?.botName ?? bot.name ?? null,
-      cliId: onlineByAppId.get(bot.larkAppId)?.cliId ?? bot.cliId,
-      vcMeetingAgentEnabled: bot.vcMeetingAgent?.enabled === true,
-      hasLarkCliProfile: typeof bot.vcMeetingAgent?.larkCliProfile === 'string' && bot.vcMeetingAgent.larkCliProfile.trim().length > 0,
-    }));
-  } catch {
-    return [];
-  }
-}
-
-
-async function validateVcMeetingListenerBotAppId(appId: string): Promise<{ ok: true } | { ok: false; error: string }> {
-  let bots: BotConfig[];
-  try {
-    bots = loadBotConfigs();
-  } catch (err: any) {
-    return { ok: false, error: `vcMeetingAgent_listenerBot_config_unavailable: ${err?.message ?? err}` };
-  }
-  const bot = bots.find(b => b.larkAppId === appId);
-  if (!bot) return { ok: false, error: 'vcMeetingAgent_listenerBot_unknown' };
-  // Core-only (apiOnly) bots cannot attend Feishu meetings (no Feishu connection,
-  // no open-platform scopes). Reject at the settings WRITE boundary so a manual
-  // PUT can't select one and drive syncVcMeetingListenerBotConfig →
-  // automateOpenPlatformSetup against the open platform with synthetic creds.
-  if (bot.apiOnly === true) return { ok: false, error: 'vcMeetingAgent_listenerBot_api_only' };
-  return { ok: true };
 }
 
 async function validateCodexNotifierTargetBotAppId(
@@ -1082,13 +1053,36 @@ function refreshLocalVcMeetingAgentConfig(appId: string): void {
   }
 }
 
+/** Map appId → persisted Feishu-probed botName from bots-info.json (offline
+ *  bots keep a friendly name in the dashboard). Best-effort; empty on any error. */
+function readPersistedBotNames(): Map<string, string> {
+  const out = new Map<string, string>();
+  try {
+    const fp = join(config.session.dataDir, 'bots-info.json');
+    if (!existsSync(fp)) return out;
+    const entries = JSON.parse(readFileSync(fp, 'utf8')) as Array<{ larkAppId?: string; botName?: string | null }>;
+    if (!Array.isArray(entries)) return out;
+    for (const e of entries) {
+      if (typeof e?.larkAppId === 'string' && typeof e?.botName === 'string' && e.botName.trim()) {
+        out.set(e.larkAppId, e.botName.trim());
+      }
+    }
+  } catch { /* best-effort */ }
+  return out;
+}
+
 function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
+  // Persisted Feishu-probed names, so an OFFLINE bot still shows its friendly
+  // name in the agent dropdown instead of falling back to the raw appId. The
+  // live registry only knows online bots; bots-info.json is written when a bot
+  // is probed and survives across restarts. Built once per deps construction.
+  const persistedBotNames = readPersistedBotNames();
   return {
-    readSnapshot: readVcMeetingConsumerProfiles,
-    updateSnapshot: updateVcMeetingConsumerProfiles,
+    readCatalog: readVcMeetingSharedConsumerCatalogSnapshot,
+    updateCatalog: updateVcMeetingSharedConsumerCatalog,
     loadBotConfigs,
     effectiveDefaultWorkingDir,
-    onlineBotName: appId => registry.getByAppId(appId)?.botName,
+    onlineBotName: appId => registry.getByAppId(appId)?.botName ?? persistedBotNames.get(appId),
     isOnline: appId => !!registry.getByAppId(appId),
     adapterReliableTurnTerminal: (cliId, cliPathOverride) => {
       if (!cliId) return false;
@@ -1122,6 +1116,48 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
       return decision.ok && decision.isolated;
     },
     reloadDaemons: reloadVcMeetingBotConfigOnDaemons,
+    applyBotOutputPolicy: async (patch) => {
+      const res = await rmwBotEntry(patch.appId, (entry) => {
+        const vc = (entry.vcMeetingAgent && typeof entry.vcMeetingAgent === 'object' && !Array.isArray(entry.vcMeetingAgent))
+          ? entry.vcMeetingAgent
+          : {};
+        // 「接收会议事件」开关。VC 对每个连着飞书的 bot 默认可用，`enabled: false`
+        // 才是显式退出——所以打开时删掉这个 key 回到默认，而不是写 `enabled: true`。
+        if (patch.vcEnabled) delete vc.enabled;
+        else vc.enabled = false;
+        const consumer = (vc.meetingConsumer && typeof vc.meetingConsumer === 'object' && !Array.isArray(vc.meetingConsumer))
+          ? vc.meetingConsumer
+          : {};
+        if (patch.textOutputPolicy === null) delete consumer.textOutputPolicy;
+        else consumer.textOutputPolicy = patch.textOutputPolicy;
+        if (patch.voiceOutputPolicy === null) delete consumer.voiceOutputPolicy;
+        else consumer.voiceOutputPolicy = patch.voiceOutputPolicy;
+        // per-bot 默认角色:null/空 = 跟随全局默认(删 key);否则写 catalogDefaultConsumerId。
+        if (patch.catalogDefaultConsumerId === null || patch.catalogDefaultConsumerId === '') {
+          delete consumer.catalogDefaultConsumerId;
+        } else {
+          consumer.catalogDefaultConsumerId = patch.catalogDefaultConsumerId;
+        }
+        if (Object.keys(consumer).length > 0) vc.meetingConsumer = consumer;
+        else delete vc.meetingConsumer;
+        const rtv = (vc.realtimeVoice && typeof vc.realtimeVoice === 'object' && !Array.isArray(vc.realtimeVoice))
+          ? vc.realtimeVoice
+          : {};
+        // 实时语音能力默认开启（未配 = 开）。所以「勾上」= 回到默认，删掉 enabled key
+        // （避免写死 true，与其它默认字段的处理一致）；「取消勾选」= 必须写显式 false
+        // 才能真正关掉（保留其它 realtimeVoice 设置如采样率）。
+        if (patch.realtimeVoiceEnabled) {
+          delete rtv.enabled;
+        } else {
+          rtv.enabled = false;
+        }
+        if (Object.keys(rtv).length > 0) vc.realtimeVoice = rtv;
+        else delete vc.realtimeVoice;
+        entry.vcMeetingAgent = vc;
+        return { write: true, result: undefined };
+      });
+      return res.ok ? { ok: true } : { ok: false, reason: res.reason };
+    },
   };
 }
 
@@ -1233,230 +1269,159 @@ async function waitForFeishuLoginQr(timeoutMs = 8_000, intervalMs = 200): Promis
   return null;
 }
 
-async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, previousListenerBotAppId?: string | null): Promise<{ ok: true } | { ok: false; error: string; feishuLoginQr?: string }> {
-  const nextAppId = listenerBotAppId?.trim() || null;
-  const prevAppId = previousListenerBotAppId?.trim() || null;
-  if (!nextAppId && !prevAppId) return { ok: true };
+/**
+ * 让某个 bot 具备「收会议事件 + 以 bot 身份入会」的开放平台前置条件。
+ *
+ * 这是全局「会议事件接收 Bot」下拉退役后留下的唯一实质工作：那个下拉真正干的事
+ * 不是「选一个人来监听」（daemon 侧早已改成谁收到谁处理），而是顺手替被选中的 bot
+ * 开权限、订事件、装 larkCliProfile。所以下拉删掉，这段保留，改成按 bot 手动触发
+ * 的一次性动作（Dashboard 的「配置权限」按钮）——不能在勾选开关时自动跑：
+ * 「接收会议事件」默认就是开的，压根没有 off→on 的跃迁可挂；也不能在页面加载时
+ * 对整个 fleet 跑，47 个 bot 就是 94 次开放平台调用。
+ *
+ * 与旧实现的关键差异：这里**只做前置条件**，绝不再往 meetingConsumer 里塞默认角色。
+ * 旧的 seedVcMeetingDefaultConsumerProfile 会把「另一个 bot」的 appId 焊进预设，
+ * 正是「拉 A 进会却把 B 拉进群」的源头。
+ */
+async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok: false; error: string; feishuLoginQr?: string }> {
+  const targetAppId = appId?.trim() || null;
+  if (!targetAppId) return { ok: false, error: 'vcMeetingBot_preflight_missing_appId' };
 
-  // Defense-in-depth: even though the settings validator rejects apiOnly, guard
-  // the sync entry too so no caller reaches automateOpenPlatformSetup / the
-  // open-platform raw fetches for a core-only bot.
-  if (nextAppId) {
+  let bots: BotConfig[];
+  try {
+    bots = loadBotConfigs();
+  } catch (err: any) {
+    return { ok: false, error: `vcMeetingBot_preflight_config_unavailable: ${err?.message ?? err}` };
+  }
+  const bot = bots.find(b => b.larkAppId === targetAppId);
+  if (!bot) return { ok: false, error: 'vcMeetingBot_preflight_bot_not_found' };
+  // apiOnly bot 结构上就收不到飞书事件，别让它把 automateOpenPlatformSetup /
+  // 开放平台裸 fetch 跑起来（写边界拦住，手搓 POST 也进不去）。
+  if (bot.apiOnly === true) return { ok: false, error: 'vcMeetingBot_preflight_api_only' };
+
+  // VC bot 入会命令(vc +meeting-join/events/message-send --as bot)要求
+  // lark-cli >= MIN_LARK_CLI_VERSION_FOR_VC_BOT；更老的版本会以
+  // "this command only supports: user" 静默拒绝 `--as bot`。
+  const larkCli = checkLarkCliVersion();
+  if (!larkCli) {
+    return { ok: false, error: 'vcMeetingBot_preflight_larkCli_not_found: 未检测到 lark-cli，请先安装 `npm i -g @larksuite/cli`' };
+  }
+  if (!larkCli.meetsVcBotRequirement) {
+    return {
+      ok: false,
+      error: `vcMeetingBot_preflight_larkCli_too_old: 当前 lark-cli ${larkCli.version} 不支持 VC bot 入会，需要 >= ${MIN_LARK_CLI_VERSION_FOR_VC_BOT}。请运行 \`npm i -g @larksuite/cli@latest\` 升级`,
+    };
+  }
+
+  // 开放平台自动化只支持 feishu.cn；`brand: 'lark'` 的 bot 跳过自动化，但仍然校验
+  // 权限是否已具备，免得报「配置好了」其实收不到事件。
+  const brand = bot.brand === 'lark' ? 'lark' : 'feishu';
+  if (brand === 'lark') {
+    logger.info(`[vc-agent] skipping open-platform automation for lark-brand bot ${targetAppId} (feishu.cn only)`);
+    const scopeCheck = await validateVcMeetingScopesForBot(bot);
+    if (!scopeCheck.ok) {
+      return { ok: false, error: `vcMeetingBot_preflight_missing_scopes: ${scopeCheck.error}` };
+    }
+  } else {
     try {
-      const bot = loadBotConfigs().find(b => b.larkAppId === nextAppId);
-      if (bot?.apiOnly === true) {
-        return { ok: false, error: 'vcMeetingAgent_listenerBot_api_only' };
-      }
-    } catch { /* fall through to normal errors below */ }
-  }
-
-  // Require lark-cli >= MIN_LARK_CLI_VERSION_FOR_VC_BOT for VC bot meeting commands
-  // (vc +meeting-join/events/message-send --as bot). Earlier versions silently reject
-  // `--as bot` with "this command only supports: user", so the listener bot can
-  // never actually join a meeting.
-  if (nextAppId) {
-    const larkCli = checkLarkCliVersion();
-    if (!larkCli) {
-      return { ok: false, error: 'vcMeetingAgent_listenerBot_larkCli_not_found: 未检测到 lark-cli，请先安装 `npm i -g @larksuite/cli`' };
-    }
-    if (!larkCli.meetsVcBotRequirement) {
-      return {
-        ok: false,
-        error: `vcMeetingAgent_listenerBot_larkCli_too_old: 当前 lark-cli ${larkCli.version} 不支持 VC bot 入会，需要 >= ${MIN_LARK_CLI_VERSION_FOR_VC_BOT}。请运行 \`npm i -g @larksuite/cli@latest\` 升级`,
-      };
-    }
-  }
-
-  // Best-effort auto-import VC meeting scopes via Open Platform automation.
-  // Run BEFORE writing bots.json so that hard failures (missing session, needs QR)
-  // don't leave per-bot vcMeetingAgent in a half-configured state.
-  // For `brand: 'lark'` bots the open-platform automation only supports feishu.cn;
-  // skip it silently and let the user configure manually.
-  if (nextAppId) {
-    const bots = loadBotConfigs();
-    const bot = bots.find(b => b.larkAppId === nextAppId);
-    const brand = bot?.brand === 'lark' ? 'lark' : 'feishu';
-    if (brand === 'lark') {
-      logger.info(`[vc-agent] skipping open-platform automation for lark-brand bot ${nextAppId} (feishu.cn only)`);
-      // For lark brand, still validate that required scopes exist before saving
-      if (bot) {
+      const result = await automateOpenPlatformSetup({
+        appId: targetAppId,
+        brand,
+        maxWaitMs: 5_000,
+        onStatus: (msg) => logger.info(`[vc-agent] scope auto-import: ${msg}`),
+      });
+      if (result.ok) {
+        logger.info(`[vc-agent] auto-imported ${result.scopeCount} scopes, subscribed ${result.subscribedEventCount} events for bot ${targetAppId}`);
+        if (result.scopeWarning) logger.warn(`[vc-agent] scope import warning: ${result.scopeWarning}`);
+        if (result.eventWarning) logger.warn(`[vc-agent] event subscription warning: ${result.eventWarning}`);
+        // 自动化「成功」不等于权限真开了：internal scope/update 可能静默跳过本租户
+        // 不可用的 scope。必须回读一次，否则会给用户一个「已配置」的假绿灯。
         const scopeCheck = await validateVcMeetingScopesForBot(bot);
         if (!scopeCheck.ok) {
-          return { ok: false, error: `vcMeetingAgent_listenerBot_missing_scopes: ${scopeCheck.error}` };
+          return {
+            ok: false,
+            error: `vcMeetingBot_preflight_missing_scopes_after_auto: ${scopeCheck.error}。请到开放平台手动开通 VC 会议权限后重试。`,
+          };
+        }
+        // 事件订阅同样关键：缺任一 VC 事件都收不到会议邀请(用 missingVcEvents 判定,
+        // 总 count 无法区分缺的是不是 VC)。
+        const eventGateError = vcListenerEventGateError(result);
+        if (eventGateError) {
+          return {
+            ok: false,
+            error: `vcMeetingBot_preflight_event_subscribe_failed: ${eventGateError}，bot 无法接收会议邀请事件。请到开放平台手动订阅 VC 会议事件后重试。`,
+          };
+        }
+      } else {
+        const reason = result.reason;
+        // 登录/会话类失败是硬失败：没有有效的开放平台会话就无从自动配置，直接把
+        // 扫码二维码回给前端。
+        if (
+          reason === 'missing_session'
+          || reason === 'invalid_session'
+          || reason === 'missing_csrf'
+          || reason === 'qr_expired'
+          || reason === 'timeout'
+          || reason === 'login_failed'
+        ) {
+          feishuLogin.start();
+          // start() 立刻返回 status='starting'，二维码是在 onQrCode 里异步塞进去的；
+          // 稍等一下拿到再回，前端才能直接内联展示而不是只给一句错误。
+          const qrDataUrl = await waitForFeishuLoginQr();
+          const hint = '请用飞书扫码完成开放平台登录，登录后重新点「配置权限」即可自动开通';
+          return {
+            ok: false,
+            error: `vcMeetingBot_preflight_scope_auto_import_failed: ${reason}: ${hint}`,
+            feishuLoginQr: qrDataUrl ?? undefined,
+          };
+        }
+        // 非登录类失败(网络、api_error 等)是 best-effort，不因此判死；但权限与事件
+        // 订阅仍然要回读确认，否则等于谎报配置成功。
+        logger.warn(`[vc-agent] open-platform automation failed for ${targetAppId}: ${reason}: ${result.message}`);
+        const scopeCheck = await validateVcMeetingScopesForBot(bot);
+        if (!scopeCheck.ok) {
+          return {
+            ok: false,
+            error: `vcMeetingBot_preflight_missing_scopes: ${scopeCheck.error}。自动化配置失败(${reason})且权限未满足，请手动开通后重试。`,
+          };
+        }
+        const eventGateError = vcListenerEventGateError(result);
+        if (eventGateError) {
+          return {
+            ok: false,
+            error: `vcMeetingBot_preflight_event_subscribe_failed: ${eventGateError}，bot 无法接收会议邀请事件。自动化配置失败(${reason})，请手动订阅 VC 会议事件后重试。`,
+          };
         }
       }
-    } else {
-      try {
-        const result = await automateOpenPlatformSetup({
-          appId: nextAppId,
-          brand,
-          maxWaitMs: 5_000,
-          onStatus: (msg) => logger.info(`[vc-agent] scope auto-import: ${msg}`),
-        });
-        if (result.ok) {
-          logger.info(`[vc-agent] auto-imported ${result.scopeCount} scopes, subscribed ${result.subscribedEventCount} events for listener bot ${nextAppId}`);
-          if (result.scopeWarning) logger.warn(`[vc-agent] scope import warning: ${result.scopeWarning}`);
-          if (result.eventWarning) logger.warn(`[vc-agent] event subscription warning: ${result.eventWarning}`);
-          // Post-validation: verify VC meeting scopes are actually granted after automation.
-          // The internal scope/update may silently skip some scopes (e.g. not available
-          // in this tenant). Without this check, a bot without VC scopes could be saved
-          // as global listener and silently drop all meeting events.
-          if (bot) {
-            const scopeCheck = await validateVcMeetingScopesForBot(bot);
-            if (!scopeCheck.ok) {
-              return {
-                ok: false,
-                error: `vcMeetingAgent_listenerBot_missing_scopes_after_auto: ${scopeCheck.error}。请到开放平台手动开通 VC 会议权限后重试。`,
-              };
-            }
-          }
-          // Event subscription is also critical: listener 缺任一 VC 事件都收不到
-          // 会议邀请(missingVcEvents 判定,总 count 无法区分缺的是不是 VC)。
-          const eventGateError = vcListenerEventGateError(result);
-          if (eventGateError) {
-            return {
-              ok: false,
-              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: ${eventGateError}，bot 无法接收会议邀请事件。请到开放平台手动订阅 VC 会议事件后重试。`,
-            };
-          }
-        } else {
-          const reason = result.reason;
-          // Session/login-related failures are hard failures — return QR so user can re-login.
-          // Without a valid Open Platform session, scope/event auto-import is impossible.
-          if (
-            reason === 'missing_session'
-            || reason === 'invalid_session'
-            || reason === 'missing_csrf'
-            || reason === 'qr_expired'
-            || reason === 'timeout'
-            || reason === 'login_failed'
-          ) {
-            feishuLogin.start();
-            // feishuLogin.start() returns immediately with status='starting'; the QR
-            // code is set asynchronously in onQrCode. Wait briefly for it to be ready
-            // so the frontend can display it inline instead of showing an error without
-            // a scan entry.
-            const qrDataUrl = await waitForFeishuLoginQr();
-            const hint = '请用飞书扫码完成开放平台登录，登录后重新选择监听 bot 即可自动配置权限';
-            return {
-              ok: false,
-              error: `vcMeetingAgent_listenerBot_scope_auto_import_failed: ${reason}: ${hint}`,
-              feishuLoginQr: qrDataUrl ?? undefined,
-            };
-          }
-          // Non-login failures (network, api_error, etc.) are best-effort — don't
-          // block the save. The user can fix scopes manually in the console.
-          logger.warn(`[vc-agent] open-platform automation failed for ${nextAppId}: ${reason}: ${result.message}`);
-          // Even on non-login automation failure, verify scopes before saving —
-          // if the bot genuinely lacks VC permissions, don't silently make it listener.
-          if (bot) {
-            const scopeCheck = await validateVcMeetingScopesForBot(bot);
-            if (!scopeCheck.ok) {
-              return {
-                ok: false,
-                error: `vcMeetingAgent_listenerBot_missing_scopes: ${scopeCheck.error}。自动化配置失败(${reason})且权限未满足，请手动开通后重试。`,
-              };
-            }
-          }
-          // Also check event subscription status — automation 走到订阅阶段时
-          // missingVcEvents 会带回来;listener 缺任一 VC 事件都不能保存。
-          const eventGateError = vcListenerEventGateError(result);
-          if (eventGateError) {
-            return {
-              ok: false,
-              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: ${eventGateError}，bot 无法接收会议邀请事件。自动化配置失败(${reason})，请手动订阅 VC 会议事件后重试。`,
-            };
-          }
-        }
-      } catch (err: any) {
-        logger.warn(`[vc-agent] open-platform automation error for ${nextAppId}: ${err?.message ?? err}`);
-      }
+    } catch (err: any) {
+      logger.warn(`[vc-agent] open-platform automation error for ${targetAppId}: ${err?.message ?? err}`);
     }
   }
 
-  const changedAppIds = new Set<string>();
+  // 唯一的落盘：补一个默认 larkCliProfile。既不写 enabled(默认就是接收)，也不碰
+  // meetingConsumer——角色预设归 fleet 共享目录管，这里不产生任何 per-bot 预设。
+  let changed = false;
   try {
     const path = requireConfigPath();
     await withFileLock(path, async () => {
       const raw = await readRawConfig(path);
-      let changed = false;
-
-      if (nextAppId) {
-        const idx = findEntryIndex(raw, nextAppId);
-        if (idx < 0) throw new Error('bot_not_in_config');
-        const entry = raw[idx] as Record<string, unknown>;
-        const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
-        let entryChanged = false;
-        const firstEnable = next.enabled !== true;
-        if (firstEnable) {
-          next.enabled = true;
-          next.dashboardManagedListener = true;
-          entryChanged = true;
-        }
-        if (!next.larkCliProfile) {
-          next.larkCliProfile = nextAppId;
-          entryChanged = true;
-        }
-        const mc = next.meetingConsumer;
-        const mcRec = mc && typeof mc === 'object' && !Array.isArray(mc)
-          ? { ...(mc as Record<string, unknown>) }
-          : {};
-        // Selecting a global listener is the Dashboard's explicit opt-in to the
-        // complete meeting pipeline. It intentionally re-enables the listener's
-        // consumer surface; profile/default ownership is still preserved by the
-        // own-property gates in seedVcMeetingDefaultConsumerProfile below.
-        if (mcRec.enabled !== true) {
-          mcRec.enabled = true;
-          entryChanged = true;
-        }
-        if (seedVcMeetingDefaultConsumerProfile(
-          mcRec,
-          nextAppId,
-          // Resolve against the latest locked bots.json snapshot, not a stale
-          // pre-lock load. This also makes fallback selection independent of
-          // the order in which bot entries happen to be stored.
-          buildVcMeetingConsumerBootstrapAgents(
-            parseBotConfigsFromText(JSON.stringify(raw)),
-          ),
-        )) {
-          entryChanged = true;
-        }
-        next.meetingConsumer = mcRec;
-        if (entryChanged) {
-          compactVcMeetingAgentEntry(entry, next);
-          changed = true;
-          changedAppIds.add(nextAppId);
-        }
-      }
-
-      if (prevAppId && prevAppId !== nextAppId) {
-        const idx = findEntryIndex(raw, prevAppId);
-        if (idx >= 0) {
-          const entry = raw[idx] as Record<string, unknown>;
-          const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
-          if (next.dashboardManagedListener === true) {
-            delete next.dashboardManagedListener;
-            if (next.enabled === true) delete next.enabled;
-            compactVcMeetingAgentEntry(entry, next);
-            changed = true;
-            changedAppIds.add(prevAppId);
-          }
-        }
-      }
-
-      if (changed) {
-        // Validate the complete post-mutation file before replacing bots.json.
-        // Keep this path symmetric with daemon bootstrap so a future generated
-        // default cannot make the Dashboard persist an invalid registry.
-        parseBotConfigsFromText(JSON.stringify(raw));
-        await writeRawConfigAtomic(path, raw);
-      }
+      const idx = findEntryIndex(raw, targetAppId);
+      if (idx < 0) throw new Error('bot_not_in_config');
+      const entry = raw[idx] as Record<string, unknown>;
+      const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
+      if (next.larkCliProfile) return;
+      next.larkCliProfile = targetAppId;
+      compactVcMeetingAgentEntry(entry, next);
+      // 落盘前整份校验，和 daemon bootstrap 保持对称，避免 Dashboard 写出非法 registry。
+      parseBotConfigsFromText(JSON.stringify(raw));
+      await writeRawConfigAtomic(path, raw);
+      changed = true;
     });
   } catch (err: any) {
-    return { ok: false, error: `vcMeetingAgent_listenerBot_config_write_failed: ${err?.message ?? err}` };
+    return { ok: false, error: `vcMeetingBot_preflight_config_write_failed: ${err?.message ?? err}` };
   }
 
-  if (changedAppIds.size > 0) await reloadVcMeetingBotConfigOnDaemons([...changedAppIds]);
+  if (changed) await reloadVcMeetingBotConfigOnDaemons([targetAppId]);
 
   return { ok: true };
 }
@@ -1510,8 +1475,6 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     noVisibleOutputHint: dashboard.noVisibleOutputHint === true, // default OFF; opt-in anti-resend guidance
     vcMeetingAgent: {
       enabled: global.vcMeetingAgent?.enabled !== false,
-      listenerBotAppId: global.vcMeetingAgent?.listenerBotAppId ?? null,
-      listenerBotOptions: vcMeetingListenerBotOptions(),
       larkCliVersion: larkCli?.version ?? null,
       larkCliMeetsRequirement: larkCli?.meetsVcBotRequirement ?? false,
       larkCliMinVersion: MIN_LARK_CLI_VERSION_FOR_VC_BOT,
@@ -1523,6 +1486,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     whiteboard: { enabled: global.whiteboard?.enabled === true },
     workflow: { enabled: global.workflow?.enabled !== false }, // default ON
     remoteAccess: global.remoteAccess === true,
+    oauthRedirectBase: global.oauthRedirectBase ?? null,
     scheduleTimeZone: global.scheduleTimeZone ?? null,
     hostTimeZone: hostLocalTimeZone(),
     effectiveScheduleTimeZone: scheduleTimeZone(),
@@ -1538,8 +1502,6 @@ async function reloadLocaleOnAllDaemons(): Promise<void> {
   ));
 }
 const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(resolveDashboardSettings, reloadLocaleOnAllDaemons);
-settingsWriteApplierDeps.syncVcMeetingListenerBotConfig = syncVcMeetingListenerBotConfig;
-settingsWriteApplierDeps.validateVcMeetingListenerBotAppId = validateVcMeetingListenerBotAppId;
 settingsWriteApplierDeps.validateCodexNotifierTargetBotAppId = validateCodexNotifierTargetBotAppId;
 settingsWriteApplierDeps.validateHostOverloadAlertTargetBotAppId = validateHostOverloadAlertTargetBotAppId;
 
@@ -2453,7 +2415,7 @@ function configuredBrands(): Map<string, string | undefined> {
   return brandMapByAppId(loadBotConfigs);
 }
 
-function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number }> {
+function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime'] }> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
@@ -2466,18 +2428,19 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: 
       model: b.model,
       reasoningEffort: b.reasoningEffort,
       turnTimeoutMs: b.turnTimeoutMs,
+      dshRuntime: b.dshRuntime,
     }]));
   } catch {
     return new Map();
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number }>(
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime'] }>(
   bot: T,
   ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }>,
-): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number } {
+): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime'] } {
   const raw = ids.get(bot.larkAppId);
-  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
+  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime'] } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
   return {
     ...bot,
     cliId: bot.cliId || fallback?.cliId,
@@ -2487,6 +2450,7 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliR
     model: bot.model || fallback?.model,
     reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
     turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
+    dshRuntime: bot.dshRuntime ?? fallback?.dshRuntime,
   };
 }
 
@@ -3525,50 +3489,41 @@ const server = createServer(async (req, res) => {
     // Server-authoritative terminal control lease. The API returns only mode
     // and timestamps; its signed read/write grant stays inside the central
     // proxy and is never placed in a URL or response body.
-    let controlMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/control(?:\/(takeover|release))?$/);
-    if (controlMatch) {
+    //
+    // The dispatch itself lives in dashboard/terminal-control-route.ts — the ONE
+    // implementation that the acceptance scripts drive as well. It used to be
+    // inlined here, and the copy in the scripts drifted: they read the `?expect=`
+    // compare-and-swap condition while this one did not, so conditional release
+    // never actually applied in production.
+    const terminalControlMatch = matchTerminalControlRoute(url.pathname);
+    if (terminalControlMatch) {
       if (!requestIdentity) {
         return dashboardControlJson(res, 401, { ok: false, error: 'authentication_required' });
       }
       if (!enforceControlCsrf(req, res, requestIdentity)) return;
-      let sessionId: string;
-      try { sessionId = decodeURIComponent(controlMatch[1]); }
-      catch { return dashboardControlJson(res, 400, { ok: false, error: 'invalid_session_id' }); }
+      if (!terminalControlMatch.ok) {
+        return dashboardControlJson(res, 400, { ok: false, error: terminalControlMatch.error });
+      }
+      const sessionId = terminalControlMatch.sessionId;
       const availability = terminalControlAvailability(sessionId);
       if (!availability.ok) {
         return dashboardControlJson(res, availability.status, { ok: false, error: availability.error });
       }
-      const action = controlMatch[2];
-      if (req.method === 'GET' && !action) {
-        return dashboardControlJson(res, 200, { ok: true, ...terminalControl.state(requestIdentity, sessionId) });
-      }
-      if (requestIdentity.terminalCapability === 'readonly') {
-        return dashboardControlJson(res, 403, { ok: false, error: 'terminal_operation_forbidden' });
-      }
-      if (req.method === 'POST' && action === 'takeover') {
-        const result = terminalControl.takeover(requestIdentity, sessionId);
-        const status = result.ok ? 200 : result.error === 'control_busy' ? 409 : 401;
-        return dashboardControlJson(
-          res,
-          status,
-          result.ok ? { ...result, owned: true } : { ok: false, error: result.error },
-        );
-      }
-      if (req.method === 'POST' && action === 'release') {
-        const result = terminalControl.release(requestIdentity, sessionId);
-        return dashboardControlJson(
-          res,
-          result.ok ? 200 : 403,
-          result.ok ? { ...result, owned: false } : { ok: false, error: result.error },
-        );
-      }
-      return dashboardControlJson(res, 405, { ok: false, error: 'method_not_allowed' });
+      const answer = resolveTerminalControlAction({
+        method: req.method ?? 'GET',
+        action: terminalControlMatch.action,
+        sessionId,
+        search: url.searchParams,
+        identity: requestIdentity,
+        control: terminalControl,
+      });
+      return dashboardControlJson(res, answer.status, answer.body);
     }
 
     // Preview interaction is separately scoped per authenticated browser
     // session. Default is always the visibly labelled preview overlay; unlock
     // and activity are explicit, and the server hard-relocks after 15m idle.
-    controlMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/preview-interaction(?:\/(unlock|activity|lock))?$/);
+    const controlMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/preview-interaction(?:\/(unlock|activity|lock))?$/);
     if (controlMatch) {
       if (!requestIdentity) {
         return dashboardControlJson(res, 401, { ok: false, error: 'authentication_required' });
@@ -4770,12 +4725,22 @@ const server = createServer(async (req, res) => {
             cliId: o.cliId,
             wrapperCli: o.wrapperCli,
           }, { shellFallback: false });
+          // 静态模型候选（shell-free）：模型下拉的初始选项；live 增量由
+          // /api/cli-options/models 按需探测。staticModelChoices 自身 fail-soft，
+          // 这里再包一层 try/catch 兜底，保证选项列表永不因模型目录异常而整包失败。
+          let modelChoices: string[] = [];
+          try {
+            modelChoices = [...staticModelChoices(o.key)];
+          } catch {
+            modelChoices = [];
+          }
           return {
             id: o.key,
             label: o.label,
             available: availability.available,
             command: availability.command,
             availabilityReason: availability.reason,
+            modelChoices,
             // ttadk 网关项: 前端据此把模型框默认成 glm-5.1 并挂候选下拉; CoCo 不接受 -m.
             ...(isTtadkWrapper(o.wrapperCli)
               ? { gateway: 'ttadk' as const, acceptsModel: ttadkAcceptsModel(o.wrapperCli) }
@@ -4788,6 +4753,18 @@ const server = createServer(async (req, res) => {
         suggestedAppName: botOnboarding.suggestedAppName(),
         webSession,
       });
+    }
+
+    // On-demand 模型探测：只探测当前选中的单个 CLI（用户在模型下拉旁点「刷新」时），
+    // 不做全量扫描——20+ CLI 各自 shell out 会让表单打开即卡。静态候选已随
+    // /api/cli-options 的 modelChoices 字段下发，本端点只补 live 增量并合并去重。
+    if (req.method === 'GET' && url.pathname === '/api/cli-options/models') {
+      const key = (url.searchParams.get('key') ?? '').trim();
+      if (!isKnownSelectionKey(key)) {
+        return jsonRes(res, 400, { ok: false, error: 'unknown_selection_key' });
+      }
+      const body = await buildModelChoicesResponse(key);
+      return jsonRes(res, 200, body);
     }
 
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
@@ -5512,10 +5489,7 @@ const server = createServer(async (req, res) => {
     // ─── 会议角色预设（私有 API：不在 PUBLIC_READ_PATHS，未认证已被 401） ───
     if (url.pathname === '/api/vc-meeting/consumer-profiles') {
       if (req.method === 'GET') {
-        const out = await handleVcMeetingConsumerProfilesGet(
-          url.searchParams.get('listenerBotAppId') ?? '',
-          vcMeetingConsumerProfilesApiDeps(),
-        );
+        const out = await handleVcMeetingConsumerProfilesGet(vcMeetingConsumerProfilesApiDeps());
         return jsonRes(res, out.status, out.body);
       }
       if (req.method === 'PUT') {
@@ -5529,6 +5503,63 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, out.status, out.body);
       }
       return jsonRes(res, 405, { ok: false, error: 'method_not_allowed' });
+    }
+
+    // 按 bot 手动触发的开放平台前置配置（开权限 + 订 VC 事件 + 补 larkCliProfile）。
+    // 私有 API，同样不在 PUBLIC_READ_PATHS。做成显式动作而不是随勾选自动跑：
+    // 「接收会议事件」默认就是开的，没有 off→on 跃迁可挂；页面加载时对整个 fleet
+    // 跑一遍则是几十上百次开放平台调用。
+    if (url.pathname === '/api/vc-meeting/bot-preflight') {
+      if (req.method !== 'POST') return jsonRes(res, 405, { ok: false, error: 'method_not_allowed' });
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const appId = (parsed as { appId?: unknown } | null)?.appId;
+      if (typeof appId !== 'string' || !appId.trim()) {
+        return jsonRes(res, 400, { ok: false, error: 'missing_appId' });
+      }
+      const out = await preflightVcMeetingBot(appId);
+      if (out.ok) return jsonRes(res, 200, { ok: true });
+      return jsonRes(res, 400, { ok: false, error: out.error, feishuLoginQr: out.feishuLoginQr });
+    }
+
+    // 「一键修复开放平台 redirect 白名单」批量入口：一次扫码，把全部（或 body 里
+    // 点名的）存量 bot 的回调白名单补齐。白名单缺失是 authorize 的硬失败（20029），
+    // 而存量 bot 今天没有任何自愈路径会去补它 —— 所以做成显式动作。
+    // 私有 API，同样不在 PUBLIC_READ_PATHS，未认证已被 decideDashboardAuth 401。
+    if (url.pathname === '/api/open-platform/repair-redirects') {
+      if (req.method !== 'POST') return jsonRes(res, 405, { ok: false, error: 'method_not_allowed' });
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const rawAppIds = (parsed as { appIds?: unknown } | null)?.appIds;
+      let appIds: string[] | undefined;
+      if (rawAppIds !== undefined && rawAppIds !== null) {
+        if (!Array.isArray(rawAppIds) || rawAppIds.some(id => typeof id !== 'string')) {
+          return jsonRes(res, 400, { ok: false, error: 'invalid_appIds' });
+        }
+        appIds = rawAppIds as string[];
+      }
+      const out = await repairOpenPlatformRedirects({ appIds });
+      if (out.ok) return jsonRes(res, 200, { ok: true, results: out.results, wanted: out.wanted });
+      // 已有一批在跑 → 409（single-flight 在 service 侧，见 open-platform-redirect-repair.ts）：
+      // 用户点两下不该排队等上一批跑完，也不该让两批抢同一份 session/csrf。
+      if (out.reason === 'in_flight') {
+        return jsonRes(res, 409, { ok: false, errorCode: 'repair_in_flight', message: out.message });
+      }
+      // 缺登录态不是错误，是「还差一步」：回 200 让前端走已有的扫码流程
+      //（POST /api/feishu-login/start + GET /api/feishu-login/status）后重试，
+      // 与 VC preflight 遇到同类失败时弹二维码是同一套登录态。
+      if (out.reason === 'login_required') {
+        return jsonRes(res, 200, { ok: false, errorCode: 'feishu_login_required', message: out.message });
+      }
+      return jsonRes(res, 502, { ok: false, errorCode: out.reason, message: out.message });
     }
 
     if (req.method === 'GET' && url.pathname === '/api/role-profiles') {
@@ -5775,6 +5806,7 @@ const server = createServer(async (req, res) => {
             model: j.model || d.model,
             reasoningEffort: j.reasoningEffort || d.reasoningEffort,
             turnTimeoutMs: typeof j.turnTimeoutMs === 'number' ? j.turnTimeoutMs : d.turnTimeoutMs,
+            dshRuntime: typeof j.dshRuntime === 'string' ? j.dshRuntime : d.dshRuntime,
           }, j);
         } catch (e: any) {
           return botDefaultsPayload(d, undefined, e?.message ?? String(e));
@@ -6290,6 +6322,46 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-rename`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // GET/PUT /api/bots/:appId/description — proxy to that bot's daemon. GET
+    // returns the localized descriptions read straight off the Open Platform;
+    // PUT body `{ descriptions: Record<lang, string> }` republishes them. The
+    // daemon owns all validation/publish/language-set semantics; this proxy only
+    // forwards, bounding the PUT body so a malicious client can't buffer freely.
+    let mBotDescription: RegExpMatchArray | null;
+    if (
+      (req.method === 'GET' || req.method === 'PUT') &&
+      (mBotDescription = url.pathname.match(/^\/api\/bots\/([^/]+)\/description$/))
+    ) {
+      const appId = decodeURIComponent(mBotDescription[1]);
+      if (req.method === 'GET') {
+        const upstream = await proxyToDaemon(appId, `/api/bot-description`, { method: 'GET' });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+      const chunks: Buffer[] = [];
+      let received = 0;
+      for await (const c of req) {
+        received += (c as Buffer).length;
+        // Descriptions are tiny (≤20 langs × ≤120 chars); cap before buffering more.
+        if (received > 64 * 1024) {
+          res.writeHead(413, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'body_too_large' }));
+          return;
+        }
+        chunks.push(c as Buffer);
+      }
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-description`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
@@ -6819,7 +6891,12 @@ server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) 
     // P1-11：管理类 WS（终端 / 调试终端）升级不经 HTTP 门禁，浏览器对 WS 握手
     // 一定带 Origin，所以「带了但对不上（含 null）」一律拒——同站兄弟子域和
     // localhost 其它端口正是 SameSite=Lax 挡不住的那一类。
-    const upgradeOrigin = managementUpgradeOrigin(req.headers);
+    //
+    // 判之前**先按 path 分流**可信来源档位：会话终端 `/s/*` 认平台 `m-`+`t-`（分享
+    // 出去的终端页就住在 `t-`），而 `/debug-terminal/*` 的另一头是宿主裸 bash，只认
+    // management 档。合在一起判的话，`t-` 就连带成了裸 bash 那条 WS 的可信 Origin。
+    const upgradeRoute = classifyManagementUpgrade(rawUrl);
+    const upgradeOrigin = managementUpgradeOrigin(req.headers, upgradeRoute.surface);
     if (!upgradeOrigin.ok) {
       const body = JSON.stringify({ ok: false, error: upgradeOrigin.error });
       clientSocket.end([
@@ -6833,8 +6910,8 @@ server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) 
       ].join('\r\n'));
       return;
     }
-    // 调试终端 WS（owner-only）：manager 内部自校验管理 cookie。命中即接管。
-    if (rawUrl.startsWith('/debug-terminal/')) {
+    // 调试终端 WS（owner-only）：manager 内部再自校验管理 cookie + legacy 管理身份。
+    if (upgradeRoute.route === 'debug-terminal') {
       if (debugTerminalManager.handleUpgrade(req, clientSocket, head)) return;
     }
     if (terminalFrontProxy.handleUpgrade(req, clientSocket, head)) return;

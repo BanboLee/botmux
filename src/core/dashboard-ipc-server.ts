@@ -72,6 +72,11 @@ import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
 import { applyExactChatGrantRequest } from '../services/exact-chat-grant.js';
+import { normalizeBotDescriptions } from '../services/bot-description-schema.js';
+import type {
+  OpenPlatformDescriptionReadResult,
+  OpenPlatformDescriptionUpdateResult,
+} from '../services/open-platform-rename.js';
 import { findConfigField, applyConfigField, coerceConfigValue, setChatFeedbackPolicy } from '../services/bot-config-store.js';
 import { traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
@@ -184,6 +189,17 @@ let botAvatarChanger: ((image: Buffer) => Promise<BotAvatarOutcome>) | null = nu
 export function setBotAvatarChanger(fn: ((image: Buffer) => Promise<BotAvatarOutcome>) | null): void {
   botAvatarChanger = fn;
 }
+// 机器人多语言名片描述读/写，注册方式同 renamer / avatar（开放平台自动化在
+// daemon 闭包里做）。描述没有 botmux 侧的本地等价物，失败不降级，把结构化原因
+// 原样返回给前端。API-only bot 不注册该 manager（无飞书应用可改）。
+export type BotDescriptionManager = {
+  read: () => Promise<OpenPlatformDescriptionReadResult>;
+  update: (descriptions: Record<string, string>) => Promise<OpenPlatformDescriptionUpdateResult>;
+};
+let botDescriptionManager: BotDescriptionManager | null = null;
+export function setBotDescriptionManager(manager: BotDescriptionManager | null): void {
+  botDescriptionManager = manager;
+}
 
 type SupervisorShutdownRegistration = SupervisorShutdownIdentity & {
   shutdown: () => Promise<void>;
@@ -203,8 +219,9 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, MAX_TURN_TIMEOUT_MS, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, MAX_TURN_TIMEOUT_MS, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import { validateSlashInjection } from './slash-inject.js';
@@ -2924,12 +2941,19 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       prompt,
       workingDir: typeof b.workingDir === 'string' ? b.workingDir : process.cwd(),
       chatId,
-      rootMessageId: rootMessageId || undefined,
+      // Only topic execution retains a root anchor; at top-level/new-topic the
+      // root is dropped so it can never pull execution back into the topic the
+      // schedule was created from (e.g. an adopted one).
+      rootMessageId: executionPosition === 'topic' ? (rootMessageId || undefined) : undefined,
       scope: executionPosition === 'topic' ? 'thread' : 'chat',
       executionPosition,
       topicTitle: topicTitle || undefined,
       chatType: 'group',
       larkAppId: cachedLarkAppId,
+      // Stamp the bot owner as creator: dashboard is local + token-protected,
+      // and the daemon re-checks the owner is still allowed at every run
+      // mutation (scheduled-turn-provenance).
+      ownerOpenId: getOwnerOpenId(cachedLarkAppId),
       deliver,
       silent,
     });
@@ -3039,18 +3063,10 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
       error: `request target botId ${valid.request.target.botId} does not match daemon ${cachedLarkAppId}`,
     });
   }
-  if (valid.request.target.kind === 'turn' && valid.request.target.sessionId) {
-    const receiverTarget = [...activeSessions.values()].find(
-      (candidate) => candidate.session.sessionId === valid.request.target.sessionId,
-    );
-    if (receiverTarget?.session.vcMeetingReceiver) {
-      return jsonRes(res, 403, {
-        ok: false,
-        errorCode: 'managed_receiver_requires_delivery_endpoint',
-        error: 'dedicated meeting receiver sessions accept only fenced delivery or explicit IM routing',
-      });
-    }
-  }
+  // Plan B: a VC meeting agent is an ordinary chat-scope session, so the generic
+  // trigger endpoint may address it like any session (botmux send / dashboard).
+  // Meeting transcript deliveries still flow through their own fenced delivery
+  // path — this endpoint only ever carries ordinary user-initiated turns.
   try {
     if (valid.request.target.kind === 'workflow') {
       return jsonRes(res, 410, {
@@ -3845,6 +3861,9 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   // dsh runner turn timeout (ms). Only meaningful for the dsh adapter; exposed
   // so the dashboard can render the dsh-only field with its current value.
   let turnTimeoutMs: number | null = null;
+  // dsh runtime variant ('official' | 'tui'). Only meaningful for the dsh CLI;
+  // exposed so the dashboard can render the dsh 运行时 toggle.
+  let dshRuntime: 'official' | 'tui' | null = null;
   let agentSelectionKey = '';
   try {
     const cfg = getBot(cachedLarkAppId).config;
@@ -3864,6 +3883,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
       && Number.isInteger(cfg.turnTimeoutMs) && cfg.turnTimeoutMs > 0
       ? cfg.turnTimeoutMs
       : null;
+    dshRuntime = cfg.dshRuntime === 'tui' ? 'tui' : null;
     agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined);
   } catch { /* no registered bot */ }
   let maxLiveWorkers: number | null = null;
@@ -3943,6 +3963,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     model,
     reasoningEffort,
     turnTimeoutMs,
+    dshRuntime,
     agentSelectionKey,
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
     defaultWorkingDir,
@@ -3966,6 +3987,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     codexAppCleanInput: cardPrefs.codexAppCleanInput,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
+    thinkingCard: cardPrefs.thinkingCard,
     overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
     autoStartOnGroupJoin: cardPrefs.autoStartOnGroupJoin,
@@ -4012,7 +4034,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: {
     usageDisplay?: unknown;
-    disableStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown;
+    disableStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; thinkingCard?: unknown;
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnNewTopic?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
@@ -4023,7 +4045,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
 
   const patch: {
     usageDisplay?: UsageDisplayMode;
-    disableStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean;
+    disableStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; thinkingCard?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnNewTopic?: boolean;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
@@ -4037,6 +4059,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (typeof body.codexAppCleanInput === 'boolean') patch.codexAppCleanInput = body.codexAppCleanInput;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
+  if (typeof body.thinkingCard === 'boolean') patch.thinkingCard = body.thinkingCard;
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
   if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;
@@ -4278,6 +4301,66 @@ ipcRoute('PUT', '/api/bot-avatar', async (req, res) => {
   jsonRes(res, status, { ok: false, error: changed.reason, message: changed.message });
 });
 
+// 机器人多语言名片描述读/写（dashboard 档案头「飞书名片描述」入口）。
+//   GET  /api/bot-description → { ok, primaryLang, languages:[{lang,description}] }
+//   PUT  /api/bot-description  Body `{ descriptions: { zh_cn, en_us, ... } }`
+// 走开放平台自动化真改飞书应用描述（全量回写 base_info + 建版发布，名片生效）。
+// 描述没有本地降级等价物：失败把结构化原因返回（no_session / session_expired 时
+// 前端引导扫码重登；languages_changed 时前端刷新重填）。manager 未注册（API-only
+// bot / 测试环境）→ 501。
+function descriptionFailureStatus(reason: string): number {
+  switch (reason) {
+    case 'languages_changed':
+      return 409;
+    case 'invalid_descriptions':
+    case 'description_required':
+    case 'description_too_long':
+      return 400;
+    default:
+      // no_session / session_expired / no_access / unsupported_brand / api_error
+      return 502;
+  }
+}
+
+ipcRoute('GET', '/api/bot-description', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!botDescriptionManager) return jsonRes(res, 501, { ok: false, error: 'description_not_wired' });
+  const result = await botDescriptionManager.read();
+  if (result.ok) {
+    return jsonRes(res, 200, { ok: true, primaryLang: result.primaryLang, languages: result.languages });
+  }
+  jsonRes(res, descriptionFailureStatus(result.reason), { ok: false, error: result.reason, message: result.message });
+});
+
+ipcRoute('PUT', '/api/bot-description', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!botDescriptionManager) return jsonRes(res, 501, { ok: false, error: 'description_not_wired' });
+  let body: unknown;
+  try { body = await readJsonBody<unknown>(req, 64 * 1024); }
+  catch (err) {
+    if (err instanceof JsonBodyTooLargeError) return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+    return jsonRes(res, 400, { ok: false, error: 'invalid_json' });
+  }
+  // 顶层只允许 { descriptions }，防原型污染与多余键。
+  if (!hasExactSafeJsonKeys(body, ['descriptions'])) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_body' });
+  }
+  const normalized = normalizeBotDescriptions((body as Record<string, unknown>).descriptions);
+  if (!normalized.ok) {
+    return jsonRes(res, 400, { ok: false, error: normalized.reason, lang: normalized.lang });
+  }
+  const result = await botDescriptionManager.update(normalized.descriptions);
+  if (result.ok) {
+    return jsonRes(res, 200, {
+      ok: true,
+      primaryLang: result.primaryLang,
+      descriptions: result.descriptions,
+      versionId: result.versionId,
+    });
+  }
+  jsonRes(res, descriptionFailureStatus(result.reason), { ok: false, error: result.reason, message: result.message, lang: result.lang });
+});
+
 // Per-bot agent launch settings. Body `{ cliId, model, cliRuntime? }` where `cliId` is the
 // dashboard selection key (plain adapter id or a wrapper option such as
 // `ttadk-x-codex`). Changes affect the next spawned CLI session; existing
@@ -4287,8 +4370,8 @@ ipcRoute('PUT', '/api/bot-avatar', async (req, res) => {
 ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   const larkAppId = cachedLarkAppId;
-  let body: { cliId?: unknown; model?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown };
-  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown }>(req); }
+  let body: { cliId?: unknown; model?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown; dshRuntime?: unknown };
+  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown; dshRuntime?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
   const key = typeof body.cliId === 'string' && body.cliId.trim() ? body.cliId.trim() : '';
@@ -4322,6 +4405,18 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       return jsonRes(res, 400, { ok: false, error: 'invalid_turn_timeout_ms' });
     }
     nextTurnTimeoutMs = n;
+  }
+  // dsh-only runtime variant (official JSON-RPC runner vs dsh-tui PTY TUI).
+  // Same present/absent semantics as turnTimeoutMs: absent preserves, present
+  // writes/clears, non-dsh always drops.
+  const supportsDshRuntime = selected.cliId === 'dsh';
+  const dshRuntimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'dshRuntime');
+  let nextDshRuntime: 'official' | 'tui' | undefined;
+  if (dshRuntimeFieldPresent && body.dshRuntime !== null && body.dshRuntime !== '') {
+    if (body.dshRuntime !== 'official' && body.dshRuntime !== 'tui') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_dsh_runtime' });
+    }
+    nextDshRuntime = body.dshRuntime;
   }
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
   const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli);
@@ -4360,6 +4455,13 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     wrapperCli: selected.wrapperCli,
     cliPathOverride: effectivePath,
   });
+  // dsh-tui mode spawns the dsh-tui binary instead of the dsh runner. Check it
+  // separately so a missing dsh-tui install surfaces as a save-time warning
+  // rather than a spawn-time ENOENT crash-loop.
+  let dshTuiAvailability: { available: boolean; command?: string; reason?: string } | undefined;
+  if (supportsDshRuntime && nextDshRuntime === 'tui') {
+    dshTuiAvailability = checkCliAvailability({ cliId: 'dsh-tui' });
+  }
   let runtimeProbe: { version: string; updateProvider: string } | undefined;
   if (runtimeFieldPresent && nextRuntime) {
     if (!availability.available) {
@@ -4390,9 +4492,13 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   // Existing Bot edits remain saveable (operators may intentionally configure
   // first and install second), but the response is explicit so Dashboard never
   // claims a missing Agent was saved successfully without qualification.
-  const availabilityWarning = availability.available
+  let availabilityWarning = availability.available
     ? undefined
     : `配置已保存，但所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 daemon 所在机器安装或修正 PATH / CLI 路径。`;
+  if (dshTuiAvailability && !dshTuiAvailability.available) {
+    const tuiWarning = `配置已保存，但 dsh-tui 未安装（${dshTuiAvailability.reason ?? 'dsh-tui 二进制不在 PATH'}）。请在 daemon 所在机器安装 @deepseek-harness-tui/dsh-tui。`;
+    availabilityWarning = availabilityWarning ? `${availabilityWarning} ${tuiWarning}` : tuiWarning;
+  }
 
   return withBotTurnMutation(larkAppId, async () => {
     // Agent selection can replace every live worker generation and may also
@@ -4454,6 +4560,12 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       if (nextTurnTimeoutMs !== undefined) entry.turnTimeoutMs = nextTurnTimeoutMs;
       else delete entry.turnTimeoutMs;
     }
+    // dsh-only runtime variant: same present/absent semantics as turnTimeoutMs.
+    if (!supportsDshRuntime) delete entry.dshRuntime;
+    else if (dshRuntimeFieldPresent) {
+      if (nextDshRuntime !== undefined) entry.dshRuntime = nextDshRuntime;
+      else delete entry.dshRuntime;
+    }
     if (entry.readIsolation === true &&
         !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli })) {
       delete entry.readIsolation;
@@ -4494,6 +4606,9 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // takes the parsed value, dsh without the field preserves the existing one.
     if (!supportsTurnTimeout) bot.config.turnTimeoutMs = undefined;
     else if (turnTimeoutFieldPresent) bot.config.turnTimeoutMs = nextTurnTimeoutMs;
+    // dsh-only runtime variant: same mirror semantics as turnTimeoutMs.
+    if (!supportsDshRuntime) bot.config.dshRuntime = undefined;
+    else if (dshRuntimeFieldPresent) bot.config.dshRuntime = nextDshRuntime;
     if (readIsolationCleared) bot.config.readIsolation = false;
     if (isRemoteCliId(selected.cliId)) {
       bot.config.backendType = selected.cliId as typeof bot.config.backendType;
@@ -4515,6 +4630,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       model: model || null,
       reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
       turnTimeoutMs: supportsTurnTimeout ? bot.config.turnTimeoutMs ?? null : null,
+      dshRuntime: supportsDshRuntime ? bot.config.dshRuntime ?? null : null,
       selectionKey,
       // Number kept for compatibility with an older dashboard bundle; the residual
       // count rides alongside so a hot CLI switch cannot silently strand a remote
@@ -4573,46 +4689,75 @@ ipcRoute('POST', '/api/session-group-tag-auth', async (_req, res) => {
   }
 });
 
-// GET /api/session-group-tag-status — 标签授权状态（Dashboard 徽标）。
+// GET /api/session-group-tag-status — 标签授权状态（Dashboard 徽标）+ 标签名。
+// tagName = 用户配置的自定义名（没配就是空串）；defaultTagName = 留空时实际生效的
+// 默认名「<bot 显示名>会话」，Dashboard 拿它做输入框 placeholder。
 ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   try {
     const cfg = getBot(cachedLarkAppId).config;
     const status = getFeedGroupAuthStatus(cfg.larkAppId, normalizeBrand(cfg.brand));
-    jsonRes(res, 200, { ok: true, ...status, tagMode: cfg.sessionGroup?.tag?.mode ?? 'feed-group' });
+    jsonRes(res, 200, {
+      ok: true,
+      ...status,
+      tagMode: cfg.sessionGroup?.tag?.mode ?? 'feed-group',
+      tagName: cfg.sessionGroup?.tag?.name ?? '',
+      defaultTagName: defaultSessionTagName(cachedLarkAppId),
+    });
   } catch (e: any) {
     jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
   }
 });
 
-// PUT /api/session-group-tag-config — 会话群标签模式（Dashboard tag mode
-// selector，PR review：授权行必须与实际 tagMode 一致）。Body `{ mode }`：
-// 'feed-group'（默认，个人侧边栏分组，需一次 OAuth，任何租户可用）|
-// 'chat-tag'（应用租户身份，无需用户授权，但部分租户权限目录无该 scope）|
-// 'off'。写 bots.json 的 sessionGroup.tag.mode 并热更内存注册表，与
-// /botconfig 同一持久化通道。
+// PUT /api/session-group-tag-config — 会话群标签模式 + 标签名（Dashboard 的
+// 「会话群标签」区块，PR review：授权行必须与实际 tagMode 一致）。
+// Body `{ mode?, name? }`，两者都可单独提交（Dashboard 下拉只发 mode、输入框只发
+// name），但至少要带一个：
+//   mode: 'feed-group'（默认，个人侧边栏分组，需一次 OAuth，任何租户可用）|
+//         'chat-tag'（应用租户身份，无需用户授权，但部分租户权限目录无该 scope）| 'off'
+//   name: 自定义标签名；trim 后为空 = 删掉该字段回默认名「<bot 显示名>会话」。
+//         超长按码点保守截断（clampSessionTagName），存进去的就是实际生效的。
+// 写 bots.json 的 sessionGroup.tag 并热更内存注册表，与 /botconfig 同一持久化通道。
 ipcRoute('PUT', '/api/session-group-tag-config', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  let body: { mode?: unknown };
-  try { body = await readJsonBody<{ mode?: unknown }>(req); }
+  let body: { mode?: unknown; name?: unknown };
+  try { body = await readJsonBody<{ mode?: unknown; name?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const hasMode = body.mode !== undefined && body.mode !== null;
+  const hasName = body.name !== undefined && body.name !== null;
   const mode = body.mode === 'chat-tag' || body.mode === 'feed-group' || body.mode === 'off'
     ? body.mode : undefined;
-  if (!mode) return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  if (hasMode && !mode) return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  if (hasName && typeof body.name !== 'string') return jsonRes(res, 400, { ok: false, error: 'invalid_name' });
+  // 一个字段都没带 → 沿用原来的 invalid_mode（老 dashboard 只发 mode，语义不变）。
+  if (!hasMode && !hasName) return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  const name = hasName ? clampSessionTagName(body.name as string) : undefined;
   try {
     const bot = getBot(cachedLarkAppId);
     const r = await rmwBotEntry(cachedLarkAppId, (entry: any) => {
       if (!entry.sessionGroup || typeof entry.sessionGroup !== 'object') entry.sessionGroup = {};
       if (!entry.sessionGroup.tag || typeof entry.sessionGroup.tag !== 'object') entry.sessionGroup.tag = {};
-      entry.sessionGroup.tag.mode = mode;
+      if (mode) entry.sessionGroup.tag.mode = mode;
+      if (hasName) {
+        if (name) entry.sessionGroup.tag.name = name;
+        else delete entry.sessionGroup.tag.name; // 留空 = 清配置回默认，bots.json 保持干净
+      }
       return { write: true, result: mode };
     });
     if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
-    bot.config.sessionGroup = {
-      ...(bot.config.sessionGroup ?? {}),
-      tag: { ...(bot.config.sessionGroup?.tag ?? {}), mode },
-    };
-    jsonRes(res, 200, { ok: true, tagMode: mode });
+    const tag = { ...(bot.config.sessionGroup?.tag ?? {}) };
+    if (mode) tag.mode = mode;
+    if (hasName) {
+      if (name) tag.name = name;
+      else delete tag.name;
+    }
+    bot.config.sessionGroup = { ...(bot.config.sessionGroup ?? {}), tag };
+    jsonRes(res, 200, {
+      ok: true,
+      tagMode: tag.mode ?? 'feed-group',
+      tagName: tag.name ?? '',
+      defaultTagName: defaultSessionTagName(cachedLarkAppId),
+    });
   } catch (e: any) {
     jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
   }

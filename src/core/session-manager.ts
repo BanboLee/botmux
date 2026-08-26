@@ -88,6 +88,7 @@ import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { writePromptContext } from '../services/prompt-context-store.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
+import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 
@@ -357,6 +358,11 @@ function armCliMismatchResweep(ds: DaemonSession): void {
 }
 
 async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMismatchCloseResult> {
+  // A Codex App shared adopt deliberately runs the plain `codex` remote TUI
+  // even when this bot's normal/new-session runtime remains `codex-app`.
+  // That is not a bot configuration drift and must never trigger the ordinary
+  // "kill mismatched CLI" cleanup during daemon restore or a live config edit.
+  if (isSharedAdoptSession(ds)) return 'not_mismatched';
   const mismatch = sessionBotCliMismatch(ds);
   if (!mismatch) return 'not_mismatched';
 
@@ -470,7 +476,7 @@ export async function closeCliMismatchedSessionsForBot(
   for (const ds of [...registry.values()]) {
     if (ds.larkAppId !== larkAppId) continue;
     if (ds.session.queued) continue;
-    if (ds.adoptedFrom || ds.session.adoptedFrom || ds.session.title?.startsWith('Adopt:')) continue;
+    if (isSharedAdoptSession(ds) || ds.session.title?.startsWith('Adopt:')) continue;
     // Defense in depth: the dashboard toggle preflights the whole bot before
     // changing config. Never let a refused suspend fall through into
     // closeSession: close is explicit abandon, and a settings toggle is not.
@@ -515,7 +521,7 @@ export async function suspendActiveSessionsForBot(larkAppId: string): Promise<nu
   for (const ds of [...registry.values()]) {
     if (ds.larkAppId !== larkAppId) continue;
     if (ds.session.queued) continue;
-    if (ds.adoptedFrom || ds.session.adoptedFrom || ds.session.title?.startsWith('Adopt:')) continue;
+    if (isSharedAdoptSession(ds) || ds.session.title?.startsWith('Adopt:')) continue;
     // A settings helper is never an explicit abandon boundary. In particular,
     // suspendWorker intentionally refuses pending Codex App ownership; do not
     // reinterpret that refusal as permission to close and erase the FIFO.
@@ -2769,9 +2775,6 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
  *                          a fresh thread session); refuse rather than clobber
  *   - 'adopt_unsupported' — adopt sessions are torn down by /close and have
  *                          no resume semantics
- *   - 'vc_receiver_managed' — dedicated meeting receivers are reconstructed
- *                          through the meeting membership/hub lifecycle; a
- *                          manual resume could resurrect a stale member epoch
  *   - 'deferred_unmaterialized' — a silent fresh-topic run finished without
  *                          publishing, so it has no conversation to resume
  *   - 'resume_cancelled' — a concurrent close won while resume was committing
@@ -2780,22 +2783,16 @@ export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
 ): Promise<{ ok: true; ds: DaemonSession }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'vc_receiver_managed' | 'deferred_unmaterialized' | 'resume_cancelled'; activeSessionId?: string }> {
+| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled'; activeSessionId?: string }> {
   let session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
 
-  // A dedicated VC receiver is not an ordinary chat conversation. Its
-  // identity is fenced by (meeting, member, epoch) and its active-map slot is
-  // reconstructed by the meeting hub/membership lifecycle. Reactivating a
-  // closed receiver through the generic dashboard/card/CLI path would bypass
-  // that ownership check, potentially revive a stale epoch, and (before the
-  // dedicated-key fix) collapse it into the listener chat's ordinary slot.
-  // Keep it closed and let the authoritative meeting lifecycle create or
-  // recover the correct receiver binding.
-  if (session.vcMeetingReceiver) {
-    return { ok: false, error: 'vc_receiver_managed' };
-  }
+  // Plan B: a VC meeting agent is an ordinary chat-scope session, so a closed one
+  // resumes into its normal (chatId, appId) slot like any chat session — the old
+  // `vc_receiver_managed` refusal is gone. (Reviving into the ordinary slot is now
+  // the intended behavior, not a hazard; the meeting lifecycle re-stamps the
+  // delivery binding via ensureVcMeetingReceiverSession when the meeting is live.)
 
   // Auto-closed invisible schedule runs are audit records, not conversations.
   // Without a materialized binding, resuming one would wake a virtual chat-
@@ -2809,7 +2806,7 @@ export async function resumeSession(
   // Adopt sessions don't survive /close — the user's tmux pane and original
   // CLI pid have already moved on, and bringing the bridge back without a live
   // pane is meaningless.
-  if (session.title?.startsWith('Adopt:') || session.adoptedFrom) {
+  if (session.title?.startsWith('Adopt:') || isSharedAdoptPersistedSession(session)) {
     return { ok: false, error: 'adopt_unsupported' };
   }
 
@@ -2824,12 +2821,11 @@ export async function resumeSession(
   const latest = sessionStore.getSession(sessionId);
   if (!latest) return { ok: false as const, error: 'not_found' as const };
   if (latest.status !== 'closed') return { ok: false as const, error: 'not_closed' as const };
-  if (latest.vcMeetingReceiver) return { ok: false as const, error: 'vc_receiver_managed' as const };
   if (latest.deferredScheduleRun
     && !readDeferredTopicBinding(config.session.dataDir, latest.sessionId)) {
     return { ok: false as const, error: 'deferred_unmaterialized' as const };
   }
-  if (latest.title?.startsWith('Adopt:') || latest.adoptedFrom) {
+  if (latest.title?.startsWith('Adopt:') || isSharedAdoptPersistedSession(latest)) {
     return { ok: false as const, error: 'adopt_unsupported' as const };
   }
   session = latest;

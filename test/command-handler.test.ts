@@ -330,6 +330,13 @@ vi.mock('../src/core/worker-pool.js', () => ({
   // /term payload. Default to the in-chat visible-to-you channel; tests override
   // per-scenario (dm / failed / not_ready).
   deliverWritableTerminalCardTo: vi.fn(async () => 'ephemeral'),
+  // /card show path. postFreshStreamingCard returns false for sessions that
+  // structurally can't post a live card (VC meeting-receiver among them); the
+  // handler then picks an accurate reason. Default false so /card show tests
+  // exercise the not-ready / vc-receiver branch; override per-scenario.
+  postFreshStreamingCard: vi.fn(async () => false),
+  postPrivateSnapshotCard: vi.fn(async () => ({ notReady: false, sent: 1, total: 1 })),
+  resolvePrivateCardAudience: vi.fn(() => ['ou_owner']),
 }));
 
 vi.mock('../src/utils/daemon-discovery.js', () => ({
@@ -482,10 +489,20 @@ vi.mock('../src/services/card-mode-store.js', () => ({
   setCardMode: vi.fn(async () => ({ ok: true })),
 }));
 
+vi.mock('../src/services/cot-mode-store.js', () => ({
+  setCotMode: vi.fn(async () => ({ ok: true })),
+}));
+
+vi.mock('../src/im/lark/cot-message.js', () => ({
+  handleCotThinkingUpdate: vi.fn(() => true),
+}));
+
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
+import { setCotMode } from '../src/services/cot-mode-store.js';
+import { handleCotThinkingUpdate } from '../src/im/lark/cot-message.js';
 import { writeRoleFile, deleteRoleFile, writeTeamRoleFile, deleteTeamRoleFile, resolveRole, resolveRoleFile } from '../src/core/role-resolver.js';
 import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
 import {
@@ -498,7 +515,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
+import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, withActiveSessionKeyLock, postFreshStreamingCard } from '../src/core/worker-pool.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
@@ -676,7 +693,7 @@ describe('DAEMON_COMMANDS set', () => {
     // 33 = current master command set (32) + /forklist.
     // /fork and /issue remain first-class daemon commands. /subscribe-lark-doc remains
     // as its original per-file API subscription command rather than an alias.
-    expect(DAEMON_COMMANDS.size).toBe(33);
+    expect(DAEMON_COMMANDS.size).toBe(34);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
@@ -1854,6 +1871,109 @@ describe('handleCommand', () => {
   // ─── /close ─────────────────────────────────────────────────────────────
 
   describe('/close', () => {
+    it('treats an existing App Server adopt as a BotMux-only disconnect', async () => {
+      const ds = makeDaemonSession({
+        session: makeSession({
+          cliId: 'codex' as any,
+          cliSessionId: '019e-existing-app-server-thread',
+          existingAppServerEndpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+        }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+
+      expect(closeSession).toHaveBeenCalledWith('sess-001');
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(sessionStore.closeSession).not.toHaveBeenCalled();
+      expect(deliverEphemeralOrReply).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('App Server 和 Codex App 会话仍在运行'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('does not report a shared App Server disconnect as complete when close leaves a residual', async () => {
+      const ds = makeDaemonSession({
+        session: makeSession({
+          cliId: 'codex' as any,
+          cliSessionId: '019e-existing-app-server-thread',
+          existingAppServerEndpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+        }),
+      });
+      const deps = makeDeps(ds);
+      vi.mocked(closeSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'local_subtree_boundary_unproven' },
+        alreadyClosed: false,
+        known: true,
+      } as never);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+
+      expect(closeSession).toHaveBeenCalledWith('sess-001');
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] as string;
+      expect(reply).toContain('未能确认完全断开');
+      expect(reply).not.toContain('App Server 和 Codex App 会话仍在运行');
+    });
+
+    it.each([
+      {
+        command: '/detach',
+        close: {
+          ok: true,
+          outcome: 'closed',
+          alreadyClosed: false,
+          known: true,
+        },
+        expected: 'App Server 和 Codex App 会话仍在运行',
+      },
+      {
+        command: '/detach',
+        close: {
+          ok: false,
+          alreadyClosed: false,
+          error: 'remote_close_unproven',
+          retryable: true,
+        },
+        expected: '未能安全断开',
+      },
+      {
+        command: '/disconnect',
+        close: {
+          ok: true,
+          outcome: 'closed_with_residual',
+          residual: { reason: 'local_subtree_boundary_unproven' },
+          alreadyClosed: false,
+          known: true,
+        },
+        expected: '未能确认完全断开',
+      },
+    ])('maps shared $command close outcomes without claiming an unverified detach', async ({ command, close, expected }) => {
+      const ds = makeDaemonSession({
+        session: makeSession({
+          cliId: 'codex' as any,
+          cliSessionId: '019e-existing-app-server-thread',
+          existingAppServerEndpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+        }),
+      });
+      const deps = makeDeps(ds);
+      vi.mocked(closeSession).mockResolvedValueOnce(close as never);
+
+      await handleCommand(command, ROOT_ID, makeLarkMessage(command), deps, LARK_APP_ID);
+
+      expect(closeSession).toHaveBeenCalledWith('sess-001');
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] as string;
+      expect(reply).toContain(expected);
+      if ((close as { outcome?: string }).outcome !== 'closed') {
+        expect(reply).not.toContain('App Server 和 Codex App 会话仍在运行');
+      }
+    });
+
     it('closes through the authoritative worker-pool lifecycle and removes the session', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
@@ -4105,6 +4225,37 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('新话题');
       expect(replyContent).toContain('静默模式');
     });
+
+    it('defaults to group top-level when created from a topic/adopt session (no position modifier)', async () => {
+      // A schedule born inside a topic (including an adopted one) must not pin
+      // its results to that topic. Without an explicit modifier the default is
+      // top-level and the root bookmark is dropped.
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'cron', expr: '0 9 * * *', display: '每日 09:00' },
+        prompt: '生成日报',
+        name: '生成日报',
+      });
+      // Default extractScheduleModifiers mock returns no executionPosition.
+      vi.mocked(scheduler.extractScheduleModifiers).mockImplementation((prompt: string) => ({
+        deliver: 'origin' as const,
+        silent: false,
+        prompt,
+      }));
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-topic-default' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-03-28T09:00:00+08:00'));
+
+      // Simulate a topic-scope (adopt) session: scope is 'thread'.
+      const ds = makeDaemonSession({ scope: 'thread' });
+      const deps = makeDeps(ds);
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每日9:00 生成日报'), deps, LARK_APP_ID);
+
+      expect(scheduler.addTask).toHaveBeenCalledTimes(1);
+      const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(callArgs.executionPosition).toBe('top-level');
+      expect(callArgs.scope).toBe('chat');
+      // The adopt topic root must not be retained as a bookmark.
+      expect(callArgs.rootMessageId).toBeUndefined();
+    });
   });
 
   // ─── /login ─────────────────────────────────────────────────────────────
@@ -4600,6 +4751,101 @@ describe('handleCommand', () => {
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('已继续 Codex App 对话');
       expect(replyContent).toContain('Fix botmux');
+    });
+
+    it('attaches a Codex App bot to an existing App Server thread without changing its default runtime', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => {
+        if (id === CODEX_APP_ID) {
+          return {
+            botName: 'Codex Remote',
+            config: {
+              larkAppId: CODEX_APP_ID,
+              larkAppSecret: 'secret-1',
+              // Existing BotMux Codex App topics keep this default. Only the
+              // explicitly selected /adopt thread switches to the official
+              // `codex --remote` client below.
+              cliId: 'codex-app' as const,
+              existingAppServer: {
+                endpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+              },
+              workingDir: '~/projects',
+              workingDirs: ['~/projects'],
+            },
+          };
+        }
+        return defaultGetBot(id);
+      }) as any);
+      vi.mocked(listCodexAppThreads).mockResolvedValueOnce([
+        {
+          threadId: '019e-remote-thread',
+          name: 'Continue GUI thread',
+          preview: 'fallback preview',
+          cwd: '/repo/remote-codex',
+          updatedAtMs: 1780000000000,
+        },
+      ]);
+      const ds = makeDaemonSession({
+        larkAppId: CODEX_APP_ID,
+        session: makeSession({
+          cliId: 'codex-app' as any,
+          // A temporary topic shell might have frozen an old launcher; the
+          // remote attach must clear it before the new fork.
+          wrapperCli: 'old-wrapper codex',
+          agentFrozen: true,
+        }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/adopt', ROOT_ID, makeLarkMessage('/adopt 019e-remote-thread'), deps, CODEX_APP_ID);
+
+      expect(discoverAdoptableSessions).not.toHaveBeenCalled();
+      expect(ds.session.cliId).toBe('codex');
+      expect(ds.session.cliSessionId).toBe('019e-remote-thread');
+      expect(ds.session.existingAppServerEndpoint)
+        .toBe('unix:///home/testuser/.codex/app-server-control/app-server-control.sock');
+      expect(ds.session.wrapperCli).toBeUndefined();
+      expect(ds.session.agentFrozen).toBeUndefined();
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', true);
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('已共享接入现有 Codex App 对话');
+      expect(replyContent).toContain('不会新建或停止开发机 App Server');
+    });
+
+    it('does not let an existing App Server shared topic adopt a second thread', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => {
+        if (id === CODEX_APP_ID) {
+          return {
+            botName: 'Codex Remote',
+            config: {
+              larkAppId: CODEX_APP_ID,
+              larkAppSecret: 'secret-1',
+              cliId: 'codex-app' as const,
+              existingAppServer: {
+                endpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+              },
+              workingDir: '~/projects',
+              workingDirs: ['~/projects'],
+            },
+          };
+        }
+        return defaultGetBot(id);
+      }) as any);
+      const ds = makeDaemonSession({
+        larkAppId: CODEX_APP_ID,
+        session: makeSession({
+          cliId: 'codex' as any,
+          cliSessionId: '019e-already-attached',
+          existingAppServerEndpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+        }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/adopt', ROOT_ID, makeLarkMessage('/adopt'), deps, CODEX_APP_ID);
+
+      expect(listCodexAppThreads).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1])
+        .toContain('本话题已共享接入一条 Codex App 对话');
     });
   });
 
@@ -6173,6 +6419,138 @@ describe('/card — operator / canOperate gate', () => {
     expect(setCardMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     expect(reply).toContain('已恢复');
+  });
+
+  it('Plan B: /card on a VC meeting-agent session gets the ordinary not-ready notice (no special-casing)', async () => {
+    // Under Plan B a meeting agent is an ordinary chat-scope session, so /card
+    // behaves exactly like any other session — postFreshStreamingCard no longer
+    // structurally refuses it, and there is no meeting-receiver-specific reason.
+    // When a post genuinely can't happen yet, the operator sees the same generic
+    // not-ready text as every other session.
+    vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+      botName: 'Claude',
+      config: { larkAppId: id, larkAppSecret: 's', cliId: 'claude-code' as const, privateCard: false },
+    })) as any);
+    vi.mocked(postFreshStreamingCard).mockResolvedValue(false);
+    const ds = makeDaemonSession({ session: makeSession({ vcMeetingReceiver: true }) });
+    const deps = makeDeps(ds);
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card', deps);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('终端尚未就绪');
+    expect(reply).not.toContain('会议接收会话');
+  });
+});
+
+describe('/cot — thinking-process message switch (operator / canOperate)', () => {
+  const CHAT_ID = 'oc_chat_1';
+  const botWith = (config: Record<string, unknown>) =>
+    vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+      botName: 'Claude',
+      config: { larkAppId: id, larkAppSecret: 's', cliId: 'claude-code' as const, ...config },
+    })) as any);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(canOperate).mockReturnValue(true);
+    vi.mocked(setCotMode).mockResolvedValue({ ok: true, changed: true } as any);
+    botWith({ thinkingCard: true });
+  });
+
+  it('rejects a non-operator: operator_only notice, no mode change', async () => {
+    vi.mocked(canOperate).mockReturnValue(false);
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_random', '/cot off', deps);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('仅授权用户');
+    expect(setCotMode).not.toHaveBeenCalled();
+  });
+
+  it('/cot off mutes the chat via setCotMode(off=true)', async () => {
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot off', deps);
+    expect(setCotMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, true);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('已关闭');
+  });
+
+  it('/cot on restores the chat and confirms when the master switch is on', async () => {
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot on', deps);
+    expect(setCotMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('已恢复');
+    expect(reply).not.toContain('thinkingCard on');
+  });
+
+  it('/cot on hints at the master switch when thinkingCard is explicitly off', async () => {
+    botWith({ thinkingCard: false });
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot on', deps);
+    expect(setCotMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('thinkingCard on');
+  });
+
+  it('/cot on with an untouched config (default ON) confirms without the master-switch hint', async () => {
+    botWith({});
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot on', deps);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('已恢复');
+    expect(reply).not.toContain('thinkingCard on');
+  });
+
+  it('/cot status reports on / chat-muted / master-off states', async () => {
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('开启中');
+
+    botWith({ thinkingCard: true, noCotChats: [CHAT_ID] });
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[1][1]).toContain('本群已关闭');
+
+    botWith({ thinkingCard: false });
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[2][1]).toContain('总开关未开');
+    expect(setCotMode).not.toHaveBeenCalled();
+  });
+
+  it('unknown subcommand shows usage', async () => {
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot bogus', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('用法');
+    expect(setCotMode).not.toHaveBeenCalled();
+  });
+
+  it('/cot show without a live session replies no_active_session', async () => {
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('没有活跃');
+    expect(handleCotThinkingUpdate).not.toHaveBeenCalled();
+  });
+
+  it('/cot show mid-turn: forces the session and renders the cached thinking immediately', async () => {
+    botWith({ thinkingCard: false }); // switches off — show overrides anyway
+    const ds = makeDaemonSession();
+    ds.lastThinkingUpdate = { entries: [{ kind: 'thinking', text: 'so far' }], turnId: 'om_turn9' };
+    const deps = makeDeps(ds);
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
+    expect(ds.cotForced).toBe(true);
+    expect(handleCotThinkingUpdate).toHaveBeenCalledWith(ds, expect.objectContaining({
+      type: 'thinking_update',
+      turnId: 'om_turn9',
+      entries: [{ kind: 'thinking', text: 'so far' }],
+    }));
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('已召唤');
+  });
+
+  it('/cot show while idle: arms the one-shot force for the next turn', async () => {
+    const ds = makeDaemonSession();
+    const deps = makeDeps(ds);
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
+    expect(ds.cotForced).toBe(true);
+    expect(handleCotThinkingUpdate).not.toHaveBeenCalled();
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('下个 turn');
   });
 });
 

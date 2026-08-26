@@ -50,6 +50,7 @@ import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createKiroCliAdapter } from '../src/adapters/cli/kiro-cli.js';
 import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
 import { createDshAdapter } from '../src/adapters/cli/dsh.js';
+import { createDshTuiAdapter } from '../src/adapters/cli/dsh-tui.js';
 import { buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
 import { ALL_CLI_IDS as REGISTRY_ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
 import { isRemoteCliId } from '../src/core/remote-cli-ids.js';
@@ -111,7 +112,7 @@ describe('lazy binary resolution', () => {
   // Direct CLI adapters resolve their actual executable lazily. Runner-backed
   // adapters (codex-app/mira) intentionally use process.execPath and are covered
   // by their own buildArgs tests below.
-  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'opencode2', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'kimi', 'grok', 'kiro-cli', 'reasonix'];
+  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'opencode2', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'kimi', 'grok', 'kiro-cli', 'reasonix', 'dsh-tui'];
 
   it.each(DIRECT_CLI_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
     const { spawnSync } = await import('node:child_process');
@@ -552,6 +553,25 @@ describe('codex-app buildArgs', () => {
     expect(args).toContain('--thread-id');
     expect(args).toContain('thread-123');
   });
+
+  it('passes the opt-in browser bridge only to the Codex App runner', () => {
+    const disabled = adapter.buildArgs({ sessionId: 'sess-app', resume: false });
+    expect(disabled).not.toContain('--browser-family');
+
+    const enabled = adapter.buildArgs({
+      sessionId: 'sess-app',
+      resume: false,
+      codexBrowser: {
+        enabled: true,
+        family: 'edge',
+        pluginRoot: '/opt/codex/chrome-plugin',
+      },
+    });
+    expect(enabled).toEqual(expect.arrayContaining([
+      '--browser-family', 'edge',
+      '--browser-plugin-root', '/opt/codex/chrome-plugin',
+    ]));
+  });
 });
 
 describe('mira buildArgs', () => {
@@ -656,6 +676,65 @@ describe('dsh buildArgs (runner model)', () => {
     const decoded = JSON.parse(Buffer.from(line.slice('::botmux-dsh:'.length).trim(), 'base64').toString('utf8'));
     expect(decoded.content).toBe('hello dsh');
     expect(decoded.replyTurnId).toBe('turn-1');
+  });
+});
+
+describe('dsh-tui buildArgs (PTY TUI model)', () => {
+  const adapter = createDshTuiAdapter('/opt/dsh-tui/bin/dsh-tui');
+
+  it('spawns the dsh-tui binary directly (no runner)', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-tui', resume: false, workingDir: '/repo/root' });
+    expect(adapter.resolvedBin).toBe('/opt/dsh-tui/bin/dsh-tui');
+    // No runner script — the TUI is spawned directly with no args on fresh boot.
+    expect(args.some(a => /runner\.js$/.test(a))).toBe(false);
+  });
+
+  it('passes --resume for session resume', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: 'abc-123' });
+    expect(args).toContain('--resume');
+    expect(args).toContain('abc-123');
+  });
+
+  it('passes bare --resume (no session id) to read resume.txt', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: true });
+    expect(args).toEqual(['--resume']);
+  });
+
+  it('omits --resume on fresh spawn', () => {
+    expect(adapter.buildArgs({ sessionId: 's', resume: false })).toEqual([]);
+  });
+
+  it('has no portable copy-paste resume command (session id not tracked)', () => {
+    expect(adapter.buildResumeCommand?.({ sessionId: 's', cliSessionId: 'abc' })).toBeNull();
+  });
+
+  it('readyPattern matches the TUI prompt char', () => {
+    expect(adapter.readyPattern?.test('❯ ')).toBe(true);
+  });
+
+  it('defers the first prompt until the TUI composer is ready', () => {
+    expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
+  });
+
+  it('does not type ahead', () => {
+    expect(adapter.supportsTypeAhead).not.toBe(true);
+  });
+
+  it('exposes ~/.dsh and ~/.dsh-tui as auth paths', () => {
+    expect(adapter.authPaths).toContain('~/.dsh');
+    expect(adapter.authPaths).toContain('~/.dsh-tui');
+  });
+
+  it('writeInput types text and presses Enter', async () => {
+    const sent: string[] = [];
+    const keys: string[][] = [];
+    const pty = {
+      sendText: (t: string) => { sent.push(t); return true; },
+      sendSpecialKeys: (...k: string[]) => { keys.push(k); return true; },
+    } as unknown as PtyHandle;
+    await adapter.writeInput!(pty, 'hello tui');
+    expect(sent).toEqual(['hello tui']);
+    expect(keys).toEqual([['Enter']]);
   });
 });
 
@@ -771,11 +850,17 @@ describe('cursor buildArgs', () => {
   const adapter = createCursorAdapter('/usr/bin/cursor-agent');
 
   it('fresh session passes trust/force/model flags without resume flags', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: false, model: 'gpt-5' });
+    const args = adapter.buildArgs({
+      sessionId: 'sess-cursor',
+      resume: false,
+      initialPrompt: 'first Lark turn',
+      model: 'gpt-5',
+    });
     expect(args).toContain('--trust');
     expect(args).toContain('--force');
     expect(args).toContain('--model');
     expect(args).toContain('gpt-5');
+    expect(args.at(-1)).toBe('first Lark turn');
     expect(args).not.toContain('--resume');
     expect(args).not.toContain('--continue');
   });
@@ -786,11 +871,13 @@ describe('cursor buildArgs', () => {
       sessionId: 'sess-cursor',
       resume: true,
       resumeSessionId: chatId,
+      initialPrompt: 'resume turn',
     });
     expect(args).toContain('--trust');
     expect(args).toContain('--resume');
     const idx = args.indexOf('--resume');
     expect(args[idx + 1]).toBe(chatId);
+    expect(args.at(-1)).toBe('resume turn');
     expect(args).not.toContain('--continue');
   });
 
@@ -814,6 +901,27 @@ describe('cursor buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: false, disableCliBypass: true });
     expect(args).toContain('--trust');
     expect(args).not.toContain('--force');
+  });
+
+  it('delivers the opening prompt through argv and enables post-ready type-ahead', () => {
+    expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    expect(adapter.readyPattern?.test('  → Plan, search, build anything')).toBe(true);
+    expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
+    expect(adapter.supportsTypeAhead).toBe(true);
+  });
+
+  it('readyPattern matches BOTH the empty-session and post-turn composer placeholders', () => {
+    // Cursor Agent 2026.08.11 renders `sessionEmpty ? "Plan, search, build
+    // anything" : "Add a follow-up"` and never reverts. The worker resets the
+    // IdleDetector (clearing readySeen) before every write, and quiescence-idle
+    // is suppressed until readyPattern is seen again — so if the pattern only
+    // matched the empty-session placeholder, turn 2+ would never re-seed ready
+    // and the CLI would be stuck reporting "working" forever. Both must match.
+    expect(adapter.readyPattern?.test('  → Plan, search, build anything')).toBe(true);
+    expect(adapter.readyPattern?.test('  → Add a follow-up')).toBe(true);
+    // Guard against over-broad matching: the arrow-prefixed composer glyph is
+    // required, so unrelated screen text with the phrase must not false-match.
+    expect(adapter.readyPattern?.test('Plan, search, build anything')).toBe(false);
   });
 });
 
@@ -1552,6 +1660,85 @@ describe('busyPattern', () => {
     expect(busy!.test('Working through the implementation')).toBe(false);
     expect(busy!.test('press esc to interrupt')).toBe(false);
   });
+
+  it('traex matches spinner-anchored working labels and standalone queue strings but not prose or idle composer', () => {
+    // Regression: a static capacity-queue screen matches readyPattern's
+    // `\d+% left` status-bar arm and survives the 2s quiescence window,
+    // flipping the card/Dashboard to Idle while the session is still waiting
+    // for capacity. The busyPattern must cover both the queue screen and the
+    // normal working indicator so the worker's deferPromptReadyWhileBusy
+    // backstop (and its idle probe) holds the session busy until a real
+    // terminal state.
+    //
+    // Every anchor below is extracted verbatim from the traex binary's
+    // compiled-in TUI string tables (verified across all 9 local releases,
+    // 0.201.1-alpha.5 … 0.201.2-alpha.2, both `traex` and
+    // `traex-code-mode-host`):
+    //   spinner frames:  "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    //   working labels:  "Working…", "Thinking…", "Pondering…",
+    //                    "Working it out…" (full rotation in traex.ts)
+    //   queue strings:   "Queued for capacity",
+    //                    "Too many requests right now. You're in the queue."
+    //   idle composer:   "Ask TraeCode CLI to do anything" + "100% context left"
+    // TraeX forked from Codex and DELETED the "esc to interrupt" footer hint
+    // (0 hits across all releases + the 94MB TUI logs), so the Codex
+    // pattern's second anchor is invalid here.
+    const busy = createTraexAdapter('/bin/traex').busyPattern;
+    expect(busy).toBeDefined();
+    // Spinner-anchored working labels: "<braille frame> <label>".
+    expect(busy!.test('⠋ Working…')).toBe(true);
+    expect(busy!.test('⠹ Thinking…')).toBe(true);
+    expect(busy!.test('⠸ Pondering…')).toBe(true);
+    expect(busy!.test('⠼ Working it out…')).toBe(true);
+    // Spinner-prefixed queue state: the queue screen can render a frozen
+    // braille frame in front of the label, and the label is part of the
+    // compiled-in spinner string table.
+    expect(busy!.test('⠋ Queued for capacity')).toBe(true);
+    // Standalone capacity-queue strings — the queue screen may render
+    // statically (no animating spinner), so no frame anchor is required.
+    // Line-anchored: bare line, indented line, and `at position N` suffix
+    // all match.
+    expect(busy!.test('Queued for capacity')).toBe(true);
+    expect(busy!.test('  Queued for capacity')).toBe(true);
+    expect(busy!.test('Queued for capacity at position 3.')).toBe(true);
+    expect(busy!.test("Too many requests right now. You're in the queue.")).toBe(true);
+    expect(busy!.test("Too many requests right now. You're in the queue at position 3.")).toBe(true);
+    // Mid-sentence prose quotes must NOT match — the line anchor is the
+    // discriminator for the standalone arms (the braille frame for the
+    // spinner arms).
+    expect(busy!.test('The status line says Queued for capacity right now')).toBe(false);
+    expect(busy!.test("It printed Too many requests right now. You're in the queue. and stopped")).toBe(false);
+    // Idle composer must NOT match.
+    expect(busy!.test('› Ask TraeCode CLI to do anything                        100% context left')).toBe(false);
+    // Prose must NOT match — the braille frame anchor is the discriminator.
+    expect(busy!.test('Working… on the fix')).toBe(false);
+    expect(busy!.test('Working through the implementation')).toBe(false);
+    expect(busy!.test('press esc to interrupt')).toBe(false);
+  });
+
+  it('traex staticBusyPattern latches only on line-anchored queue evidence', () => {
+    // The pre-idle static latch (ZMX gap) consumes queue evidence straight
+    // from the PTY byte stream — see TRAEX_STATIC_BUSY_PATTERN in traex.ts.
+    // It must match every queue-screen shape (bare / indented / spinner-
+    // prefixed / at-position suffix / ANSI-stripped by IdleDetector) and
+    // must NOT match prose quotes or the idle composer.
+    const staticBusy = createTraexAdapter('/bin/traex').staticBusyPattern;
+    expect(staticBusy).toBeDefined();
+    expect(staticBusy!.test('Queued for capacity')).toBe(true);
+    expect(staticBusy!.test('  Queued for capacity')).toBe(true);
+    expect(staticBusy!.test('Queued for capacity at position 3.')).toBe(true);
+    expect(staticBusy!.test('⠋ Queued for capacity')).toBe(true);
+    expect(staticBusy!.test("Too many requests right now. You're in the queue.")).toBe(true);
+    expect(staticBusy!.test("Too many requests right now. You're in the queue at position 3.")).toBe(true);
+    // Mid-sentence prose quotes must NOT latch.
+    expect(staticBusy!.test('The status line says Queued for capacity right now')).toBe(false);
+    expect(staticBusy!.test("It printed Too many requests right now. You're in the queue. and stopped")).toBe(false);
+    // Idle composer must NOT latch.
+    expect(staticBusy!.test('› Ask TraeCode CLI to do anything                        100% context left')).toBe(false);
+    // Working labels without the queue string must NOT latch — the latch is
+    // queue-only; ordinary working turns are covered by the spinner guard.
+    expect(staticBusy!.test('⠋ Working…')).toBe(false);
+  });
 });
 
 describe('idleToBusyPattern', () => {
@@ -1572,6 +1759,26 @@ describe('idleToBusyPattern', () => {
     expect(adapter.idleToBusyPattern!.source).toBe(adapter.busyPattern!.source);
     expect(adapter.idleToBusyPattern!.test('● Working... (esc to interrupt)')).toBe(true);
     expect(adapter.idleToBusyPattern!.test('Working through the implementation')).toBe(false);
+  });
+
+  it('traex opts into idle→busy recovery with the same strict active marker as busyPattern', () => {
+    // The capacity-queue screen can render AFTER a false idle was already
+    // published (readyPattern's `\d+% left` arm matched the status bar and
+    // quiescence fired). idleToBusyPattern must flip the session back to
+    // working when the queue marker or a working spinner label appears in
+    // the PTY stream. Strings are the same binary-extracted anchors as the
+    // busyPattern test above.
+    const adapter = createTraexAdapter('/bin/traex');
+    expect(adapter.idleToBusyPattern).toBeDefined();
+    expect(adapter.idleToBusyPattern!.source).toBe(adapter.busyPattern!.source);
+    // Spinner-anchored working labels.
+    expect(adapter.idleToBusyPattern!.test('⠋ Working…')).toBe(true);
+    expect(adapter.idleToBusyPattern!.test('⠙ Pondering…')).toBe(true);
+    // Standalone queue strings.
+    expect(adapter.idleToBusyPattern!.test('Queued for capacity')).toBe(true);
+    expect(adapter.idleToBusyPattern!.test("Too many requests right now. You're in the queue.")).toBe(true);
+    // Prose without the braille frame anchor must NOT flip idle→busy.
+    expect(adapter.idleToBusyPattern!.test('Working… on the fix')).toBe(false);
   });
 
   it.each([
