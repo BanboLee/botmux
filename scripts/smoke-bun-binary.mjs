@@ -32,7 +32,7 @@
  */
 
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, copyFileSync, chmodSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -179,6 +179,64 @@ for (;;) {
   await delay(250);
 }
 console.log(`smoke: ✅ http — dashboard is serving (status ${served})`);
+
+// ── 5. the wrapper write must NOT destroy an install.sh-style binary ─────────
+// REGRESSION GUARD for a shipped bug this smoke test used to walk straight past.
+//
+// install.sh puts the compiled binary at `~/.botmux/bin/botmux`, and the daemon's
+// writePidFile() writes its `botmux` wrapper to that SAME path. Under a compiled
+// binary the Node-shaped wrapper content is `exec node "/$bunfs/root/cli.js"` — a
+// process-private path — so the write replaced the running executable: a
+// 94,582,912-byte ELF became a 47-byte script (inode changed).
+//
+// Why checks 1-4 could not catch it: they run with `bots.json = '[]'`, so no bot
+// daemon ever spawns, and writePidFile lives in the daemon. This check exercises
+// the collision directly instead of booting a full bot (which would need real
+// Feishu credentials): copy the binary to the wrapper path, run the daemon entry
+// there, and assert the file is still the executable afterwards.
+const binDir = join(home, '.botmux', 'bin');
+mkdirSync(binDir, { recursive: true });
+const installedBinary = join(binDir, 'botmux');
+copyFileSync(binary, installedBinary);
+chmodSync(installedBinary, 0o755);
+const sizeBefore = statSync(installedBinary).size;
+
+// Run the DAEMON entry from the installed path so writePidFile() executes with
+// process.execPath === the wrapper target. It will exit on its own (no bots /no
+// credentials); we only care about the file afterwards, not its exit code.
+await new Promise((resolve) => {
+  const child = spawn(installedBinary, ['__daemon'], {
+    cwd: home, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let settled = false;
+  const finish = () => { if (!settled) { settled = true; resolve(); } };
+  child.on('exit', finish);
+  child.on('error', finish);
+  // Cap the wait: if it stays alive (a daemon legitimately might), the wrapper
+  // write has long since happened — writePidFile runs during startup.
+  setTimeout(() => {
+    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    finish();
+  }, 15_000);
+});
+
+const sizeAfter = statSync(installedBinary).size;
+const head = readFileSync(installedBinary).subarray(0, 32).toString('latin1');
+if (sizeAfter !== sizeBefore) {
+  fail(
+    'self-destruct',
+    `the daemon REPLACED its own binary at ${installedBinary}: `
+    + `${sizeBefore} bytes → ${sizeAfter} bytes. First bytes now: ${JSON.stringify(head)}. `
+    + 'The wrapper write must skip a target that is the running executable.',
+  );
+}
+if (head.startsWith('#!')) {
+  fail(
+    'self-destruct',
+    `the binary at ${installedBinary} is now a shell script (${JSON.stringify(head)}) — overwritten by the wrapper write.`,
+  );
+}
+console.log(`smoke: ✅ self-destruct guard — binary intact at the wrapper path (${sizeAfter} bytes)`);
 
 console.log('smoke: all checks passed');
 cleanup();
