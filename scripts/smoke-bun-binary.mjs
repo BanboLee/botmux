@@ -34,9 +34,15 @@
 import { spawn, execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, copyFileSync, chmodSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
-const binary = process.argv[2];
+// Resolve to an ABSOLUTE path immediately. Every spawn below runs with
+// `cwd: home` (a scratch dir, deliberately without node_modules), so a relative
+// argument like `dist-bin/botmux-linux-x64` would be resolved against THAT dir
+// and die with ENOENT — even though the existsSync check above it passes, since
+// that check runs against the script's own cwd. CI passes a repo-relative path,
+// which is exactly the case that broke; a local absolute path masked it.
+const binary = process.argv[2] ? resolve(process.argv[2]) : undefined;
 if (!binary) {
   console.error('usage: node scripts/smoke-bun-binary.mjs <path-to-binary>');
   process.exit(2);
