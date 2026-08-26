@@ -604,13 +604,33 @@ jobs:
     # own native runner (linux -> ubuntu, darwin -> macos-14), where build/Release
     # is correct; each runner emits both of its architectures.
     needs: [preflight]
+    # WHY a per-OS **and per-arch** matrix: node-pty's native `pty.node` (and
+    # macOS `spawn-helper`) must match the target. Bun can cross-compile the JS +
+    # runtime, but the embedded `.node` has to be the one `pnpm install` produced
+    # for that platform.
+    #
+    # darwin: node-pty SHIPS prebuilds (`prebuilds/darwin-{x64,arm64}/`), so one
+    # macOS runner can emit both arches.
+    # linux: node-pty ships NO linux prebuild — its install script is
+    # `node-gyp rebuild`, which compiles `build/Release/pty.node` for the HOST arch
+    # only. So an x64 runner cannot produce a linux-arm64 binary: the build script
+    # fails closed ("node-pty native not found for linux-arm64") rather than
+    # shipping a binary with the wrong native. Because the compile step loops with
+    # `set -e`, that failure also discarded the successfully-built linux-x64 in the
+    # same leg — and with the release order inverted, `binary-subpackages` and
+    # `release` both `needs` this job, so the whole publish chain stalled.
+    # Hence linux-arm64 gets its own native arm64 runner (`ubuntu-24.04-arm`,
+    # GA and free for public repos).
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            targets: bun-linux-x64 bun-linux-arm64
-            artifact: linux
+            targets: bun-linux-x64
+            artifact: linux-x64
+          - os: ubuntu-24.04-arm
+            targets: bun-linux-arm64
+            artifact: linux-arm64
           - os: macos-14
             targets: bun-darwin-x64 bun-darwin-arm64
             artifact: darwin
@@ -650,9 +670,11 @@ jobs:
           done
 
       - name: Smoke-test the host-arch binary
-        # Only the runner's OWN arch can execute here (a cross-compiled arm64
-        # binary cannot run on an x64 runner, so those are built but never
-        # executed — an accepted limitation of the per-OS matrix).
+        # Each leg executes the binary it just built for its OWN arch, so with the
+        # per-arch matrix every linux target is now genuinely run (linux-x64 on the
+        # x64 runner, linux-arm64 on the arm64 runner). Only darwin still has one
+        # cross-built arch that cannot be executed here: the macOS leg emits both
+        # x64 and arm64 from prebuilds, and a runner can only run its own.
         #
         # Shares scripts/smoke-bun-binary.mjs with the CI `bun-binary` job so the
         # release gate is never weaker than the PR gate. It used to run only
