@@ -404,6 +404,12 @@ export interface DaemonSession {
   };
   usageLimit?: CliUsageLimitState;
   usageLimitRetryTimer?: NodeJS.Timeout;
+  /** Latch for the proactive rate/usage-limit owner notification: the
+   *  usageLimitStateKey of the limit episode we already posted about. Exactly
+   *  one owner notification per episode; reset to undefined by
+   *  clearUsageLimitState (limit self-heal / turn end) so the next episode can
+   *  notify again. In-memory only. */
+  rateLimitNotifiedKey?: string;
   /** Interval that re-PATCHes the live streaming card with fresh Context/Token
    *  usage while a turn is executing (streaming display mode). Armed on the
    *  working edge, cleared on idle/turn-end/card removal. */

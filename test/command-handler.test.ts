@@ -4225,6 +4225,37 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('新话题');
       expect(replyContent).toContain('静默模式');
     });
+
+    it('defaults to group top-level when created from a topic/adopt session (no position modifier)', async () => {
+      // A schedule born inside a topic (including an adopted one) must not pin
+      // its results to that topic. Without an explicit modifier the default is
+      // top-level and the root bookmark is dropped.
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'cron', expr: '0 9 * * *', display: '每日 09:00' },
+        prompt: '生成日报',
+        name: '生成日报',
+      });
+      // Default extractScheduleModifiers mock returns no executionPosition.
+      vi.mocked(scheduler.extractScheduleModifiers).mockImplementation((prompt: string) => ({
+        deliver: 'origin' as const,
+        silent: false,
+        prompt,
+      }));
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-topic-default' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-03-28T09:00:00+08:00'));
+
+      // Simulate a topic-scope (adopt) session: scope is 'thread'.
+      const ds = makeDaemonSession({ scope: 'thread' });
+      const deps = makeDeps(ds);
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每日9:00 生成日报'), deps, LARK_APP_ID);
+
+      expect(scheduler.addTask).toHaveBeenCalledTimes(1);
+      const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(callArgs.executionPosition).toBe('top-level');
+      expect(callArgs.scope).toBe('chat');
+      // The adopt topic root must not be retained as a bookmark.
+      expect(callArgs.rootMessageId).toBeUndefined();
+    });
   });
 
   // ─── /login ─────────────────────────────────────────────────────────────

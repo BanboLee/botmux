@@ -7410,6 +7410,15 @@ dialog.onboarding-dialog::backdrop {
   gap: 10px;
   align-items: center;
 }
+.roles-listener-content-policy {
+  display: grid;
+  gap: 8px;
+}
+.roles-listener-content-policy textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+}
 .roles-listener-policy {
   display: inline-flex;
   align-items: center;

@@ -1683,6 +1683,9 @@ export function clearUsageLimitState(ds: DaemonSession): void {
     ds.usageLimitRetryTimer = undefined;
   }
   ds.usageLimit = undefined;
+  // Re-arm the proactive rate-limit notification latch: the next limit episode
+  // (even one with the same usageLimitStateKey) must notify the owner again.
+  ds.rateLimitNotifiedKey = undefined;
   persistStreamCardState(ds);
 }
 
@@ -10847,14 +10850,18 @@ function setupWorkerHandlers(
           });
           // Usage ledger: any settle-to-idle/limited edge records the delta.
           // Turn reactions are stricter — only flip ✋→✅ after a real busy
-          // period (working/analyzing). Cold-start starting→idle (or the first
-          // prompt-ready before the turn has gone working) must NOT DONE a
-          // message that is still about to be / just being processed. Grok
-          // card-off sessions hit this when the ready-gate settle fired idle
-          // ~seconds after GoGoGo while the CLI was still running the prompt.
+          // period (working/analyzing) that settles to IDLE. A limited settle
+          // is a blocked turn, not completion: DONE-ing ✋ on working→limited
+          // made users think the task finished while the CLI was stuck (the
+          // rate-limit notification below owns that attention instead).
+          // Cold-start starting→idle (or the first prompt-ready before the turn
+          // has gone working) must NOT DONE a message that is still about to be
+          // / just being processed. Grok card-off sessions hit this when the
+          // ready-gate settle fired idle ~seconds after GoGoGo while the CLI
+          // was still running the prompt.
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
-            if (prevStatus === 'working' || prevStatus === 'analyzing') {
+            if (ds.lastScreenStatus === 'idle' && (prevStatus === 'working' || prevStatus === 'analyzing')) {
               void finishTurnReactions(ds);
             }
           }
@@ -10876,6 +10883,46 @@ function setupWorkerHandlers(
         }
 
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) { clearUsageRefreshTimer(ds); break; }
+
+        // Proactive rate/usage-limit notification. The streaming-card PATCH
+        // (card-on) carries no unread/mention signal, and card-off sessions
+        // skip card output entirely — so without a fresh message here the owner
+        // never learns the CLI is blocked (the turn just stalls). Fire on the
+        // working/other→limited edge, AFTER the managed/silent fence above but
+        // BEFORE the card-off early-break below (card-off sessions must still
+        // get this ping), once per limit episode: the latch is keyed on
+        // usageLimitStateKey and reset by clearUsageLimitState (self-heal /
+        // turn end), so the same episode's repeated limited ticks stay quiet
+        // while the next episode notifies again.
+        //
+        // Recovery-window exclusion: usageLimit is in-memory. When the CLI got
+        // limited WHILE the daemon was down (common for tmux/adopt restores),
+        // restore has no usageLimit to seed lastScreenStatus='limited' from,
+        // so the first post-restart limited tick is a false (empty→limited)
+        // edge. The in-memory latch also died with the old process, so without
+        // this guard the restart-silence contract would be broken by one @owner
+        // ping. The owner already got the private recovery DM summary; hold the
+        // ping until a real user turn clears suppressRecoveryCard.
+        if (
+          ds.lastScreenStatus === 'limited'
+          && prevStatus !== 'limited'
+          && ds.usageLimit
+          && !ds.suppressRecoveryCard
+          && ds.rateLimitNotifiedKey !== usageLimitStateKey(ds.usageLimit)
+        ) {
+          ds.rateLimitNotifiedKey = usageLimitStateKey(ds.usageLimit);
+          const limit = ds.usageLimit;
+          const notifyBody = tr(
+            limit.kind === 'usage' ? 'worker.rate_limit_notify.usage' : 'worker.rate_limit_notify.rate',
+            { cliName: sessionCliDisplayName(ds, botCfg), retryLabel: limit.retryLabel },
+            loc,
+          );
+          const ownerOpenId = ds.session.ownerOpenId;
+          const notifyText = ownerOpenId ? `<at id=${ownerOpenId}></at> ${notifyBody}` : notifyBody;
+          scopedReply(notifyText, 'text', msg.turnId).catch((err: any) => {
+            logger.debug(`[${t}] Failed to deliver rate-limit notification: ${err?.message ?? err}`);
+          });
+        }
 
         // Bot opted out of the streaming card — dashboard SSE above already got
         // the status patch; just don't touch any Lark card. Turn-exact: a

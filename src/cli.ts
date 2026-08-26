@@ -7932,6 +7932,7 @@ interface CurrentSession {
   larkAppId?: string;
   chatType?: 'group' | 'p2p';
   scope?: 'thread' | 'chat';
+  ownerOpenId?: string;
 }
 
 /** Detect current session info from ancestor marker + session files. */
@@ -7949,6 +7950,7 @@ function detectCurrentSession(): CurrentSession | null {
     larkAppId: s.larkAppId,
     chatType: s.chatType,
     scope: s.scope,
+    ownerOpenId: s.ownerOpenId,
   };
 }
 
@@ -8363,13 +8365,18 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       console.error('无法推断 chat-id。请加上 --chat-id <CHAT_ID>，或从 Lark 话题内的 CLI 会话中运行本命令。');
       process.exit(1);
     }
+    // Default to group top-level: a schedule created inside a topic session
+    // (including an adopted one) must not pin its results to that topic.
+    // --topic opts in explicitly; p2p sessions keep the legacy inference.
     const executionPosition: 'top-level' | 'topic' | 'new-topic' = wantsNewTopic
       ? 'new-topic'
       : wantsTopLevel
         ? 'top-level'
         : wantsTopic
           ? 'topic'
-          : cur?.scope === 'chat' ? 'top-level' : rootMessageId ? 'topic' : 'top-level';
+          : cur?.chatType === 'p2p'
+            ? (cur?.scope === 'chat' ? 'top-level' : rootMessageId ? 'topic' : 'top-level')
+            : 'top-level';
     const scope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
     if (scope === 'thread' && !rootMessageId) {
       console.error('话题下执行需要 --root-msg-id <ROOT_MESSAGE_ID>，或从 Lark 话题会话中运行。');
@@ -8401,11 +8408,18 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         prompt: promptArg,
         workingDir,
         chatId,
-        rootMessageId,
+        // Only topic execution keeps the captured root; at top-level the root
+        // is dropped so toggles can never pull execution back into the
+        // originating (e.g. adopted) topic.
+        rootMessageId: executionPosition === 'topic' ? rootMessageId : undefined,
         larkAppId,
         creatorChatId: cur?.chatId,
         creatorRootMessageId: cur?.rootMessageId,
         creatorLarkAppId: cur?.larkAppId,
+        // Stamp the creator (sandboxed session owner) so the task's scheduled
+        // turns can authenticate workflow commands as them. The daemon
+        // re-checks the owner is still allowed at every run mutation.
+        ownerOpenId: process.env.BOTMUX_OWNER_OPEN_ID ?? cur?.ownerOpenId,
         chatType: cur?.chatType === 'p2p' ? 'p2p' : 'topic_group',
         scope,
         executionPosition,

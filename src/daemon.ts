@@ -65,6 +65,7 @@ import {
   getBot,
   getAllBots,
   getOwnerOpenId,
+  getDashboardAdminOpenIds,
   findOncallChat,
   effectiveDefaultWorkingDir,
   effectiveBotDisplayName,
@@ -5992,6 +5993,21 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
           : undefined,
         selfLarkAppId: selfV3LarkAppId,
         baseDir: v3DefaultBaseDir(),
+        sessionDataDir: config.session.dataDir,
+        // Live owner gate for scheduled turns: the task creator must still be
+        // in the bot's resolvedAllowedUsers, so removing a creator revokes
+        // their scheduled tasks' workflow authority immediately.
+        // 镜像 canOperate 语义：未配白名单的开放 bot 恒放行（否则开放 bot 的
+        // 定时 workflow 会被一律拒绝且报误导性「不在授权名单」错误）。
+        isScheduleOwnerAllowed: (larkAppId, ownerOpenId) => {
+          const bot = getBot(larkAppId);
+          const hasAllowlist = (bot.config.allowedUsers?.length ?? 0) > 0
+            || (bot.config.allowedChatGroups?.length ?? 0) > 0
+            || (bot.config.globalGrants?.length ?? 0) > 0
+            || bot.config.p2pOpen === true;
+          if (!hasAllowlist) return true;
+          return getDashboardAdminOpenIds(larkAppId).includes(ownerOpenId);
+        },
       });
       if (!decision.ok) {
         return jsonRes(res, decision.status, {

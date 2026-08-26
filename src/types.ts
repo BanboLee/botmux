@@ -879,6 +879,17 @@ export interface ScheduledTask {
   creatorChatId?: string;
   creatorRootMessageId?: string;
   creatorLarkAppId?: string;
+  /** Creator's Lark open_id captured at creation time. Daemon-initiated
+   *  scheduled turns (`schedule:<taskId>:<uuid>`) authenticate workflow
+   *  commands as this identity. On the sandboxed relay path the daemon
+   *  re-checks it is still in the bot's resolvedAllowedUsers before every
+   *  run mutation; the default non-sandboxed signed-envelope route (and
+   *  `botmux workflow run`) verifies the shared secret but does not re-check
+   *  membership — see scheduled-turn-provenance for the exact boundary.
+   *  Absent for legacy tasks and CLI-created tasks without a resolvable
+   *  creator — those keep the historical behavior (scheduled turns cannot
+   *  run Saved Workflows). */
+  ownerOpenId?: string;
   enabled: boolean;
   createdAt: string;
   lastRunAt?: string;

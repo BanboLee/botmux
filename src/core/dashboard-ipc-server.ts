@@ -219,7 +219,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, MAX_TURN_TIMEOUT_MS, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, MAX_TURN_TIMEOUT_MS, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -2941,12 +2941,19 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       prompt,
       workingDir: typeof b.workingDir === 'string' ? b.workingDir : process.cwd(),
       chatId,
-      rootMessageId: rootMessageId || undefined,
+      // Only topic execution retains a root anchor; at top-level/new-topic the
+      // root is dropped so it can never pull execution back into the topic the
+      // schedule was created from (e.g. an adopted one).
+      rootMessageId: executionPosition === 'topic' ? (rootMessageId || undefined) : undefined,
       scope: executionPosition === 'topic' ? 'thread' : 'chat',
       executionPosition,
       topicTitle: topicTitle || undefined,
       chatType: 'group',
       larkAppId: cachedLarkAppId,
+      // Stamp the bot owner as creator: dashboard is local + token-protected,
+      // and the daemon re-checks the owner is still allowed at every run
+      // mutation (scheduled-turn-provenance).
+      ownerOpenId: getOwnerOpenId(cachedLarkAppId),
       deliver,
       silent,
     });
