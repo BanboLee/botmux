@@ -27,6 +27,30 @@ pnpm build:bun            # 打自包含单文件二进制（scripts/build-bun-b
 
 **测试里 spawn 子进程必须走 `test/helpers/ts-runner.ts`**，不要写 `spawn(process.execPath, ['--import','tsx', …])`：那是 Node-only 形态，Bun 下 `process.execPath` 是 bun 二进制、`bun --import tsx` 不合法，子进程会全部起不来。helper 按运行时解析（Node 加 tsx loader、Bun 原生跑 TS）。片段里 import 仓库模块（`.js` specifier 实际是 `.ts`）时用 `spawnTsEvalWithRepoImports`，普通 `spawnTsEval` 在 Node 下会 ERR_MODULE_NOT_FOUND。
 
+worktree 里也能直接用 bun，且**不额外占依赖体积**——只要不跑 install（见下节）。`bun run <script>` 可以代替 `pnpm run <script>`。实测在「源码 + `node_modules` symlink 到 canonical」的 worktree 里，`bun src/cli.ts`、`bun run build`、`tsc`、`vitest`、`build:bun`（`pty.node` 经 symlink 解析，不复制）以及编出二进制跑 smoke 六项，全部正常。
+
+### worktree 的 node_modules：共享还是独立（改前必读）
+
+worktree 的 `node_modules` **形态不统一**，是逐个手工决定的，不是包管理器行为：
+
+| 形态 | 体积 | 风险 |
+|---|---|---|
+| symlink → canonical | 0 字节 | 见下面两条 🔴 |
+| 独立 `pnpm install` | ~750M | 安全，互不影响 |
+
+**🔴 铁律：绝不在 worktree 里跑任何 install（`pnpm install` / `bun install` 都算）。** 理由不是「浪费一次重装」，是下面两条实测出来的后果——而且它们**与包管理器无关**，bun 和 pnpm 在「穿透 symlink 写进被指向目录」上逐字同构：
+
+1. **两个 worktree 同时 symlink 到同一个目标时，`pnpm install` 会失败并把共享目录删掉**：
+   ```
+   ENOTDIR: not a directory, mkdir '<worktree>/node_modules'
+   → 目标目录被删除
+   ```
+   单个 symlink 时 exit 0、目标完好；双 symlink 指同一目标时 exit 236 且目标被清掉（`bun install` 同场景 exit 0、目标完好）。canonical 的 `node_modules` 是 ~50 个 live daemon 的依赖来源——`/proc/<pid>/maps` 里能看到它们 mmap 着 `node_modules/.pnpm/node-pty@*/…/pty.node`。已在跑的进程靠 inode 存活不会立刻崩，但**任何重启、spawn worker、或新起 CLI 会话都会失败**，等于 fleet 不可恢复。
+
+2. **共享依赖时，后装的 worktree 会静默覆盖先装的版本**：A 要 `ms@2.1.3`、B 要 `ms@2.0.0`、共享同一 `node_modules` → B 装完后 **A 解析到 `2.0.0`**，而 A 的 `package.json` 写的是 `2.1.3`。**exit 0，零报错零警告**，症状会在完全无关的地方冒出来。
+
+所以：**依赖需求与 canonical 完全一致**时才用 symlink（省 750M）；一旦分支动了 `package.json` / lockfile，就该独立 install，并且**在 worktree 之外**做（比如把改动推上去让 CI 装，或在 canonical 上装完再 symlink）。
+
 ### 编译态（单文件二进制）注意
 
 编译版里没有 `dist/` 落在磁盘上——模块图在虚拟只读的 `/$bunfs/` 下，`__dirname` 是 `/$bunfs/root`。所以**任何把 `__dirname` 拼出的路径写到磁盘、或交给别的进程用的代码，在编译态都是坏的**（那个路径进程外不存在，且 sh 里未转义的 `$bunfs` 还会被展开成空串）。曾因此把 install.sh 装在 `~/.botmux/bin/botmux` 的二进制**覆盖成 47 字节的壳**。判断运行形态用 `isStandaloneBinary()`（`src/core/self-spawn.ts`），子进程一律走 `resolveEntrySpawn` / `spawnWorker` re-exec `process.execPath`，不要拼 `dist/*.js` 路径。
