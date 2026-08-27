@@ -14,8 +14,9 @@ import { join, resolve } from 'node:path';
  *
  * Every assertion below corresponds to a failure mode that was REPRODUCED by hand
  * first, because each one fails silently or destructively in production:
- *   · optionalDependencies committed to package.json → ERR_PNPM_OUTDATED_LOCKFILE
- *     on every CI job (repo installs with --frozen-lockfile everywhere).
+ *   · optionalDependencies committed to package.json → `error: lockfile had
+ *     changes, but lockfile is frozen` on every CI job (repo installs with
+ *     --frozen-lockfile everywhere).
  *   · `npm version` does not rewrite dependency ranges → a committed "0.0.0" would
  *     point at a version that never exists, npm skips the optional dep, and the
  *     launcher finds no binary. Silent degradation.

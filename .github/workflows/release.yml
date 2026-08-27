@@ -419,8 +419,9 @@ jobs:
         # package.json, for two measured reasons:
         #
         #  1. `bun install --frozen-lockfile` (used by every job in this repo)
-        #     fails with ERR_PNPM_OUTDATED_LOCKFILE when package.json names a
-        #     dependency the lockfile does not — it would turn all of CI red.
+        #     fails with `error: lockfile had changes, but lockfile is frozen`
+        #     when package.json names a dependency the lockfile does not — it
+        #     would turn all of CI red.
         #  2. `npm version` does not rewrite dependency ranges, so a committed
         #     "0.0.0" would stay "0.0.0" and point at a version that never
         #     exists. npm treats an unresolvable OPTIONAL dep as a silent no-op,

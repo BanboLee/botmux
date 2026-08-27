@@ -6,10 +6,9 @@
  * ── WHY THIS IS NOT JUST CHECKED INTO package.json ─────────────────────────────
  * Two independent reasons, both measured rather than assumed:
  *
- * 1. `pnpm install --frozen-lockfile` would fail on every CI job. Adding the four
- *    entries to package.json without regenerating pnpm-lock.yaml produces:
- *      ERR_PNPM_OUTDATED_LOCKFILE ... specifiers in the lockfile don't match
- *      specs in package.json
+ * 1. `bun install --frozen-lockfile` would fail on every CI job. Adding the four
+ *    entries to package.json without regenerating bun.lock produces:
+ *      error: lockfile had changes, but lockfile is frozen
  *    Verified by reproducing it in a scratch package. Every workflow in this repo
  *    installs with --frozen-lockfile, so a committed-but-unlocked optional dep
  *    turns the whole pipeline red.

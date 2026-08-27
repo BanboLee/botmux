@@ -23,6 +23,9 @@ bun run daemon:logs
 > `node-pty`: bun does not run dependency lifecycle scripts by default, and
 > `node-pty` needs its install hook to build `build/Release/pty.node` — without
 > it the PTY layer is dead and the compiled single-file binary cannot be built.
+> The list is deliberately just `["electron","node-pty"]` (identical to the
+> `onlyBuiltDependencies` it replaced) — don't "complete" it by adding esbuild:
+> its binary comes from the `@esbuild/<platform>` package, not its postinstall.
 >
 > This is about *building botmux from source*. How **end users install botmux**
 > is a separate matter — `pnpm i -g botmux` is still a supported install path

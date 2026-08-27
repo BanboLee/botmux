@@ -14,7 +14,9 @@ bun run daemon:logs          # 查看日志
 
 **包管理器是 bun**（`packageManager: bun@1.4.0`，锁文件 `bun.lock`）。装依赖用 `bun install --frozen-lockfile`。
 
-⚠️ `trustedDependencies: ["node-pty","esbuild","electron"]` **不能删**：bun 默认**不跑依赖的生命周期脚本**，而 `node-pty` 要靠它 `node-gyp` 编出 `build/Release/pty.node` —— 少了这个，PTY 全废、编译版二进制也打不出来（`pty.node` 是被嵌进去的）。esbuild/electron 的 postinstall 则负责下载各自平台的二进制。
+⚠️ `trustedDependencies: ["electron","node-pty"]` **不能删**：bun 默认**不跑依赖的生命周期脚本**，而 `node-pty` 要靠它 `node-gyp` 编出 `build/Release/pty.node` —— 少了这个，PTY 全废、编译版二进制也打不出来（`pty.node` 是被嵌进去的）。electron 的 postinstall 负责下载对应平台的二进制。
+
+这个名单**刻意只有两项**（与 pnpm 时代的 `onlyBuiltDependencies` 逐字一致），别照着"顺手补全"往里加 esbuild —— 实测 esbuild 虽然有 postinstall，但它的二进制由 `@esbuild/<platform>` 平台包直接提供：空白目录里 `bun install esbuild` 不跑任何脚本，`esbuild --version` 照样输出 0.28.2。加进白名单只会让 bun 比 pnpm 多跑脚本、扩大两者的行为差异，与迁移目标相反。
 
 注意与「用户怎么装 botmux」区分开：`install-diagnostics.ts` 的 `InstallKind`（含 `'pnpm-global'`）与 `maintenance.ts` 的自动更新说的是**终端用户的安装方式**，线上确实有人 `pnpm i -g botmux`。那些**不是**本仓库的构建工具链，不要跟着一起改。
 
