@@ -82,6 +82,27 @@ jobs:
       # The platform's own install compiles node-pty's build/Release/pty.node for
       # this OS/arch, which the embed plugin bundles into the binary.
       - run: pnpm install --frozen-lockfile
+
+      - name: Stamp a synthetic version (mirrors the release job)
+        # WHY THIS EXISTS: the compiled binary has no package.json on disk, so the
+        # build BAKES the version in at compile time by reading package.json —
+        # and in the repo that file carries the unbuilt `0.0.0` placeholder, which
+        # the runtime deliberately treats as "nothing baked" (a locally-compiled
+        # dev binary must not report 0.0.0 as authoritative). Compiling straight
+        # from the placeholder therefore yields `--version: unknown`, which is the
+        # exact regression the smoke gate below exists to catch.
+        #
+        # release.yml stamps the real version from the git tag BEFORE compiling
+        # ("Sync version from git tag"). CI has no tag, so stamp a synthetic one
+        # here — same ORDER as release, so this job exercises the same shape the
+        # shipped artifact is built with instead of a placeholder-only path that
+        # can never satisfy the gate.
+        #
+        # Runs after `pnpm install --frozen-lockfile` on purpose: `npm version`
+        # rewrites package.json, and pnpm's frozen-lockfile check must see the
+        # committed file. The workspace is ephemeral, so nothing is committed back.
+        run: npm version "0.0.0-ci.${{ github.run_number }}" --no-git-tag-version --allow-same-version
+
       - run: pnpm build
 
       - name: Compile the host-arch Bun binary
