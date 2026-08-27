@@ -554,6 +554,49 @@ describe('codex-app buildArgs', () => {
     expect(args).toContain('thread-123');
   });
 
+  it('canonicalizes a symlinked codex so --codex-bin matches the sandbox-authorized path', () => {
+    // Regression, same class as the dsh case below: `codex` on PATH is commonly a
+    // symlink CHAIN — measured on the dev box, ~/.local/bin/codex →
+    // …/standalone/current/bin/codex → …/releases/<version>/bin/codex, where the
+    // middle `current` hop re-points on every upgrade. The file sandbox authorizes
+    // only dirname(realpath(bin)) (worker.ts `execDirs`), while
+    // codex-app-runner.ts spawns --codex-bin verbatim → `execvp … No such file or
+    // directory` inside the sandbox and an app-server crash-loop.
+    //
+    // Verified against a real bwrap sandbox: raw path → execvp ENOENT, canonical
+    // path → exit 0. All three call sites must agree, since they share one cache.
+    const root = mkdtempSync(join(tmpdir(), 'codex-symlink-'));
+    try {
+      const realDir = join(root, 'releases', '1.2.3', 'bin');
+      mkdirSync(realDir, { recursive: true });
+      const realBin = join(realDir, 'codex');
+      writeFileSync(realBin, '#!/bin/sh\n', { mode: 0o755 });
+      // Two hops, mirroring the real install: link/codex → current/codex → realBin.
+      const midDir = join(root, 'current', 'bin');
+      mkdirSync(midDir, { recursive: true });
+      const midBin = join(midDir, 'codex');
+      symlinkSync(realBin, midBin);
+      const linkDir = join(root, 'local', 'bin');
+      mkdirSync(linkDir, { recursive: true });
+      const linkBin = join(linkDir, 'codex');
+      symlinkSync(midBin, linkBin);
+
+      const symlinkAdapter = createCodexAppAdapter(linkBin);
+      const canonicalReal = realpathSync(realBin);
+      expect(linkBin).not.toBe(canonicalReal); // the hazard exists in this fixture
+
+      const args = symlinkAdapter.buildArgs({ sessionId: 's', resume: false });
+      const binIdx = args.indexOf('--codex-bin');
+      expect(binIdx).toBeGreaterThanOrEqual(0);
+      expect(args[binIdx + 1]).toBe(canonicalReal);
+      // Must equal the argv exactly — the sandbox authorizes from THIS list while
+      // the runner spawns the argv; any divergence is the bug.
+      expect(symlinkAdapter.sandboxExtraExecPaths?.()).toEqual([canonicalReal]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('passes the opt-in browser bridge only to the Codex App runner', () => {
     const disabled = adapter.buildArgs({ sessionId: 'sess-app', resume: false });
     expect(disabled).not.toContain('--browser-family');
