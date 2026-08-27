@@ -41,15 +41,44 @@ interface Pm2God {
   pid: number;
 }
 
-/** Read a pm2 God's pid from its PM2_HOME/pm2.pid, if the God is alive. */
+/**
+ * Read a pm2 God's pid from its PM2_HOME/pm2.pid, if the God is alive.
+ *
+ * `pm2.pid` is the cheap, authoritative signal when present — but it is NOT
+ * always there. MEASURED on this dev box: a God had been supervising 50 botmux
+ * daemons for ~15 hours with NO pm2.pid in its PM2_HOME (only rpc.sock/pub.sock,
+ * pids/, and the logs). pm2 writes that file at daemon launch and removes it on
+ * shutdown, so a God whose file was cleaned up, rotated away, or never written by
+ * an older pm2 is invisible to a pid-file-only probe.
+ *
+ * That miss is not benign: the reaper exists so `botmux start/restart` can stop a
+ * pre-migration God before the new supervisor starts its OWN daemons. A silent
+ * no-op here means both fleets run at once — every bot doubled, two processes
+ * answering the same Feishu events.
+ *
+ * So fall back to the God's RPC socket, which is what the pm2 CLI itself connects
+ * through. `pm2 jlist` succeeds against exactly this God with no pid file at all
+ * (verified). We return pid 0 for a socket-only God: reaping drives everything
+ * through the pm2 CLI (`delete`/`kill`), none of which needs the pid — it is only
+ * reported for logging.
+ */
 function liveGodAt(home: string): Pm2God | null {
   const pidFile = join(home, 'pm2.pid');
-  if (!existsSync(pidFile)) return null;
-  let pid = 0;
-  try { pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10); } catch { return null; }
-  if (!Number.isSafeInteger(pid) || pid <= 1) return null;
-  try { process.kill(pid, 0); } catch { return null; } // God not actually alive
-  return { home, pid };
+  if (existsSync(pidFile)) {
+    let pid = 0;
+    try { pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10); } catch { pid = 0; }
+    if (Number.isSafeInteger(pid) && pid > 1) {
+      try {
+        process.kill(pid, 0);
+        return { home, pid };
+      } catch { /* stale pid file — fall through to the socket probe */ }
+    }
+  }
+  // No usable pid file. A live God still owns its RPC socket; if that exists,
+  // treat the God as present and let the pm2 CLI decide (a truly dead God's
+  // `jlist` fails, which the caller already handles).
+  if (existsSync(join(home, 'rpc.sock'))) return { home, pid: 0 };
+  return null;
 }
 
 /** Parse `pm2 jlist` stdout (may be prefixed by log lines) into the app array. */
@@ -126,7 +155,7 @@ export function reapLegacyPm2(configDir: string, pkgRoot: string, log: (m: strin
     if (!exclusive && botmuxNames.length === 0) continue;
 
     result.found = true;
-    log(`legacy pm2 God detected (PM2_HOME=${home}, pid ${god.pid}, ${botmuxNames.length} botmux row(s)${exclusive ? '' : ', shared home'}); reaping`);
+    log(`legacy pm2 God detected (PM2_HOME=${home}, pid ${god.pid > 0 ? god.pid : 'unknown (no pm2.pid; detected via rpc.sock)'}, ${botmuxNames.length} botmux row(s)${exclusive ? '' : ', shared home'}); reaping`);
 
     // Delete each botmux row (best-effort, one at a time so one failure doesn't
     // abort the rest).

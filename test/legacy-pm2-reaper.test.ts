@@ -48,6 +48,16 @@ function liveGodPidfile(home: string): void {
   writeFileSync(join(home, 'pm2.pid'), String(process.pid));
 }
 
+/** A live God that has NO pm2.pid — only its RPC socket. This is the shape
+ *  MEASURED on the dev box: a God supervising 50 botmux daemons for ~15 hours
+ *  with no pidfile in its PM2_HOME. A plain file stands in for the socket; the
+ *  reaper only tests existence, and creating a real unix socket would need a
+ *  listener. */
+function liveGodSocketOnly(home: string): void {
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, 'rpc.sock'), '');
+}
+
 describe('reapLegacyPm2', () => {
   it('no-ops fail-safe when there is no pm2 God pidfile (fresh install)', () => {
     const configDir = tmp();
@@ -94,6 +104,69 @@ describe('reapLegacyPm2', () => {
     expect(calls).not.toContain('delete botmux-plugin-x');
     expect(calls).not.toContain('delete some-other-app');
     expect(calls).toContain('kill');
+  });
+
+  // ── The gap that would have doubled the fleet ───────────────────────────────
+  // The reaper's whole job is to stop a pre-migration God BEFORE the new
+  // supervisor starts its own daemons. Detection used to require pm2.pid, and a
+  // real God was found running 50 botmux daemons with no such file — so the
+  // reaper silently no-opped and a `botmux restart` would have left both fleets
+  // live, two processes answering the same Feishu events.
+  it('detects a live God that has NO pm2.pid (socket-only), and reaps it', () => {
+    const configDir = tmp();
+    const pkgRoot = tmp();
+    const jlist = JSON.stringify([{ name: 'botmux-claude' }, { name: 'unrelated' }]);
+    const logFile = fakePm2(pkgRoot, { jlist });
+    liveGodSocketOnly(join(configDir, 'pm2'));
+
+    const r = reapLegacyPm2(configDir, pkgRoot);
+    expect(r.found).toBe(true);
+    expect(r.deleted).toEqual(['botmux-claude']);
+    expect(r.killed).toBe(true);
+    const calls = readFileSync(logFile, 'utf-8');
+    expect(calls).toContain('delete botmux-claude');
+    expect(calls).not.toContain('delete unrelated');
+    expect(calls).toContain('kill');
+  });
+
+  it('prefers a live pidfile over the socket probe (pid is reported)', () => {
+    const configDir = tmp();
+    const pkgRoot = tmp();
+    fakePm2(pkgRoot, { jlist: JSON.stringify([{ name: 'botmux' }]) });
+    const home = join(configDir, 'pm2');
+    liveGodPidfile(home);
+    liveGodSocketOnly(home); // both signals present
+    const r = reapLegacyPm2(configDir, pkgRoot);
+    expect(r.found).toBe(true);
+    expect(r.deleted).toEqual(['botmux']);
+  });
+
+  it('falls back to the socket when the pidfile is STALE (dead pid, God alive)', () => {
+    // pm2 can leave a stale pidfile behind. Before, a dead pid short-circuited to
+    // null even though the God was reachable — same double-run hazard.
+    const configDir = tmp();
+    const pkgRoot = tmp();
+    fakePm2(pkgRoot, { jlist: JSON.stringify([{ name: 'botmux-0' }]) });
+    const home = join(configDir, 'pm2');
+    mkdirSync(home, { recursive: true });
+    writeFileSync(join(home, 'pm2.pid'), '2147483646'); // not a live process
+    liveGodSocketOnly(home);
+    const r = reapLegacyPm2(configDir, pkgRoot);
+    expect(r.found).toBe(true);
+    expect(r.deleted).toEqual(['botmux-0']);
+  });
+
+  it('still no-ops when a stale pidfile is the ONLY signal (no socket)', () => {
+    // The negative half: without a socket there is no reachable God, so the
+    // fallback must not invent one. Otherwise every fresh/torn-down install
+    // would try to reap nothing on each start.
+    const configDir = tmp();
+    const pkgRoot = tmp();
+    mkdirSync(join(configDir, 'pm2'), { recursive: true });
+    writeFileSync(join(configDir, 'pm2', 'pm2.pid'), '2147483646');
+    const r = reapLegacyPm2(configDir, pkgRoot);
+    expect(r.found).toBe(false);
+    expect(r.killed).toBe(false);
   });
 
   it('is best-effort: a jlist failure is swallowed, not thrown', () => {
