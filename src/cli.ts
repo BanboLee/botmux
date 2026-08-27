@@ -2887,7 +2887,14 @@ function pm2GodAlive(home: string): boolean {
 }
 
 /** Does the SHARED pm2 home actually hold botmux apps? pm2 writes one pid file
- *  per app as `pids/<name>-<id>.pid`, so this answers it without running pm2. */
+ *  per app as `pids/<name>-<id>.pid`, so this answers it without running pm2.
+ *
+ *  BEST-EFFORT BY DESIGN, and deliberately not on any correctness path: this
+ *  only decides whether to PRINT a migration hint. If pm2 ever changes the
+ *  `pids/` layout this goes false-negative (the hint stays silent) — it can
+ *  never cause a wrong action. The authoritative detection is reapLegacyPm2's
+ *  `pm2 jlist`, which asks pm2 itself and is unaffected by this assumption.
+ *  Name matching is kept in step with that function's `isBotmuxPm2Name`. */
 function sharedHomeHasBotmuxRows(home: string): boolean {
   try {
     return readdirSync(join(home, 'pids')).some((f) =>
