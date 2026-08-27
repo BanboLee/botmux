@@ -21378,6 +21378,11 @@ async function waitForManagedActivationCommit(index: number, appId: string): Pro
 }
 
 export async function startDaemon(botIndex?: number): Promise<void> {
+  // 会话存储 SQLite 能力硬门：package.json engines 只要求 node>=22（npm 对
+  // 不匹配只告警；编译版走 bun:sqlite）。这里经 sqlite-compat 探测，失败
+  // 信息可行动，避免拖到首次落盘才炸。
+  sessionStore.assertSqliteSupported();
+
   // Survive a fire-and-forget rejection instead of dying from it. Installed here
   // rather than in index-daemon.ts on purpose: startDaemon has TWO entry points
   // (index-daemon.ts and index-core-only.ts), so guarding the entry file would
@@ -21390,6 +21395,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // live Lark session too. The rejection is logged loudly at error level — this
   // is a backstop for the next missed `.catch`, not permission to omit them.
   installDaemonRejectionGuard(logger);
+
   // Repair a shared tmux server polluted by an older botmux immediately on
   // daemon startup. This must not depend on restoring/spawning a bmx-* session:
   // a user-held tmux server can outlive every botmux pane and still leak stale
@@ -22053,9 +22059,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // so riff never triggers into a racing durable restore (codex P1).
 
   // Publish daemon ownership immediately after IPC binds, then perform the
-  // first session-file load under SessionStore's cross-process lock. An
-  // offline CLI either observes this descriptor and delegates, or it already
-  // holds the file lock; in the latter case this load waits and sees its atomic
+  // first session-store load under the store's cross-process write exclusion
+  // (the shared file lock on JSON, a BEGIN IMMEDIATE read on SQLite — a plain
+  // SELECT would NOT wait for an in-flight offline writer). An offline CLI
+  // either observes this descriptor and delegates, or it already holds the
+  // write exclusion; in the latter case this load waits and sees its atomic
   // mutation. Never load a stale cache in an unadvertised startup window.
   desc.lastHeartbeat = Date.now();
   writeDaemonDescriptor(desc);
