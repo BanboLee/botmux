@@ -28,11 +28,12 @@ import {
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { spawnWorker } from './self-spawn.js';
 import { resolveSessionLaunchModel } from './session-model.js';
-import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
+import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
+import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
@@ -425,6 +426,7 @@ import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.j
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
+import { snapshotProcessIdentities } from './current-actor-attestation.js';
 import { usageLimitStateKey, isActiveWorkRuntimeStatus, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import {
   evaluateVcMeetingManagedSend,
@@ -736,6 +738,7 @@ export function getActiveSessionsRegistry(): Map<string, DaemonSession> | undefi
  */
 export function isRelayableRealSession(ds: DaemonSession): boolean {
   if (ds.worker) return true;
+  if (ds.session.cliLaunchSnapshot) return true;
   if (ds.session.cliId) return true;
   if (ds.session.lastCliInput) return true;
   return false;
@@ -1142,7 +1145,7 @@ function tag(ds: DaemonSession): string {
 }
 
 function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
-  return ds.session.cliId ?? botCfg.cliId;
+  return ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId;
 }
 
 function ordinaryTurnRecoveryEligible(
@@ -1308,8 +1311,42 @@ function recordLaunchModel(ds: DaemonSession, model: string | undefined): void {
 
 function sessionAgentConfig(
   ds: DaemonSession,
-  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' },
-): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' } {
+  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[]; env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean },
+): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[] } {
+  const selected = ds.session.cliLaunchSnapshot;
+  if (selected) {
+    if (selected.cliId.toLowerCase() === 'riff') throw new Error('CLI selection rejected: Riff requires bot-level backend configuration and cannot be selected per session');
+    if (botCfg.env && Object.keys(botCfg.env).length > 0) throw new Error('CLI selection rejected: bot env is configured');
+    if (botCfg.backendType === 'riff' || botCfg.riff !== undefined) throw new Error('CLI selection rejected: Riff is configured');
+    if (botCfg.codexRpcInput === true && !RPC_CAPABLE_CLIS.has(selected.cliId)) {
+      throw new Error(`CLI selection rejected: ${selected.cliId} cannot use codexRpcInput`);
+    }
+    const runtime = selected.cliRuntime ?? undefined;
+    const legacyPath = selected.cliPathOverride ?? undefined;
+    const wrapperCli = selected.wrapperCli ?? undefined;
+    const reasoningEffort = selected.reasoningEffort ?? undefined;
+    const launchShell = selected.launchShell ?? undefined;
+    const startupCommands = [...selected.startupCommands];
+    if (selected.state === 'pending') {
+      selected.state = 'resolved';
+      ds.session.cliId = selected.cliId;
+      ds.session.cliRuntime = runtime;
+      ds.session.cliPathOverride = legacyPath;
+      ds.session.wrapperCli = wrapperCli;
+      ds.session.reasoningEffort = reasoningEffort;
+      ds.session.agentFrozen = true;
+      sessionStore.updateSession(ds.session);
+    }
+    // Model is NOT frozen from the snapshot (which carries none): resolve it live
+    // like every other spawn (#773) AFTER cliId is stamped, so resolveSessionLaunchModel
+    // compares against the selected CLI. Cross-CLI (the /cli use case) → cliMatchesBot
+    // is false → no bot model leaks to a different CLI; same-CLI keeps the bot's model
+    // and stays consistent with in-place restarts (latestModelForRespawn), which never
+    // pass through this snapshot branch. spawnModelOverride is honored automatically.
+    const model = resolveSessionLaunchModel(ds, botCfg);
+    recordLaunchModel(ds, model);
+    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, model, reasoningEffort, launchShell, startupCommands };
+  }
   // Freeze the agent launch config (cli / runtime / cliPath / wrapper) onto the
   // session the first time a worker forks, so later bot-level edits never
   // retroactively change a live session — same discipline as `sandbox`.
@@ -1399,8 +1436,15 @@ function sessionAgentConfig(
     wrapperCli: ds.session.wrapperCli,
     model,
     reasoningEffort: ds.session.reasoningEffort,
+    launchShell: botCfg.launchShell,
+    startupCommands: botCfg.startupCommands,
   };
 }
+
+/** @internal test-only: exercise sessionAgentConfig's launch-config resolution
+ * (incl. the /cli cliLaunchSnapshot branch's live model resolution) directly,
+ * without spawning a real worker. */
+export const __testOnly_sessionAgentConfig = sessionAgentConfig;
 
 
 export { freezeMojoIdentityForSession } from './mojo-session-identity.js';
@@ -7304,6 +7348,15 @@ export async function forkSession(
   childSession.sandboxNetwork = ds.session.sandboxNetwork;
   childSession.reasoningEffort = ds.session.reasoningEffort;
   childSession.model = ds.session.model;
+  childSession.cliLaunchSnapshot = ds.session.cliLaunchSnapshot
+    ? {
+        ...ds.session.cliLaunchSnapshot,
+        cliRuntime: ds.session.cliLaunchSnapshot.cliRuntime
+          ? { ...ds.session.cliLaunchSnapshot.cliRuntime, update: { ...ds.session.cliLaunchSnapshot.cliRuntime.update } }
+          : null,
+        startupCommands: [...ds.session.cliLaunchSnapshot.startupCommands],
+      }
+    : undefined;
   childSession.cliRuntime = ds.session.cliRuntime
     ? { ...ds.session.cliRuntime, update: { ...ds.session.cliRuntime.update } }
     : undefined;
@@ -9440,7 +9493,7 @@ export function forkWorker(
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
     wrapperCli: agentCfg.wrapperCli,
-    launchShell: botCfg.launchShell,
+    launchShell: agentCfg.launchShell,
     model: agentCfg.model,
     reasoningEffort: agentCfg.reasoningEffort,
     // dsh runner turn timeout: read live from bot config so tuning bots.json
@@ -9455,16 +9508,16 @@ export function forkWorker(
     // through its terminal and must never trigger BotMux's self-owned RPC engine.
     codexRpcInput: existingAppServerEndpoint
       ? false
-      : botCfg.codexRpcInput === true || config.codexRpcInputDefault,
+      : (botCfg.codexRpcInput === true && RPC_CAPABLE_CLIS.has(agentCfg.cliId)) || config.codexRpcInputDefault,
     ...(existingAppServerEndpoint ? { existingAppServerEndpoint } : {}),
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.
-    startupCommands: botCfg.startupCommands,
+    startupCommands: agentCfg.startupCommands,
     // Per-bot env (bots.json `env`) — injected into the CLI process only (e.g.
     // ANTHROPIC_BASE_URL/AUTH_TOKEN for a GLM/3rd-party bot). Adopt sessions are
     // observed, not driven, so forkAdoptWorker intentionally omits it.
-    env: botCfg.env,
+    env: ds.session.cliLaunchSnapshot ? undefined : botCfg.env,
     // Use the decision recorded on the session (above), NOT the live bot flag, so
     // historical sessions never get retroactively sandboxed on restart.
     sandbox: ds.session.sandbox === true,
@@ -9848,6 +9901,21 @@ function isMeetingDrivenTurn(
   if (!ds.session.vcMeetingReceiver) return false;
   if (dispatchAttempt !== undefined) return true;
   return resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined;
+}
+
+function currentGatewayCallerOpenId(ds: DaemonSession, turnId: string): string | undefined {
+  // The daemon owns this per-turn sender map. The worker contributes only the
+  // turn id over private IPC; it can never choose which human that id denotes.
+  return pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
+}
+
+function currentTurnProcessIdentities(
+  ds: DaemonSession,
+  turnId: string | undefined,
+): string[] | undefined {
+  return turnId && ds.localProcessAttestation?.cliPid
+    ? snapshotProcessIdentities(ds.localProcessAttestation.cliPid)
+    : undefined;
 }
 
 function setupWorkerHandlers(
@@ -12149,12 +12217,19 @@ function setupWorkerHandlers(
             break;
           }
         }
+        const preexistingProcessIdentities = currentTurnProcessIdentities(ds, msg.turnId);
         ds.managedTurnOrigin = {
           capability: msg.capability,
           ...(msg.originChannelId ? { originChannelId: msg.originChannelId } : {}),
           ...(msg.turnId ? { turnId: msg.turnId } : {}),
           ...(msg.dispatchAttempt !== undefined
             ? { dispatchAttempt: msg.dispatchAttempt }
+            : {}),
+          ...((msg.turnId && currentGatewayCallerOpenId(ds, msg.turnId))
+            ? { callerOpenId: currentGatewayCallerOpenId(ds, msg.turnId) }
+            : {}),
+          ...(preexistingProcessIdentities
+            ? { preexistingProcessIdentities }
             : {}),
         };
         break;
