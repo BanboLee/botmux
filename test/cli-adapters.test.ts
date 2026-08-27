@@ -853,6 +853,54 @@ describe('mir buildArgs (runner model)', () => {
     expect(args).not.toContain('--mircli-bin');
   });
 
+  it('canonicalizes a symlinked mircli so --mircli-bin matches the sandbox-authorized path', () => {
+    // Same defect class as codex-app above and dsh below: mir-runner.ts spawns
+    // `this.mircliBin || MIRCLI_BIN || 'mircli'` verbatim, while the file sandbox
+    // authorizes only dirname(realpath(bin)) (worker.ts `execDirs`) → a raw
+    // symlink path ENOENTs inside the sandbox.
+    //
+    // mir's gap used to be the WIDEST of the three: before this it declared no
+    // sandboxExtraExecPaths at all, so the second-stage binary was never exposed.
+    const root = mkdtempSync(join(tmpdir(), 'mircli-symlink-'));
+    try {
+      const realDir = join(root, 'releases', '2.0.0', 'bin');
+      mkdirSync(realDir, { recursive: true });
+      const realBin = join(realDir, 'mircli');
+      writeFileSync(realBin, '#!/bin/sh\n', { mode: 0o755 });
+      // Two hops, matching how versioned CLIs are usually installed.
+      const midDir = join(root, 'current', 'bin');
+      mkdirSync(midDir, { recursive: true });
+      const midBin = join(midDir, 'mircli');
+      symlinkSync(realBin, midBin);
+      const linkDir = join(root, 'local', 'bin');
+      mkdirSync(linkDir, { recursive: true });
+      const linkBin = join(linkDir, 'mircli');
+      symlinkSync(midBin, linkBin);
+
+      const symlinkAdapter = createMirAdapter(linkBin);
+      const canonicalReal = realpathSync(realBin);
+      expect(linkBin).not.toBe(canonicalReal); // the hazard exists in this fixture
+
+      const args = symlinkAdapter.buildArgs({ sessionId: 's', resume: false });
+      const idx = args.indexOf('--mircli-bin');
+      expect(idx).toBeGreaterThanOrEqual(0);
+      expect(args[idx + 1]).toBe(canonicalReal);
+      // The sandbox authorizes from this list while the runner spawns the argv —
+      // any divergence between the two IS the bug.
+      expect(symlinkAdapter.sandboxExtraExecPaths?.()).toEqual([canonicalReal]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('declares no sandbox exec path when there is no cliPathOverride', () => {
+    // Without an override the runner resolves `mircli` from PATH *inside* the
+    // sandbox, which the adapter cannot know here — so it declares nothing rather
+    // than guessing. Documents the remaining gap (tracked as a follow-up): that
+    // PATH entry may not be bind-mounted, and would still ENOENT.
+    expect(adapter.sandboxExtraExecPaths?.()).toEqual([]);
+  });
+
   it('has no portable copy-paste resume command (mircli owns the session store)', () => {
     expect(adapter.buildResumeCommand?.({ sessionId: 'sess-mir', cliSessionId: 'conv-abc' })).toBeNull();
   });
