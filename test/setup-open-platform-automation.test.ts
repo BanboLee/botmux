@@ -11,6 +11,10 @@ import {
   automateOpenPlatformSetup,
   BOT_BASELINE_APP_EVENTS,
   BOT_BASELINE_CALLBACKS,
+  BOT_OPTIONAL_APP_EVENTS,
+  LONG_CONNECTION_EVENT_MODE,
+  VC_MEETING_APP_EVENTS,
+  VC_MEETING_USER_EVENTS,
   BOTMUX_REDIRECT_URL,
   botmuxFeishuSessionFilePath,
   buildFeishuQrPayload,
@@ -1957,6 +1961,125 @@ describe('automateOpenPlatformSetup', () => {
       .toContain('长连接');
     // 走不到订阅阶段的早期失败(missingVcEvents/eventModeReady 均 undefined)保持原 best-effort 语义
     expect(vcListenerEventGateError({})).toBeNull();
+  });
+
+  // 无变更短路：redirect / scope / 事件 / 回调 / 接收模式一路下来都没落地过写操作时，
+  // 不应再 create+publish 一个新版本（存量 bot 每次重启命中自检都凭空多一版的根因）。
+  describe('无变更时跳过发版', () => {
+    // 「什么都不缺」的 mock：所有 botmux 需要的事件/回调/长连接模式都已就位，
+    // redirect 白名单已含全部 wanted，scope 传空清单 → 全程零写请求。
+    function noopMock(appId: string) {
+      return openPlatformSubscriptionMock(appId, {
+        initial: {
+          appEvents: [...BOT_BASELINE_APP_EVENTS, ...BOT_OPTIONAL_APP_EVENTS, ...VC_MEETING_APP_EVENTS],
+          userEvents: [...VC_MEETING_USER_EVENTS],
+          eventMode: LONG_CONNECTION_EVENT_MODE,
+          callbacks: [...BOT_BASELINE_CALLBACKS],
+          callbackMode: LONG_CONNECTION_EVENT_MODE,
+          redirectUrls: collectBotmuxRedirectUrls(),
+        },
+      });
+    }
+
+    function noopFetch(appId: string, sub: ReturnType<typeof openPlatformSubscriptionMock>, calls: string[]) {
+      return (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes(`/scope/all/${appId}`)) {
+          return Response.json({ code: 0, data: { appScopeList: [], userScopeList: [] } });
+        }
+        // 命中发版端点直接抛：无变更时它们绝不该被调用。
+        if (href.includes('/app_version/create/') || href.includes('/publish/commit/')) {
+          throw new Error(`must not publish on no-op: ${href}`);
+        }
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+    }
+
+    it('权限/事件/回调全就位时不 create+publish，直接回成功且 versionId 为空', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-noop-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl: noopFetch('cli_x', sub, calls),
+        // 空清单 → importedScopeCount=0 → 不发 scope/update
+        scopeManifest: { scopes: { tenant: [], user: [] } },
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.versionId).toBeUndefined();
+      // 一条发版请求都没有；也没有任何写请求（redirect/scope/event/callback update）。
+      expect(calls.some(u => u.includes('/app_version/create/'))).toBe(false);
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
+      expect(calls.some(u => u.includes('/scope/update/'))).toBe(false);
+      expect(sub.updateBodies).toEqual([]);
+      expect(sub.redirectWrites).toEqual([]);
+    });
+
+    it('appJustCreated=true 时即便无变更也照常发版（新应用要靠首发上架）', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-noop-new-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes('/scope/all/cli_x')) return Response.json({ code: 0, data: { appScopeList: [], userScopeList: [] } });
+        if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl,
+        scopeManifest: { scopes: { tenant: [], user: [] } },
+        appJustCreated: true,
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.versionId).toBe('v1');
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
+    });
+
+    it('requireVerifiedEvents=true 时即便无变更也照常发版（受管激活靠精确 versionId ACK）', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-noop-managed-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes('/scope/all/cli_x')) return Response.json({ code: 0, data: { appScopeList: [], userScopeList: [] } });
+        if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl,
+        scopeManifest: { scopes: { tenant: [], user: [] } },
+        requireVerifiedEvents: true,
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.versionId).toBe('v1');
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
+    });
   });
 });
 
