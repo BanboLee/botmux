@@ -2035,6 +2035,22 @@ describe('readyPattern', () => {
 });
 
 describe('traex automation trust flags', () => {
+  it('injects structured reasoning effort as a TraeX launch config', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({
+      sessionId: 'traex-effort',
+      resume: false,
+      reasoningEffort: 'medium',
+    });
+    const i = args.indexOf('model_reasoning_effort="medium"');
+    expect(i).toBeGreaterThan(0);
+    expect(args[i - 1]).toBe('-c');
+  });
+
+  it('omits the reasoning effort launch config when none is configured', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({ sessionId: 'traex-effort', resume: false });
+    expect(args.join(' ')).not.toContain('model_reasoning_effort');
+  });
+
   it('bypasses both permission and hook-review gates for automation when the hook-trust toggle is on', () => {
     const args = createTraexAdapter('/bin/traex').buildArgs({ sessionId: 'traex-goal', resume: false, bypassHookTrust: true });
     expect(args).toContain('--dangerously-bypass-approvals-and-sandbox');
