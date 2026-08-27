@@ -8297,7 +8297,7 @@ async function captureAndUpload(): Promise<void> {
       usageLimitContent = snap;
       const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
       const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
-      png = captureToPng(term, { cols: shotCols, rows: shotRows, startY });
+      png = await captureToPng(term, { cols: shotCols, rows: shotRows, startY });
     }
   } catch (err: any) {
     logError(`Screenshot render failed: ${err?.message ?? err}`);
