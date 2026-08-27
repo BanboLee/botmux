@@ -2847,20 +2847,59 @@ async function ensureSystemDependencies(): Promise<void> {
  * If a legacy pm2 God (from a pre-supervisor botmux) is still alive, warn the
  * operator so read-only commands (status/logs) don't silently show an empty
  * supervisor view while old pm2-managed daemons keep running. Self-contained:
- * checks only for a live pm2.pid under the botmux-dedicated home or the shared
- * default — no pm2 CLI call. `botmux start`/`restart` will reap it (reapLegacyPm2).
+ * no pm2 CLI call. `botmux start`/`restart` will reap it (reapLegacyPm2).
+ *
+ * TWO SIGNALS, deliberately different per home — this must agree with
+ * reapLegacyPm2's detection or the warning lies in one direction or the other:
+ *
+ *  • The botmux-dedicated home (~/.botmux/pm2) is exclusively ours, so ANY live
+ *    God there is a migration leftover. Detect it by pm2.pid OR rpc.sock: a real
+ *    God was observed supervising 50 daemons with NO pm2.pid at all, and a
+ *    pid-file-only probe stayed silent through exactly the situation this warning
+ *    exists for.
+ *
+ *  • The shared default (~/.pm2) may be the user's own pm2 running unrelated
+ *    apps. A live God there means nothing by itself — MEASURED on this box: the
+ *    shared God was alive with ZERO botmux rows, and the pid-file-only check
+ *    warned anyway, telling the operator to run a migration that was already
+ *    done. So there we require actual evidence of botmux rows, which pm2 records
+ *    as per-app pid files under `pids/` (checked without spawning pm2).
  */
-function warnIfLegacyBotmuxAlive(): void {
-  for (const home of [join(CONFIG_DIR, 'pm2'), join(homedir(), '.pm2')]) {
-    const pidFile = join(home, 'pm2.pid');
-    if (!existsSync(pidFile)) continue;
+function legacyBotmuxGodAlive(): boolean {
+  const dedicated = join(CONFIG_DIR, 'pm2');
+  if (pm2GodAlive(dedicated)) return true;
+  const shared = join(homedir(), '.pm2');
+  return pm2GodAlive(shared) && sharedHomeHasBotmuxRows(shared);
+}
+
+/** A God is alive at `home` if its pid file points at a live process, or (when
+ *  the file is missing/stale) its RPC socket is still there. */
+function pm2GodAlive(home: string): boolean {
+  const pidFile = join(home, 'pm2.pid');
+  if (existsSync(pidFile)) {
     let pid = 0;
-    try { pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10); } catch { continue; }
-    if (!Number.isSafeInteger(pid) || pid <= 1) continue;
-    try { process.kill(pid, 0); } catch { continue; } // God not alive
-    console.warn('⚠️  检测到旧版 pm2 守护进程仍在运行,运行 `botmux restart` 完成到内置 supervisor 的迁移(会自动停掉旧 pm2)。\n');
-    return;
+    try { pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10); } catch { pid = 0; }
+    if (Number.isSafeInteger(pid) && pid > 1) {
+      try { process.kill(pid, 0); return true; } catch { /* stale — try the socket */ }
+    }
   }
+  return existsSync(join(home, 'rpc.sock'));
+}
+
+/** Does the SHARED pm2 home actually hold botmux apps? pm2 writes one pid file
+ *  per app as `pids/<name>-<id>.pid`, so this answers it without running pm2. */
+function sharedHomeHasBotmuxRows(home: string): boolean {
+  try {
+    return readdirSync(join(home, 'pids')).some((f) =>
+      (f === 'botmux.pid' || f.startsWith('botmux-')) && !f.startsWith('botmux-plugin-'));
+  } catch {
+    return false; // no pids/ dir → no apps we care about
+  }
+}
+
+function warnIfLegacyBotmuxAlive(): void {
+  if (!legacyBotmuxGodAlive()) return;
+  console.warn('⚠️  检测到旧版 pm2 守护进程仍在运行,运行 `botmux restart` 完成到内置 supervisor 的迁移(会自动停掉旧 pm2)。\n');
 }
 
 // #877 的纯文件 tail：fleet 停止时也能看日志，且永不创建 God。
