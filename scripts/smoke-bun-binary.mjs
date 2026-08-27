@@ -80,9 +80,66 @@ const childEnv = {
 };
 
 let supervisor;
+
+/**
+ * Reap the supervisor AND the members it spawned.
+ *
+ * WHY THE MEMBERS NEED EXPLICIT HANDLING: cleanup used to SIGKILL only the
+ * supervisor. SIGKILL is not catchable, so the supervisor never got to stop its
+ * own children — the `__dashboard` member it had spawned survived as an orphan.
+ * Observed on EVERY run, including passing ones: the GitHub runner reported
+ * `Terminate orphan process: pid (2717) (botmux-linux-x64)` while tearing the
+ * job down. Harmless on an ephemeral runner, but on a developer machine it
+ * leaves a stray dashboard holding its port, and it means this script does not
+ * actually clean up after itself.
+ *
+ * Order matters: SIGTERM first so the supervisor stops its members the way it
+ * normally would, then a bounded wait, then SIGKILL whatever is still alive —
+ * members first (read out of fleet-state, which records their pids), so nothing
+ * is left parentless. Every step is best-effort: cleanup runs on the failure
+ * path too and must never throw over an already-dead process.
+ */
+const memberPids = () => {
+  try {
+    const state = JSON.parse(readFileSync(join(home, '.botmux', 'fleet-state.json'), 'utf-8'));
+    return (state.procs ?? [])
+      .map((p) => p?.pid)
+      .filter((pid) => typeof pid === 'number' && pid > 0);
+  } catch {
+    return []; // no state file yet, or unreadable — nothing we can target
+  }
+};
+
+const alive = (pid) => {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+};
+
+/** Block the thread briefly. cleanup() runs from exit paths where an `await`
+ *  would never be honoured, so the wait for the supervisor to exit has to be
+ *  synchronous. Atomics.wait on a throwaway buffer is the standard way to sleep
+ *  without spawning anything. */
+const sleepSync = (ms) => {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
+  catch { /* SharedArrayBuffer unavailable — skip the grace period */ }
+};
+
 const cleanup = () => {
+  const members = memberPids();
   if (supervisor && supervisor.exitCode === null) {
-    try { supervisor.kill('SIGKILL'); } catch { /* already gone */ }
+    // Graceful first: lets the supervisor tear down its own members.
+    try { supervisor.kill('SIGTERM'); } catch { /* already gone */ }
+    const deadline = Date.now() + 3_000;
+    while (supervisor.exitCode === null && Date.now() < deadline) sleepSync(100);
+    if (supervisor.exitCode === null) {
+      try { supervisor.kill('SIGKILL'); } catch { /* already gone */ }
+    }
+  }
+  // Sweep any member the supervisor did not manage to stop (it may itself have
+  // been SIGKILLed, or died before handling the SIGTERM).
+  for (const pid of members) {
+    if (alive(pid)) {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+    }
   }
   try { rmSync(home, { recursive: true, force: true }); } catch { /* best-effort */ }
 };
