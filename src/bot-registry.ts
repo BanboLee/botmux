@@ -1426,6 +1426,12 @@ export interface BotConfig {
    */
   existingAppServer?: ExistingAppServerConfig;
   /**
+   * Codex credential policy. Missing/`shared` preserves the historical global
+   * auth refresh; `isolated` always redirects Codex into this bot's private
+   * CODEX_HOME and never reads or copies global auth, with or without sandbox.
+   */
+  codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode;
+  /**
    * Run this bot's CLI inside a per-session file sandbox (unified three-tier
    * whitelist, deny-by-default; Linux bwrap + macOS Seatbelt with identical
    * semantics — see adapters/cli/fs-policy.ts). The agent can read/write the
@@ -3093,6 +3099,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       codexBrowser,
       codexRpcInput: entry.codexRpcInput === true,
       existingAppServer,
+      // Missing keeps the historical every-cold-spawn global auth refresh.
+      codexAuthSync: entry.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
       sandbox: entry.sandbox === true,
       sandboxPaths: entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
         ? {
