@@ -9,6 +9,7 @@
   },
   "files": [
     "dist/",
+    "scripts/postinstall-bin.mjs",
     "ecosystem.config.cjs",
     "README.md",
     "README.en.md",
@@ -24,10 +25,14 @@
     "workflow-core:build": "node scripts/build-workflow-core-package.mjs",
     "workflow-core:test": "pnpm workflow-core:build && node scripts/test-workflow-core-package.mjs",
     "workflow-core:pack": "pnpm workflow-core:build && node scripts/pack-workflow-core-package.mjs",
+    "build:bun": "bun scripts/build-bun-binary.mjs",
     "audit:domains": "node scripts/audit-public-domains.mjs",
     "dashboard:bundle": "node scripts/build-dashboard.mjs",
     "dashboard:watch": "node scripts/build-dashboard.mjs --watch",
     "daemon": "tsx src/index-daemon.ts",
+    "daemon:bun": "bun src/index-daemon.ts",
+    "supervisor:bun": "bun src/index-supervisor.ts",
+    "dashboard:bun": "bun src/index-dashboard.ts",
     "daemon:start": "node dist/cli.js start",
     "daemon:stop": "node dist/cli.js stop",
     "daemon:restart": "node dist/cli.js restart",
@@ -55,6 +60,7 @@
     "desktop:pack": "pnpm desktop:pack:local",
     "desktop:pack:local": "node scripts/desktop-pack-local.mjs",
     "prepublishOnly": "npm run build",
+    "postinstall": "node scripts/postinstall-bin.mjs",
     "prepare": "git config core.hooksPath scripts/git-hooks 2>/dev/null || true"
   },
   "dependencies": {

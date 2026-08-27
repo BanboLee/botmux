@@ -12,9 +12,30 @@ pnpm daemon:logs          # 查看日志
 
 - 每次修改后需要 `pnpm build` 然后 `pnpm daemon:restart`
 
+### Bun 开发链路
+
+daemon / supervisor / dashboard 都能直接跑 TypeScript，不必先 `pnpm build`：
+
+```bash
+pnpm daemon:bun           # bun src/index-daemon.ts
+pnpm supervisor:bun       # bun src/index-supervisor.ts
+pnpm dashboard:bun        # bun src/index-dashboard.ts
+pnpm build:bun            # 打自包含单文件二进制（scripts/build-bun-binary.mjs）
+```
+
+发版编译用的 Bun 版本**钉在 1.4.0**（见 `.github/workflows/`）。本地 bun 与它差太多时，编译产物的行为可能和 CI 不一致——排查编译态问题前先核对 `bun --version`。
+
+**测试里 spawn 子进程必须走 `test/helpers/ts-runner.ts`**，不要写 `spawn(process.execPath, ['--import','tsx', …])`：那是 Node-only 形态，Bun 下 `process.execPath` 是 bun 二进制、`bun --import tsx` 不合法，子进程会全部起不来。helper 按运行时解析（Node 加 tsx loader、Bun 原生跑 TS）。片段里 import 仓库模块（`.js` specifier 实际是 `.ts`）时用 `spawnTsEvalWithRepoImports`，普通 `spawnTsEval` 在 Node 下会 ERR_MODULE_NOT_FOUND。
+
+### 编译态（单文件二进制）注意
+
+编译版里没有 `dist/` 落在磁盘上——模块图在虚拟只读的 `/$bunfs/` 下，`__dirname` 是 `/$bunfs/root`。所以**任何把 `__dirname` 拼出的路径写到磁盘、或交给别的进程用的代码，在编译态都是坏的**（那个路径进程外不存在，且 sh 里未转义的 `$bunfs` 还会被展开成空串）。曾因此把 install.sh 装在 `~/.botmux/bin/botmux` 的二进制**覆盖成 47 字节的壳**。判断运行形态用 `isStandaloneBinary()`（`src/core/self-spawn.ts`），子进程一律走 `resolveEntrySpawn` / `spawnWorker` re-exec `process.execPath`，不要拼 `dist/*.js` 路径。
+
+注意 CI 的 smoke（`scripts/smoke-bun-binary.mjs`）用空 `bots.json`，而 daemon 在 0 个 bot 时会直接以 `Invalid BOTMUX_BOT_INDEX=0` 拒绝启动——**daemon 内的代码路径在前几项检查里结构上不可达**，别把「smoke 绿」当成 daemon 编译态已验证。
+
 ### 多 checkout：全局 `botmux` 指向谁
 
-全局 `botmux` 命令走 `~/.botmux/bin/botmux` 瘦 wrapper，指向「最后认领的 checkout」的 `dist/cli.js`（daemon 启动时也会写）：
+全局 `botmux` 命令走 `~/.botmux/bin/botmux` 瘦 wrapper，指向「最后认领的 checkout」的 `dist/cli.js`（daemon 启动时也会写；编译态下则改为 `exec` 二进制自身，且当该路径就是正在运行的二进制时会跳过写入，不再自毁）：
 
 ```bash
 pnpm use:here             # 把全局 botmux 指向当前 checkout（仅改指向，不重启 daemon）
