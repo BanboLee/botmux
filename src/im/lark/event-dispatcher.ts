@@ -41,6 +41,7 @@ import { tryHandleGrantCommand } from './grant-command.js';
 import { tryHandleInviteCommand } from './invite-command.js';
 import { autoInviteOwnerOnGroupJoin } from '../../services/groups-store.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
+import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled, clearPending } from './grant-pending.js';
@@ -2556,7 +2557,7 @@ async function maybeApplySharedTopicSeed(input: {
   // (unconditional) or 'ambient' — but for 'ambient' NOT when the message
   // @mentions another specific member (person/bot) without @ing us: that is a
   // redirect to someone else, so we back off (mentionsAnotherMember).
-  const seedMentionMode = resolveGroupMentionMode(larkAppId);
+  const seedMentionMode = resolveGroupMentionMode(larkAppId, chatId);
   if (!isBotMentioned(larkAppId, message, senderOpenId)
       && !(seedMentionMode === 'never'
         || (seedMentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message)))) return undefined;
@@ -3049,7 +3050,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       dispatchPersistedForwardFollowup(record.messageId, payload);
     const remainingMs = record.dueAt - Date.now();
     const isUnpairedSeed = !record.payload.ctx.forwardSeedData;
-    const delayStillEnabled = usesForwardFollowupDelay(resolveGroupMentionMode(larkAppId));
+    const delayStillEnabled = usesForwardFollowupDelay(resolveGroupMentionMode(larkAppId, chatId));
     if (isUnpairedSeed && delayStillEnabled && remainingMs > 0 && forwardFollowups.hold({
       larkAppId,
       chatId,
@@ -3439,6 +3440,10 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         return;
       }
 
+      if (await tryHandleMentionModeCommand(larkAppId, message, senderOpenId, isAllowed)) {
+        return;
+      }
+
       if (await tryHandleSubstituteCommand(larkAppId, message, senderOpenId)) {
         return;
       }
@@ -3600,7 +3605,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // that @mentions another specific member (person/bot) is a redirect to
       // someone else → back off, don't fold it in (mentionsAnotherMember).
       // 'never' stays unconditional by design.
-      const mentionModeForAlias = resolveGroupMentionMode(larkAppId);
+      const mentionModeForAlias = resolveGroupMentionMode(larkAppId, chatId);
       if (!explicitlyMentionedThisBot
           && mentionModeForAlias !== 'always'
           && !((mentionModeForAlias === 'topic' || mentionModeForAlias === 'ambient') && mentionsAnotherMember(larkAppId, message))
@@ -3749,7 +3754,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           senderOpenId,
           rootId: message.root_id,
         };
-        const pairingMentionMode = resolveGroupMentionMode(larkAppId);
+        const pairingMentionMode = resolveGroupMentionMode(larkAppId, chatId);
         const ambientRedirect = pairingMentionMode === 'ambient'
           && !explicitlyMentionedThisBot
           && mentionsAnotherMember(larkAppId, message);
@@ -3806,7 +3811,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       //   !ownsSession (group)    → require @mention + allowlist
       //   p2p                     → allowlist only
       if (chatType === 'group') {
-        const mentionMode = resolveGroupMentionMode(larkAppId);
+        const mentionMode = resolveGroupMentionMode(larkAppId, chatId);
         // 消息里 @ 了别的具体成员,就已经证明群不是 1人1bot（只有群成员能被 @）——
         // 此刻末条 solo 放行必然不成立,而 stats 只被末条消费,直接跳过这次（可能
         // 昂贵的）人数查询。这在「刚拉了新 bot、用户 @ 新 bot」窗口里尤为重要：
@@ -3929,7 +3934,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? ownsSession;
       }
       const payload = { data, ctx, ownsSession } satisfies PendingForwardTopicPayload;
-      const groupMentionMode = resolveGroupMentionMode(larkAppId);
+      const groupMentionMode = resolveGroupMentionMode(larkAppId, chatId);
       const shouldDelayTopicSeed = usesForwardFollowupDelay(groupMentionMode)
         && !pairedForwardSeed
         && !isControlCommand
