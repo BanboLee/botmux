@@ -131,6 +131,7 @@ import {
   PM2_DAEMON_RESTART_DELAY_MS,
 } from './core/shutdown-budgets.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
+import { buildCardPatchSuccessOutput, CARD_COMMAND_USAGE, CARD_PATCH_USAGE, cardPatchArgsWantHelp, executeCardPatch, parseCardPatchArgs, readCardPatchInput } from './cli/card-dispatch.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
@@ -5930,6 +5931,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
     Bot→Bot 默认进入 Queue；要显式调整对方活跃的 Codex App turn，把 @steer 写成
     正文首个语义行（可放在收件人 @ 行之后）。接收端会消费该指令，不交给模型。
     （可设 BOTMUX_REQUIRE_MENTION_DECISION=false 关闭硬门）
+  card patch --message-id <om_xxx> (--card-file <path> | --card-json <json>)
+                       原地更新之前用 send --card-file/--card-json 发出的自定义卡片
+                       （不发新消息、不换群/话题）；messageId 取自 send 成功输出的 .messageId，
+                       卡片安全校验与 send 相同；[--session-id <sid>] 可手动指定会话
   bots list                            列出当前群聊中的机器人（含 open_id）
   bots invite --chat <chatId> --team <id> --agent <appId>...
                                        往「已存在的团队群」补人：把同团队、已 opt-in 的 agent + 各自 owner 一起拉进；
@@ -9350,6 +9355,67 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 }
 
+// ─── Card subcommand (patch a previously-sent custom card in place) ───
+
+async function cmdCard(rest: string[]): Promise<void> {
+  const sub = rest[0] ?? '';
+  if (sub === '' || sub === '--help' || sub === '-h') {
+    console.log(CARD_COMMAND_USAGE);
+    return;
+  }
+  if (sub !== 'patch') {
+    console.error(
+      `未知 card 子命令: ${sub}\n` +
+      `用法: botmux card patch --message-id <om_xxx> (--card-file <path> | --card-json <json>) [--session-id <sid>]`,
+    );
+    process.exit(2);
+  }
+  const args = rest.slice(1);
+  // Help wins over the missing-arg validation and the transport gates below.
+  if (cardPatchArgsWantHelp(args)) {
+    console.log(CARD_PATCH_USAGE);
+    return;
+  }
+  // Same two transport doors as `botmux send`: a no-transport turn (apiOnly bot
+  // or HTTP virtual session) may not originate ANY Feishu write — including a
+  // card patch.
+  assertTurnTransportOrExit('card patch');
+  // Read isolation: register this bot from its own worker-written cred file so
+  // the Lark client resolves without reading the denied bots.json (same as
+  // cmdSend/cmdHistory).
+  await registerSelfFromCredFile();
+
+  const parsed = parseCardPatchArgs(args);
+  if (!parsed.ok) {
+    console.error(`botmux card patch: ${parsed.error}`);
+    process.exit(2);
+  }
+  const input = readCardPatchInput(parsed.cardFile, parsed.cardJson);
+  if (!input.ok) {
+    console.error(`botmux card patch: ${input.error}`);
+    process.exit(input.exitCode);
+  }
+  // Bot identity comes from the session context only (same as send): no
+  // --bot-style explicit selector. Resolves --session-id / ancestor pid marker
+  // / BOTMUX_SESSION_ID / riff sandbox, and registers the bot so getBotClient
+  // works. Exits 1 on failure (session not found / no larkAppId), same as send.
+  const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
+  // Target-aware door: a --session-id pointing at a virtual/apiOnly session is
+  // refused even from a transport-capable turn.
+  assertSessionTransportOrExit({ chatId: session.chatId, larkAppId }, 'card patch');
+
+  const { updateMessage } = await import('./im/lark/client.js');
+  const outcome = await executeCardPatch(
+    { updateMessage },
+    { larkAppId, messageId: parsed.messageId, rawCard: input.rawCard },
+  );
+  if (!outcome.ok) {
+    console.error(`botmux card patch: ${outcome.error}`);
+    process.exit(outcome.exitCode);
+  }
+  console.log(buildCardPatchSuccessOutput(outcome.messageId, sid));
+}
+
 // ─── Dispatch subcommand (Phase 0: open a sub-project thread + assign bots) ───
 
 async function postCurrentSessionDaemonRoute(input: {
@@ -12690,7 +12756,7 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 // managed origin → NOT gated: the operator keeps full access. per-command +
 // daemon-side getBotClient/larkTransportEnabled gates remain authoritative.
 const LARK_FACING_COMMANDS = new Set([
-  'send', 'dispatch', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread',
+  'send', 'dispatch', 'card', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread',
   'vc-agent', 'report', 'actor',
 ]);
 if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
@@ -12969,6 +13035,7 @@ switch (command) {
     break;
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
+  case 'card':     await cmdCard(process.argv.slice(3)); break;
   case 'chat':     await cmdChat(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;
