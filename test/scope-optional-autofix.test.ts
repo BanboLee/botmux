@@ -48,9 +48,15 @@ describe('checkRequiredScopes — opt-in optional-scope auto-top-up', () => {
   });
 
   it('runs the top-up SILENTLY and WITHOUT a second QR (session-only)', () => {
-    expect(region).toContain('{ disableQrLogin: true, silent: true }');
+    expect(region).toContain('disableQrLogin: true, silent: true');
     // passes no critical scopes (optional-only top-up)
     expect(region).toMatch(/tryAutoFixScopes\(larkAppId, bot, brand, \[\], missingOptional,/);
+  });
+
+  it('threads the already-granted scope names into the top-up (no-op-publish diff)', () => {
+    // The auto-top-up must forward the scopes it already read back so automation
+    // can diff and skip publishing when nothing is actually new (PR #1044).
+    expect(region).toContain('grantedScopeNames: [...grantedScopes]');
   });
 
   it('returns on a successful top-up (before the all-critical-granted log)', () => {
@@ -73,7 +79,11 @@ describe('tryAutoFixScopes — silent / disableQrLogin plumbing', () => {
   const region = fnRegion('async function tryAutoFixScopes(', 4200);
 
   it('accepts the disableQrLogin + silent opts', () => {
-    expect(region).toContain('opts?: { disableQrLogin?: boolean; silent?: boolean }');
+    expect(region).toContain('opts?: { disableQrLogin?: boolean; silent?: boolean; grantedScopeNames?: string[] }');
+  });
+
+  it('threads grantedScopeNames into the Open Platform automation', () => {
+    expect(region).toContain('grantedScopeNames: opts?.grantedScopeNames,');
   });
 
   it('threads disableQrLogin into the Open Platform automation', () => {

@@ -677,6 +677,7 @@ async function finishOpenPlatformSetup(
       say('      缺了它，群聊模式 p2pMode=group / 会话群标签 / `/login` 点授权会直接报 20029。');
     }
     if (result.versionId) say(`   已提交发布版本: ${result.versionId}`);
+    else if (result.publishSkipped) say('   本次配置无变更，已跳过发版（未创建新版本）。');
     else say('   已创建版本；未从响应中解析到 versionId，请到开放平台确认是否需要手动发布。');
     say('');
     return outcome;

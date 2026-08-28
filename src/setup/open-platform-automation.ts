@@ -153,6 +153,11 @@ export type OpenPlatformAutomationResult =
       /** Managed onboarding only: exact baseline event + callback count read back before session cleanup. */
       verifiedEventCount?: number;
       versionId?: string;
+      /**
+       * 本次因「无任何配置变更」而**跳过了 create+publish**。区别于「发了版但没解析到
+       * versionId」：前者根本没建版（下游别去后台找不存在的草稿、也别把它当 warning）。
+       */
+      publishSkipped?: boolean;
     }
   | {
       ok: false;
@@ -217,6 +222,20 @@ export interface OpenPlatformAutomationOptions {
   appJustCreated?: boolean;
   fetchImpl?: typeof fetch;
   scopeManifest?: ScopeManifest;
+  /**
+   * 调用方已经确知**当前已授权**的 scope 名字集合（来自 tenant-token
+   * `application/v6` 的 scope 列表，见 event-dispatcher 的 `checkRequiredScopes`）。
+   *
+   * 传入时，本函数会在**映射成 ID 之前**用它对 manifest 做 name 差集，只对「真正
+   * 还没授权」的 scope 发 `scope/update`，并且**只在差集非空**时把 scope 记为一次
+   * 变更（驱动末尾是否发版）。不传时保持历史行为：拿不到已授权信号，就以「发出过
+   * 一次非空 scope/update」作为保守近似（宁可偶尔多发一版，也不少发导致新权限不
+   * 生效）。
+   *
+   * ⚠️ 差集必须在 name 空间做：`grantedScopeNames` 与 manifest 都是 scope **name**，
+   * 而 catalog 映射后是 ID，两者不可直接比。
+   */
+  grantedScopeNames?: string[];
   pollIntervalMs?: number;
   maxWaitMs?: number;
   onQrCode?: (info: { qrText: string; qrPayload: string }) => void | Promise<void>;
@@ -1109,8 +1128,23 @@ export async function automateOpenPlatformSetup(
   }
 
   const manifest = options.scopeManifest ?? readDefaultScopeManifest();
+  // 调用方给了「已授权」名字集合时，在**映射成 ID 之前**做 name 差集，把 manifest
+  // 收窄成「本次真正还缺的」——只有它非空才需要发 scope/update、也才算一次变更。
+  // 这正是「无变更短路」在走默认全量 manifest 的生产链路里能真正生效的关键：否则
+  // manifest 恒非空 → scope/update 恒发 → mutated 恒真 → 短路永不触发。
+  const grantedSet = options.grantedScopeNames && options.grantedScopeNames.length > 0
+    ? new Set(options.grantedScopeNames)
+    : undefined;
+  const effectiveManifest: ScopeManifest = grantedSet
+    ? {
+        scopes: {
+          tenant: (manifest.scopes?.tenant ?? []).filter(name => !grantedSet.has(name)),
+          user: (manifest.scopes?.user ?? []).filter(name => !grantedSet.has(name)),
+        },
+      }
+    : manifest;
   const catalog = extractOpenPlatformScopeEntries(allScopesPayload);
-  const mapped = mapManifestScopesToOpenPlatformIds(manifest, catalog);
+  const mapped = mapManifestScopesToOpenPlatformIds(effectiveManifest, catalog);
   const missing = [...mapped.missingTenantScopes, ...mapped.missingUserScopes];
   const skippedScopeCount = missing.length;
   if (missing.length > 0) {
@@ -1124,8 +1158,9 @@ export async function automateOpenPlatformSetup(
   if (importedScopeCount > 0) {
     try {
       await postJson(`/developers/v1/scope/update/${options.appId}`, buildScopeUpdatePayload(options.appId, mapped));
-      // 保守近似：拿不到「哪些本就已授权」的信号，只要成功发出了一次非空
-      // scope/update 就当作可能改动过权限，允许后续发版让新权限生效。
+      // 已知 granted 时：manifest 已收窄成「真正还缺的」，走到这里就一定有新增权限，
+      // 记为变更、允许后续发版让新权限生效。未知 granted 时保守近似：拿不到「哪些本就
+      // 已授权」的信号，只要成功发出了一次非空 scope/update 就当作可能改动过权限。
       mutated = true;
     } catch (err: any) {
       scopeWarning = safeErrorMessage(err);
@@ -1324,9 +1359,12 @@ export async function automateOpenPlatformSetup(
       eventModeReady,
       redirectConfigured,
       redirectWarning,
-      // 没发版：versionId 留空。非受管路径本就不依赖它（受管路径已被 mustPublish
-      // 排除在短路之外），下游只把它当「有则记一笔」。
+      // 没发版：versionId 留空，另置 publishSkipped 标记「本次确实没建版」。非受管
+      // 路径本就不依赖 versionId（受管路径已被 mustPublish 排除在短路之外），下游据
+      // publishSkipped 区分「跳过发版」与「发了版但没解析到 versionId」——前者不该被
+      // classifySetupOpenPlatformOutcome 计入 warning，也不该让 CLI 提示去后台找草稿。
       versionId: undefined,
+      publishSkipped: true,
     };
   }
 

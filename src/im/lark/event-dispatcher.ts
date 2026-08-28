@@ -253,7 +253,7 @@ async function tryAutoFixScopes(
   brand: Brand,
   missingCritical: { name: string; desc: string }[],
   missingOptional: { name: string; desc: string }[],
-  opts?: { disableQrLogin?: boolean; silent?: boolean },
+  opts?: { disableQrLogin?: boolean; silent?: boolean; grantedScopeNames?: string[] },
 ): Promise<boolean> {
   if (brand !== 'feishu') return false;
 
@@ -265,6 +265,12 @@ async function tryAutoFixScopes(
       brand,
       maxWaitMs: 60_000,
       disableQrLogin: opts?.disableQrLogin,
+      // 把上层自检回读到的「已授权」scope 名字集合往下传：automation 据此在 name
+      // 空间对 manifest 做差集，只对真正还缺的 scope 发 scope/update，并按「确有新增」
+      // 而非「发过 scope/update」置 mutated——这样「配置本就齐全」时才能真正命中无变更
+      // 短路、不再凭空发版。拿不到 granted（如 chicken-and-egg 的 self_manage 冷启动）
+      // 时不传，automation 退回原保守近似。
+      grantedScopeNames: opts?.grantedScopeNames,
       onStatus: (msg) => logger.info(`[${larkAppId}] auto-fix: ${msg}`),
       onQrCode: (info) => {
         logger.warn(
@@ -279,9 +285,12 @@ async function tryAutoFixScopes(
       const scopeDetail = result.scopeCount > 0
         ? `${result.scopeCount} 项权限已导入${result.skippedScopeCount > 0 ? `（${result.skippedScopeCount} 项跳过）` : ''}`
         : '所有必需权限已在应用清单中';
+      const versionDetail = result.publishSkipped
+        ? '无变更，已跳过发版'
+        : `version ${result.versionId ?? 'n/a'} published`;
       logger.info(
         `[${larkAppId}] auto-fix succeeded: ${scopeDetail}, ` +
-        `version ${result.versionId ?? 'n/a'} published, ` +
+        `${versionDetail}, ` +
         `${result.subscribedEventCount} events subscribed`,
       );
       // opt-in / optional-only path: succeeded silently, no admin DM (a bot that
@@ -514,7 +523,7 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       // before (no API call / no prompt / no nag).
       if (missingOptional.length > 0 && brand === 'feishu') {
         const toppedUp = await tryAutoFixScopes(larkAppId, bot, brand, [], missingOptional,
-          { disableQrLogin: true, silent: true });
+          { disableQrLogin: true, silent: true, grantedScopeNames: [...grantedScopes] });
         if (toppedUp) {
           logger.info(`[${larkAppId}] auto-topped-up ${missingOptional.length} optional scope(s): ${missingOptional.map(s => s.name).join('、')}`);
           return;
@@ -529,7 +538,8 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     // If a cached Feishu web session exists (~/.botmux/feishu-session.json), we can
     // directly add missing scopes and publish a new version without user interaction.
     // Falls through to manual DM warning if session is missing/expired.
-    const autoFixed = await tryAutoFixScopes(larkAppId, bot, brand, missingCritical, missingOptional);
+    const autoFixed = await tryAutoFixScopes(larkAppId, bot, brand, missingCritical, missingOptional,
+      { grantedScopeNames: [...grantedScopes] });
     if (autoFixed) return;
 
     // Log + DM consolidated message listing all missing critical scopes.
