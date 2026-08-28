@@ -2138,8 +2138,12 @@ describe('automateOpenPlatformSetup', () => {
         appId: 'cli_x',
         sessionFilePath: sessionFile,
         fetchImpl: defaultCatalogFetch('cli_x', sub, calls, captured),
-        // 关键：不传 scopeManifest（走真实默认清单），但告知「全部已授权」。
-        grantedScopeNames: allDefaultScopeNames,
+        // 关键：不传 scopeManifest（走真实默认清单），但告知「全部已授权」——
+        // 按桶传：tenant / user 两桶各自全授权。
+        grantedScopeNames: {
+          tenant: [...defaultManifest.scopes.tenant],
+          user: [...defaultManifest.scopes.user],
+        },
       });
 
       expect(result.ok).toBe(true);
@@ -2154,16 +2158,20 @@ describe('automateOpenPlatformSetup', () => {
       expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
     });
 
-    it('默认全量 manifest + grantedScopeNames 缺一项时，只对缺的那项发 scope/update 并发版', async () => {
-      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-default-onemissing-'));
+    // PR #1044 R2 回归：dual-bucket 名字（tenant/user 两桶都有）的 user 侧独缺时，
+    // 必须仍对 user 侧发 scope/update——不能因为 tenant 侧已授权就把它从 user 桶误删。
+    // 用扁平集合做差会把这一项静默吞掉（0 次 scope/update + publishSkipped），本例锁死。
+    it('dual-bucket 名字仅 user 侧缺失时，按桶做差仍申请其 user 授权、不误报无变更', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-dual-user-missing-'));
       const sessionFile = join(dir, 'feishu-session.json');
       writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
       const sub = noopMock('cli_x');
       const calls: string[] = [];
       const captured = { scopeUpdateBodies: [] as Array<Record<string, unknown>> };
-      // 缺一项 tenant scope（其余全部已授权）。
-      const missingName = defaultManifest.scopes.tenant[0];
-      const granted = allDefaultScopeNames.filter(n => n !== missingName);
+      // 取一个同时出现在 tenant 与 user 两桶的名字。
+      const tenantSet = new Set(defaultManifest.scopes.tenant);
+      const dualName = defaultManifest.scopes.user.find(n => tenantSet.has(n))!;
+      expect(dualName, 'expected a dual-bucket scope name in the default manifest').toBeTruthy();
       const nameToId = new Map<string, string>();
       allDefaultScopeNames.forEach((name, i) => nameToId.set(name, `id_${i}`));
       const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
@@ -2192,7 +2200,68 @@ describe('automateOpenPlatformSetup', () => {
         appId: 'cli_x',
         sessionFilePath: sessionFile,
         fetchImpl,
-        grantedScopeNames: granted,
+        // tenant 侧全授权；user 侧独缺 dualName。扁平集合会因 tenant 有 dualName 而误删 user 桶。
+        grantedScopeNames: {
+          tenant: [...defaultManifest.scopes.tenant],
+          user: defaultManifest.scopes.user.filter(n => n !== dualName),
+        },
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        // 确有新增（user 侧那一项）→ 必须发版、不是无变更。
+        expect(result.publishSkipped).toBeUndefined();
+      }
+      // 恰好对「user 侧缺的那一项」发一次 scope/update：零 tenant id、一个 user id。
+      expect(captured.scopeUpdateBodies).toHaveLength(1);
+      expect(captured.scopeUpdateBodies[0].appScopeIDs).toEqual([]);
+      expect(captured.scopeUpdateBodies[0].userScopeIDs).toEqual([nameToId.get(dualName)]);
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
+    });
+
+    it('默认全量 manifest + grantedScopeNames 缺一项时，只对缺的那项发 scope/update 并发版', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-default-onemissing-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+      const captured = { scopeUpdateBodies: [] as Array<Record<string, unknown>> };
+      // 缺一项**仅出现在 tenant 桶**的 scope（避免 dual 名字干扰，其余全部已授权）。
+      const userSet = new Set(defaultManifest.scopes.user);
+      const missingName = defaultManifest.scopes.tenant.find(n => !userSet.has(n))!;
+      expect(missingName, 'expected a tenant-only scope name').toBeTruthy();
+      const nameToId = new Map<string, string>();
+      allDefaultScopeNames.forEach((name, i) => nameToId.set(name, `id_${i}`));
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes('/scope/all/cli_x')) {
+          return Response.json({
+            code: 0,
+            data: {
+              appScopeList: defaultManifest.scopes.tenant.map(name => ({ name, id: nameToId.get(name) })),
+              userScopeList: defaultManifest.scopes.user.map(name => ({ name, id: nameToId.get(name) })),
+            },
+          });
+        }
+        if (href.includes('/scope/update/cli_x')) {
+          captured.scopeUpdateBodies.push(JSON.parse(String(init?.body)));
+          return Response.json({ code: 0 });
+        }
+        if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v-NEW' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl,
+        grantedScopeNames: {
+          tenant: defaultManifest.scopes.tenant.filter(n => n !== missingName),
+          user: [...defaultManifest.scopes.user],
+        },
       });
 
       expect(result.ok).toBe(true);

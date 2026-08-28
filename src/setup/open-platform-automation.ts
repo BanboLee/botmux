@@ -223,19 +223,23 @@ export interface OpenPlatformAutomationOptions {
   fetchImpl?: typeof fetch;
   scopeManifest?: ScopeManifest;
   /**
-   * 调用方已经确知**当前已授权**的 scope 名字集合（来自 tenant-token
-   * `application/v6` 的 scope 列表，见 event-dispatcher 的 `checkRequiredScopes`）。
+   * 调用方已经确知**当前已授权**的 scope 名字集合，**按 token 类型分桶**（来自
+   * tenant-token `application/v6` 的 scope 列表，见 event-dispatcher 的
+   * `checkRequiredScopes`——该接口每个 scope 条目自带 `token_types: (tenant|user)[]`）。
    *
-   * 传入时，本函数会在**映射成 ID 之前**用它对 manifest 做 name 差集，只对「真正
-   * 还没授权」的 scope 发 `scope/update`，并且**只在差集非空**时把 scope 记为一次
-   * 变更（驱动末尾是否发版）。不传时保持历史行为：拿不到已授权信号，就以「发出过
-   * 一次非空 scope/update」作为保守近似（宁可偶尔多发一版，也不少发导致新权限不
-   * 生效）。
+   * 传入时，本函数会在**映射成 ID 之前**分别用 `tenant` / `user` 桶对 manifest 的
+   * 对应桶做 name 差集，只对「该 token 类型下真正还没授权」的 scope 发 `scope/update`，
+   * 并且**只在差集非空**时把 scope 记为一次变更（驱动末尾是否发版）。不传时保持历史
+   * 行为：拿不到已授权信号，就以「发出过一次非空 scope/update」作为保守近似（宁可偶尔
+   * 多发一版，也不少发导致新权限不生效）。
    *
-   * ⚠️ 差集必须在 name 空间做：`grantedScopeNames` 与 manifest 都是 scope **name**，
-   * 而 catalog 映射后是 ID，两者不可直接比。
+   * ⚠️ 必须**按桶**做差、且在 name 空间做：`lark-scopes.json` 里约 121 个名字同时出现
+   * 在 tenant 与 user 两个桶，而 tenant/user 是两份独立授权。若把已授权名字拍平成一个
+   * 扁平集合去过滤两个桶，「tenant 已授权」会连带把 user 桶里的同名 scope 也误删，导致
+   * 真正缺失的 user 侧权限被静默吞掉、永远补不上（PR #1044 R2）。catalog 映射后是 ID，
+   * 与 name 不可直接比，故差集只能在 mapped 之前的 name 空间做。
    */
-  grantedScopeNames?: string[];
+  grantedScopeNames?: { tenant: string[]; user: string[] };
   pollIntervalMs?: number;
   maxWaitMs?: number;
   onQrCode?: (info: { qrText: string; qrPayload: string }) => void | Promise<void>;
@@ -1132,14 +1136,22 @@ export async function automateOpenPlatformSetup(
   // 收窄成「本次真正还缺的」——只有它非空才需要发 scope/update、也才算一次变更。
   // 这正是「无变更短路」在走默认全量 manifest 的生产链路里能真正生效的关键：否则
   // manifest 恒非空 → scope/update 恒发 → mutated 恒真 → 短路永不触发。
-  const grantedSet = options.grantedScopeNames && options.grantedScopeNames.length > 0
-    ? new Set(options.grantedScopeNames)
+  //
+  // 差集必须**按 token 桶各自做**：约 121 个名字同时在 tenant/user 两桶，而两者是
+  // 两份独立授权。若拿一个扁平集合过滤两桶，「tenant 已授权」会连带删掉 user 桶的
+  // 同名 scope，把真正缺的 user 侧权限静默吞掉（PR #1044 R2）。
+  const grantedTenant = options.grantedScopeNames
+    ? new Set(options.grantedScopeNames.tenant)
     : undefined;
-  const effectiveManifest: ScopeManifest = grantedSet
+  const grantedUser = options.grantedScopeNames
+    ? new Set(options.grantedScopeNames.user)
+    : undefined;
+  const hasGrantedSignal = !!(grantedTenant || grantedUser);
+  const effectiveManifest: ScopeManifest = hasGrantedSignal
     ? {
         scopes: {
-          tenant: (manifest.scopes?.tenant ?? []).filter(name => !grantedSet.has(name)),
-          user: (manifest.scopes?.user ?? []).filter(name => !grantedSet.has(name)),
+          tenant: (manifest.scopes?.tenant ?? []).filter(name => !grantedTenant?.has(name)),
+          user: (manifest.scopes?.user ?? []).filter(name => !grantedUser?.has(name)),
         },
       }
     : manifest;

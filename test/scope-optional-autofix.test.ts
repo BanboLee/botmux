@@ -54,9 +54,11 @@ describe('checkRequiredScopes — opt-in optional-scope auto-top-up', () => {
   });
 
   it('threads the already-granted scope names into the top-up (no-op-publish diff)', () => {
-    // The auto-top-up must forward the scopes it already read back so automation
-    // can diff and skip publishing when nothing is actually new (PR #1044).
-    expect(region).toContain('grantedScopeNames: [...grantedScopes]');
+    // The auto-top-up must forward the scopes it already read back — bucketed by
+    // token type — so automation can diff per bucket and skip publishing when
+    // nothing is actually new (PR #1044). Bucketing avoids a tenant grant masking
+    // a genuinely-missing user-side scope of the same name (PR #1044 R2).
+    expect(region).toContain('grantedScopeNames: grantedScopeBuckets');
   });
 
   it('returns on a successful top-up (before the all-critical-granted log)', () => {
@@ -79,7 +81,7 @@ describe('tryAutoFixScopes — silent / disableQrLogin plumbing', () => {
   const region = fnRegion('async function tryAutoFixScopes(', 4200);
 
   it('accepts the disableQrLogin + silent opts', () => {
-    expect(region).toContain('opts?: { disableQrLogin?: boolean; silent?: boolean; grantedScopeNames?: string[] }');
+    expect(region).toContain('opts?: { disableQrLogin?: boolean; silent?: boolean; grantedScopeNames?: { tenant: string[]; user: string[] } }');
   });
 
   it('threads grantedScopeNames into the Open Platform automation', () => {
