@@ -288,6 +288,7 @@ import {
   backendSupportsWebTerminal,
 } from './adapters/backend/capabilities.js';
 import { zellijEnv } from './setup/ensure-zellij.js';
+import { locateExecutable } from './utils/executable.js';
 import {
   AmbiguousSubmissionBlockedError,
   isObserveBackend,
@@ -12518,10 +12519,17 @@ async function spawnCli(
   }
   let resolvedZmxSessionProbe: SessionProbe | undefined;
   let resolvedZmxSessionPid: number | undefined;
+  // Frozen zellij existence decision, mirroring resolvedZmxSessionProbe: the
+  // gate resolves the tri-state probe ONCE (biasing an indeterminate answer
+  // toward reattach) and every teardown below refreshes it to 'missing', so a
+  // post-kill re-selection cold-spawns instead of reattaching to the pane it
+  // just removed. selectSessionBackend consumes it via hasExistingSession.
+  let resolvedZellijSessionProbe: SessionProbe | undefined;
   {
     let available = true;
     let reason = '';
     let hasExistingSession = false;
+    let existingSessionUnknown = false;
     if (effectiveBackend === 'tmux') {
       hasExistingSession = TmuxBackend.hasSession(TmuxBackend.sessionName(cfg.sessionId));
       if (!hasExistingSession) {
@@ -12533,10 +12541,39 @@ async function spawnCli(
       // Like tmux, zellij's probe is a disposable background session, so a
       // live named session is more authoritative than a transient probe
       // failure (PR#249 semantics) — check it first so we reattach, not gate.
-      hasExistingSession = ZellijBackend.hasSession(ZellijBackend.sessionName(cfg.sessionId));
-      if (!hasExistingSession) {
+      //
+      // Tri-state on purpose: `hasSession()` is `probeSession() === 'exists'`,
+      // so it answers `false` BOTH for "no such session" and for "the probe got
+      // no answer" (`list-sessions` timed out / spawn failed). Under host load
+      // that second case is real — the probe needs a fork+exec before zellij
+      // ever runs — and collapsing it into "no session" then let the functional
+      // probe (which spawns a background session, so it times out under the
+      // same pressure) gate a session whose pane was alive the whole time.
+      const probeState = ZellijBackend.probeSession(ZellijBackend.sessionName(cfg.sessionId));
+      resolvedZellijSessionProbe = probeState;
+      hasExistingSession = probeState === 'exists';
+      existingSessionUnknown = probeState === 'unknown';
+      if (probeState === 'missing') {
         available = ZellijBackend.isAvailable();
         reason = 'zellij 功能性探针失败（需 zellij >= 0.44）';
+      } else if (existingSessionUnknown) {
+        // `probeSession` collapses BOTH a load-timeout AND a missing/unrunnable
+        // binary (ENOENT/EACCES) into 'unknown'. Only the first deserves the
+        // spawn-instead-of-gate exemption; a genuinely absent zellij must still
+        // gate to the actionable "install zellij" card, not fall through and
+        // crash node-pty with `execvp failed`. `locateExecutable` is a pure
+        // PATH stat (no fork) so it stays authoritative under the very host
+        // load that made `list-sessions` time out — an absent binary fails it
+        // instantly, a present-but-slow one still resolves.
+        if (locateExecutable('zellij', zellijEnv())) {
+          log('zellij list-sessions probe returned no answer but the binary is on PATH (host load); spawning to let reattach decide instead of gating');
+        } else {
+          existingSessionUnknown = false;
+          resolvedZellijSessionProbe = 'missing';
+          available = false;
+          reason = 'zellij 二进制不在 PATH 上';
+          log('zellij list-sessions probe returned no answer AND the binary is not on PATH; gating to the install card instead of spawning');
+        }
       }
     } else if (effectiveBackend === 'zmx') {
       // The local controller version is a protocol requirement even when the
@@ -12570,7 +12607,7 @@ async function spawnCli(
       available = HerdrBackend.isAvailable();
       reason = 'herdr 功能性探针失败';
     }
-    const decision = decideBackendGate({ requested: effectiveBackend, available, hasExistingSession });
+    const decision = decideBackendGate({ requested: effectiveBackend, available, hasExistingSession, existingSessionUnknown });
     if (decision.action === 'gate') {
       const detail = reason || decision.reason;
       log(`${effectiveBackend} backend unavailable and silent PTY fallback is disabled (set BACKEND_TYPE=pty to opt in): ${detail}`);
@@ -12932,11 +12969,19 @@ async function spawnCli(
     // requires an isolation/MCP boundary that only a Botmux-owned session can
     // safely provide. Fresh tasks use distinct agents in one machine-wide host.
     reuseRecordedHerdrTarget,
-    // ZMX reattach vs fresh is frozen here from the probe taken above; the
-    // backend refuses to silently turn a fresh launch into an attach.
+    // ZMX/zellij reattach vs fresh is frozen here from the probe taken above;
+    // the backend refuses to silently turn a fresh launch into an attach. ZMX
+    // reattaches only on a proven 'exists'; zellij also reattaches on 'unknown'
+    // (a load-timed-out probe of a pane that is more likely alive than gone —
+    // the same asymmetry the gate used to spawn instead of gate), and cold-
+    // spawns only on an authoritative 'missing'. Post-kill gates below reset
+    // the frozen probe to 'missing' so a re-selection never reattaches to a
+    // pane they just tore down.
     hasExistingSession: effectiveBackend === 'zmx'
       ? resolvedZmxSessionProbe === 'exists'
-      : undefined,
+      : effectiveBackend === 'zellij'
+        ? resolvedZellijSessionProbe !== undefined && resolvedZellijSessionProbe !== 'missing'
+        : undefined,
     zmxRecoveryStateDir: isolationRuntimeDataDir,
   });
   let selectedBackend = selectBackend();
@@ -13232,6 +13277,15 @@ async function spawnCli(
         if (effectiveBackendType === 'zmx') {
           resolvedZmxSessionProbe = postKillProbe;
           resolvedZmxSessionPid = undefined;
+        } else if (effectiveBackendType === 'zellij') {
+          // Refresh the frozen zellij probe before re-selecting, or the
+          // replacement keeps isReattach for the pane this gate just removed.
+          // This gate already threw above unless the post-kill probe proved
+          // 'missing' (an inconclusive answer never gets here), so the pane is
+          // known gone: record that so the re-selection cold-spawns. The
+          // mcp-gateway gate is laxer (it only rejects a proven-live pane), so
+          // its own reset still has to fail closed on 'unknown' explicitly.
+          resolvedZellijSessionProbe = 'missing';
         }
       },
       clearProvenanceVerified: () => {
@@ -13314,6 +13368,18 @@ async function spawnCli(
         `could not verify existing ${effectiveBackendType} pane`,
       );
     }
+    // zellij's pre-spawn bias reattaches on an indeterminate probe (a live pane
+    // is likelier than a gone one under load). That bias is WRONG for an
+    // MCP-gateway pane: reattaching binds the CLI's MCP client to a relay socket
+    // that cannot survive this worker, and the gate below only cold-resumes on a
+    // proven 'exists'. So an unverifiable zellij pane here must fail closed like
+    // zmx rather than silently reattach to a possibly-dead gateway host.
+    if (effectiveBackendType === 'zellij' && paneProbe === 'unknown') {
+      throw new Error(
+        `[mcp-gateway] refusing to start session ${cfg.sessionId}: ` +
+        `could not verify existing ${effectiveBackendType} pane`,
+      );
+    }
     if (effectiveBackendType === 'zmx') {
       resolvedZmxSessionProbe = paneProbe;
     }
@@ -13376,6 +13442,11 @@ async function spawnCli(
       if (effectiveBackendType === 'zmx') {
         resolvedZmxSessionProbe = postKillProbe;
         resolvedZmxSessionPid = undefined;
+      } else if (effectiveBackendType === 'zellij') {
+        // Same as the read-isolation gate: refresh the frozen zellij probe so
+        // the re-selection cold-spawns a fresh host instead of reattaching to
+        // the pane we just killed. Fail closed to 'missing' unless proven live.
+        resolvedZellijSessionProbe = postKillProbe === 'exists' ? 'exists' : 'missing';
       }
       selectedBackend = selectBackend();
       isTmuxMode = selectedBackend.isTmuxMode;
