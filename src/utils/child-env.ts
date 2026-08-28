@@ -589,3 +589,57 @@ export function redactChildEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   stripDashboardH5Env(env);
   return env;
 }
+
+/**
+ * Scrub the env handed to an EXTERNAL long-lived child — a process that is not
+ * botmux's own code and therefore will not scrub itself.
+ *
+ * WHY THIS EXISTS SEPARATELY FROM THE BOOT SCRUBS: a bot daemon and the
+ * dashboard strip these families in their OWN entrypoints (index-daemon.ts /
+ * index-dashboard.ts). That works because they are our code. A plugin service is
+ * an arbitrary third-party program: it inherits whatever we hand it and will
+ * never delete a key on our behalf, so the strip has to happen on OUR side,
+ * before the spawn.
+ *
+ * The set is deliberately IDENTICAL to what the pm2 path scrubbed
+ * (`scrubPm2CallerEnv`), because this replaces that path — a migration must not
+ * quietly reduce protection. Every family below has a measured fleet-wide
+ * failure mode; see each key list for the specifics:
+ *
+ *   • SESSION_CLI_HOME_ENV_KEYS      one bot reading/writing a sibling's CLI home
+ *   • CLAUDE_SESSION_MARKER_ENV_KEYS transcript saving flipped off fleet-wide
+ *   • WORKFLOW_WORKER_ENV_KEYS       ordinary chats running in workflow mode
+ *   • dashboard H5 family            the app secret persisted into child state
+ *   • INVOKER_TERMINAL_ENV_KEYS      every PTY on the machine turned colorless
+ *   • SESSION_TURN_MARKER_ENV_KEYS   a long-lived proc carrying one turn's identity
+ *
+ * The graceful-exit sentinel is stripped for the same reason the pm2 path did it
+ * (stripPm2GracefulExitMarker, called by pm2Env before this scrub): it is the
+ * private handshake by which OUR OWN two managed cores report a clean shutdown as
+ * exit 90 instead of 0. resolveFleetDaemonEnv pins it for every supervised member,
+ * so without this an external command inherits it and any foreground `botmux` it
+ * launches would exit 90 on a clean stop — read back as a crash. An external
+ * member must never be told that 90 means "clean". (Stripping it here does NOT by
+ * itself stop the supervisor from reading a plain exit(90) as graceful; that is a
+ * separate decision in fleet-supervisor-policy's decideOnExit, which never looks
+ * at env. Both are required, which is why isGracefulExit is member-shape aware.)
+ *
+ * TERM is re-pinned rather than deleted, matching the pm2 path: deleting it
+ * makes a child's supports-color detection fail and render colorless, which is
+ * the same end state the invoker-terminal scrub exists to prevent.
+ *
+ * Mutates `env` in place.
+ */
+export function scrubExternalMemberEnv(env: NodeJS.ProcessEnv): void {
+  scrubSessionCliHomeEnv(env);
+  scrubClaudeSessionMarkerEnv(env);
+  scrubWorkflowWorkerEnv(env);
+  stripDashboardH5Env(env);
+  scrubInvokerTerminalEnv(env);
+  scrubSessionTurnMarkerEnv(env);
+  // String literal, not an import: this module is deliberately dependency-free
+  // (see REDACTED_CHILD_ENV_KEYS, which spells the same key out for the same
+  // reason). A drift-guard test pins it to PM2_GRACEFUL_EXIT_CODE_ENV.
+  delete env.BOTMUX_PM2_GRACEFUL_EXIT_CODE;
+  env.TERM = 'xterm-256color';
+}
