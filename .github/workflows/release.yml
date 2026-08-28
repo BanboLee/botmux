@@ -839,7 +839,7 @@ jobs:
               if [ ! -x "$BIN" ]; then echo "musl binary $BIN not built"; exit 1; fi
               node scripts/smoke-bun-binary.mjs "$BIN"
 
-              # The legacy-pm2 reaper's process/socket probes, exercised against
+              # The process/socket probes in the legacy-pm2 reaper, exercised against
               # BusyBox. Mirrors the PR gate deliberately: `bun run test` runs on
               # glibc, where reverting either probe to `ps -p`/`lsof` leaves the
               # unit suite green while the musl binary we ship stops reaping at all
