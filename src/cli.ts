@@ -100,7 +100,7 @@ import {
 import { hasProtectedSessionMutationOwnership } from './core/session-mutation-guard.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
-import { reapLegacyPm2 } from './core/legacy-pm2-reaper.js';
+import { reapLegacyPm2, liveGodAt } from './core/legacy-pm2-reaper.js';
 import { withFileLock, withFileLockSync } from './utils/file-lock.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
@@ -2453,12 +2453,22 @@ function sleepSyncMs(ms: number): void {
  * double-run alongside the supervisor. This detects that stale God and stops it
  * (delegated to the self-contained `reapLegacyPm2`), so the operator never has
  * to `pm2 kill` by hand. Fail-safe + no-op on fresh installs / when pm2 is
- * absent (always the case for the compiled single binary). The `_op` parameter
- * is retained for call-site compatibility but no longer changes behavior — the
- * reaper is a single idempotent operation.
+ * absent. The `_op` parameter is retained for call-site compatibility but no
+ * longer changes behavior — the reaper is a single idempotent operation.
+ *
+ * A reap that finds a God but cannot confirm it is down is reported on STDERR,
+ * not just through `logger`: CLI mode runs with `logger.setSilent(true)`, so the
+ * reaper's own notes are invisible without DEBUG. That silence is how a
+ * double-run started unnoticed — both fleets live, two processes consuming the
+ * same Feishu events and the same session sqlite. The operator needs to see it.
  */
 function cleanupLegacyPm2(_op?: 'stop' | 'restart'): boolean {
   const r = reapLegacyPm2(CONFIG_DIR, PKG_ROOT, (m) => logger.info(`[legacy-pm2] ${m}`));
+  if (r.unresolved) {
+    console.warn(`⚠️  检测到迁移前的 pm2 守护进程,但未能确认其已停止:${r.note}`);
+    console.warn('   旧 fleet 可能仍在消费同一批飞书事件(消息重复、会话存储争用)。');
+    console.warn('   请手动确认:ps -ef | grep index-daemon   然后停掉旧进程后重试。');
+  }
   return r.found;
 }
 
@@ -2850,14 +2860,18 @@ async function ensureSystemDependencies(): Promise<void> {
  * supervisor view while old pm2-managed daemons keep running. Self-contained:
  * no pm2 CLI call. `botmux start`/`restart` will reap it (reapLegacyPm2).
  *
- * TWO SIGNALS, deliberately different per home — this must agree with
- * reapLegacyPm2's detection or the warning lies in one direction or the other:
+ * TWO SIGNALS, deliberately different per home. Both go through the reaper's own
+ * `liveGodAt` so the warning and the reaper cannot disagree — this used to be a
+ * second, hand-kept copy of that logic, and it drifted: it trusted a bare
+ * `kill(pid, 0)` (true for the ZOMBIE a fresh reap leaves behind) and a bare
+ * `existsSync(rpc.sock)` (which outlives `pm2 kill`), so the warning survived a
+ * SUCCESSFUL migration and no amount of re-running `restart` could clear it.
  *
  *  • The botmux-dedicated home (~/.botmux/pm2) is exclusively ours, so ANY live
- *    God there is a migration leftover. Detect it by pm2.pid OR rpc.sock: a real
- *    God was observed supervising 50 daemons with NO pm2.pid at all, and a
- *    pid-file-only probe stayed silent through exactly the situation this warning
- *    exists for.
+ *    God there is a migration leftover. `liveGodAt` detects it by pm2.pid OR a
+ *    held rpc.sock: a real God was observed supervising 50 daemons with NO
+ *    pm2.pid at all, and a pid-file-only probe stayed silent through exactly the
+ *    situation this warning exists for.
  *
  *  • The shared default (~/.pm2) may be the user's own pm2 running unrelated
  *    apps. A live God there means nothing by itself — MEASURED on this box: the
@@ -2868,23 +2882,9 @@ async function ensureSystemDependencies(): Promise<void> {
  */
 function legacyBotmuxGodAlive(): boolean {
   const dedicated = join(CONFIG_DIR, 'pm2');
-  if (pm2GodAlive(dedicated)) return true;
+  if (liveGodAt(dedicated) !== null) return true;
   const shared = join(homedir(), '.pm2');
-  return pm2GodAlive(shared) && sharedHomeHasBotmuxRows(shared);
-}
-
-/** A God is alive at `home` if its pid file points at a live process, or (when
- *  the file is missing/stale) its RPC socket is still there. */
-function pm2GodAlive(home: string): boolean {
-  const pidFile = join(home, 'pm2.pid');
-  if (existsSync(pidFile)) {
-    let pid = 0;
-    try { pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10); } catch { pid = 0; }
-    if (Number.isSafeInteger(pid) && pid > 1) {
-      try { process.kill(pid, 0); return true; } catch { /* stale — try the socket */ }
-    }
-  }
-  return existsSync(join(home, 'rpc.sock'));
+  return liveGodAt(shared) !== null && sharedHomeHasBotmuxRows(shared);
 }
 
 /** Does the SHARED pm2 home actually hold botmux apps? pm2 writes one pid file
