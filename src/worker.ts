@@ -202,6 +202,7 @@ import { filterHermesEventsForBotmuxSession } from './services/hermes-session-fi
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
 import { drainPiTranscript } from './services/pi-transcript.js';
 import { drainOmpTranscript, type OmpTranscriptState } from './services/omp-transcript.js';
+import { drainEbsdTranscript, type EbsdTranscriptState } from './services/ebsd-transcript.js';
 import {
   drainGrokUpdates,
   findGrokSessionByPid,
@@ -269,6 +270,8 @@ import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionId
 import { sessionReadyHookCommand } from './adapters/hook-command.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import { ompSessionDir } from './adapters/cli/oh-my-pi.js';
+import { assertEbsdPerBotEnv, ebsdBotmuxSessionDir } from './adapters/cli/ebsd.js';
+import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret-files.js';
 import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
 import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
@@ -2097,7 +2100,7 @@ let closeRequested = false;
 let capturedSpawnCommand: string | null = null;
 let deferredTopicOutputTail = '';
 const reportedDeferredTopicRoots = new Set<string>();
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', opencode2: 'OpenCode 2', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff', reasonix: 'Reasonix', dsh: 'DeepSeek Harness', 'dsh-tui': 'DeepSeek Harness TUI', mojo: 'Mojo' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', opencode2: 'OpenCode 2', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', ebsd: 'ebsd', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff', reasonix: 'Reasonix', dsh: 'DeepSeek Harness', 'dsh-tui': 'DeepSeek Harness TUI', mojo: 'Mojo' };
 function cliName(): string {
   return (lastInitConfig?.cliRuntime?.source === 'configured'
     ? (lastInitConfig.cliRuntime.displayName?.trim() || lastInitConfig.cliRuntime.id)
@@ -4283,9 +4286,11 @@ codexBridgeQueue.setCotObserver((entries, turn) => {
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
 let ompBridgeState: OmpTranscriptState = {};
+let ebsdBridgeState: EbsdTranscriptState = {};
 let ompQuietCandidateKey: string | undefined;
 let ompQuietCandidateCompleteOffset: number | undefined;
 const ompRetiredTranscriptPaths = new Set<string>();
+const ebsdRetiredTranscriptPaths = new Set<string>();
 /** Settings are observed on the same append-only cursor as bridge output.
  *  The tracker owns rollout-generation clear/update semantics and publishes a
  *  dedicated IPC event, independent of PTY redraw frequency. */
@@ -5942,6 +5947,10 @@ function structuredBridgeIsOmp(): boolean {
   return lastInitConfig?.cliId === 'oh-my-pi';
 }
 
+function structuredBridgeIsEbsd(): boolean {
+  return lastInitConfig?.cliId === 'ebsd';
+}
+
 function structuredBridgeIsGrok(): boolean {
   return lastInitConfig?.cliId === 'grok';
 }
@@ -5967,6 +5976,11 @@ function structuredBridgeIngestPath(
   }
   if (codexBridgeIsCursor()) return drainCursorTranscript(path, offset);
   if (structuredBridgeIsPi()) return drainPiTranscript(path, offset);
+  if (structuredBridgeIsEbsd()) {
+    const result = drainEbsdTranscript(path, offset, ebsdBridgeState);
+    ebsdBridgeState = result.state;
+    return result;
+  }
   if (structuredBridgeIsOmp()) {
     const result = drainOmpTranscript(path, offset, ompBridgeState, {
       flushTrailingFinal: opts.flushOmpTrailingFinal,
@@ -6062,6 +6076,7 @@ function codexBridgeStartTimer(): void {
       // TRAE process merely because it shares the working directory.
       maybeFollowTraexSessionRotationViaPid();
       maybeFollowOmpTranscriptRotation();
+      maybeFollowEbsdTranscriptRotation();
       if (!codexBridgeRolloutPath) {
         // Late-attach: cliSessionId (writeInput / daemon probe) then adopt
         // pid. Path lookup is centralized in resolveFileBridgePath so
@@ -6199,6 +6214,7 @@ function mtrBridgeIngest(): void {
 
 function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'baseline-existing-skip-tail' | 'fresh-empty' | 'split-live'): void {
   ompBridgeState = {};
+  ebsdBridgeState = {};
   ompQuietCandidateKey = undefined;
   ompQuietCandidateCompleteOffset = undefined;
   codexBridgeRolloutPath = rolloutPath;
@@ -6373,6 +6389,7 @@ function codexBridgeDetachFile(): void {
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
   ompBridgeState = {};
+  ebsdBridgeState = {};
   ompQuietCandidateKey = undefined;
   ompQuietCandidateCompleteOffset = undefined;
 }
@@ -6719,6 +6736,28 @@ function maybeFollowOmpTranscriptRotation(): void {
   }
   log(`OMP transcript rotated: ${codexBridgeRolloutPath} → ${next}`);
   ompRetiredTranscriptPaths.add(retired);
+  codexBridgeDetachFile();
+  codexBridgeAttach(next, 'fresh-empty');
+}
+
+/** ebsd may rotate its JSONL while resuming the same exact BotMux session.
+ * Keep this independent from OMP's provisional-terminal state and quiet flush. */
+function maybeFollowEbsdTranscriptRotation(): void {
+  if (!structuredBridgeIsEbsd() || !codexBridgeRolloutPath
+    || !lastSpawnEffectiveAdapterSessionId) return;
+  const next = resolveFileBridgePath('ebsd', {
+    sessionId: lastSpawnEffectiveAdapterSessionId,
+  });
+  if (!next || next === codexBridgeRolloutPath || ebsdRetiredTranscriptPaths.has(next)) return;
+  const retired = codexBridgeRolloutPath;
+  try {
+    codexBridgeIngest();
+    emitReadyCodexTurns();
+  } catch (err: any) {
+    log(`ebsd pre-rotation bridge drain failed: ${err.message}`);
+  }
+  log(`ebsd transcript rotated: ${codexBridgeRolloutPath} → ${next}`);
+  ebsdRetiredTranscriptPaths.add(retired);
   codexBridgeDetachFile();
   codexBridgeAttach(next, 'fresh-empty');
 }
@@ -7410,9 +7449,11 @@ function stopCodexBridge(): void {
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
   ompBridgeState = {};
+  ebsdBridgeState = {};
   ompQuietCandidateKey = undefined;
   ompQuietCandidateCompleteOffset = undefined;
   ompRetiredTranscriptPaths.clear();
+  ebsdRetiredTranscriptPaths.clear();
   hermesBridgeOffset = 0;
   hermesBridgeBaselineDone = false;
   hermesBridgeSourceSessionId = undefined;
@@ -13688,6 +13729,7 @@ async function spawnCli(
   lastSpawnEffectiveCliSessionId = effectiveCliSessionId;
   lastSpawnEffectiveAdapterSessionId = effectiveAdapterSessionId;
   ompRetiredTranscriptPaths.clear();
+  ebsdRetiredTranscriptPaths.clear();
 
   // ttadk 网关：模型走 ttadk 自己的 `-m`（启动期注入到 ttadk 前缀，见下方 wrapperCli
   // 分支），不能再把 cfg.model 透给底层适配器，否则真实 CLI 会再吃一个 --model 重复。
@@ -13857,7 +13899,12 @@ async function spawnCli(
   }
 
   // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)
-  const extra = (process.env.CLI_EXTRA_ARGS ?? '').trim();
+  const extra = cliAdapter.allowExtraArgs === false
+    ? ''
+    : (process.env.CLI_EXTRA_ARGS ?? '').trim();
+  if (cliAdapter.allowExtraArgs === false && (process.env.CLI_EXTRA_ARGS ?? '').trim()) {
+    log(`Ignoring CLI_EXTRA_ARGS for fixed-contract adapter ${cliAdapter.id}`);
+  }
   if (extra) args.push(...extra.split(/\s+/).filter(Boolean));
 
   // Claude Code 在 root/sudo 下会拒绝 --dangerously-skip-permissions 并立即 exit。
@@ -14106,6 +14153,7 @@ async function spawnCli(
   // `/usr/bin/env` prefix and never into the shared backing-server global env,
   // keeping it from leaking across bots. Re-sanitized here (crossed IPC).
   const perBotInjectEnv = sanitizePerBotEnv(cfg.env);
+  if (cliAdapter.id === 'ebsd') assertEbsdPerBotEnv(perBotInjectEnv);
   const perBotInjectKeys = Object.keys(perBotInjectEnv);
   if (perBotInjectKeys.length) log(`Injecting ${perBotInjectKeys.length} per-bot env var(s): ${perBotInjectKeys.join(', ')}`);
   const hermesUsesBotmuxSessionProfile = basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session';
@@ -14199,23 +14247,26 @@ async function spawnCli(
       return p; // not even '/' resolved (impossible) → lexical fallback
     };
 
-    // OMP keeps all transcripts under one shared state root. Materialize this
-    // Botmux session's exact directory before allow-path existence filtering;
-    // the policy below masks the shared sessions parent and re-opens only this
-    // deeper directory read-write.
+    // OMP and ebsd use separate state roots but the same exact-session sandbox
+    // shape. Materialize only the selected adapter's directory, then mask its
+    // sessions parent and re-open that one directory read-write.
     const ompCurrentSessionDir = cliAdapter.id === 'oh-my-pi'
       ? ompSessionDir(effectiveAdapterSessionId)
       : undefined;
-    if (ompCurrentSessionDir) mkdirSync(ompCurrentSessionDir, { recursive: true, mode: 0o700 });
-    const canonicalOmpSessionsRoot = ompCurrentSessionDir
-      ? canonical(dirname(dirname(ompCurrentSessionDir)))
+    const ebsdCurrentSessionDir = cliAdapter.id === 'ebsd'
+      ? ebsdBotmuxSessionDir(effectiveAdapterSessionId)
       : undefined;
-    const canonicalOmpSessionDir = ompCurrentSessionDir
-      ? canonical(ompCurrentSessionDir)
+    const managedCurrentSessionDir = ompCurrentSessionDir ?? ebsdCurrentSessionDir;
+    if (managedCurrentSessionDir) mkdirSync(managedCurrentSessionDir, { recursive: true, mode: 0o700 });
+    const canonicalManagedSessionsRoot = managedCurrentSessionDir
+      ? canonical(dirname(dirname(managedCurrentSessionDir)))
       : undefined;
-    if (canonicalOmpSessionsRoot && canonicalOmpSessionDir
-      && relative(canonicalOmpSessionsRoot, canonicalOmpSessionDir) !== join('botmux', effectiveAdapterSessionId)) {
-      throw new Error('[sandbox] OMP session directory escapes its managed sessions root');
+    const canonicalManagedSessionDir = managedCurrentSessionDir
+      ? canonical(managedCurrentSessionDir)
+      : undefined;
+    if (canonicalManagedSessionsRoot && canonicalManagedSessionDir
+      && relative(canonicalManagedSessionsRoot, canonicalManagedSessionDir) !== join('botmux', effectiveAdapterSessionId)) {
+      throw new Error('[sandbox] CLI session directory escapes its managed sessions root');
     }
 
     // User three-tier lists: the new sandboxPaths field, or a pre-migration
@@ -14308,6 +14359,16 @@ async function spawnCli(
     // (Schedules moved into each bot's BOT_HOME — the whole dir is already
     // bound readWrite for the owner, so no per-file pre-create is needed.)
 
+    // Fixed service-adapter credentials remain mandatory read-only, but travel
+    // through a dedicated policy channel so no-transport authority filtering
+    // applies only to them—not to capability/attestation/MCP mandatory grants.
+    const serviceCredentialReadOnlyPaths = resolveServiceSecretReadonlyFiles(
+      cliAdapter.sandboxSecretReadonlyPaths?.({
+        ...childEnv,
+        ...perBotInjectEnv,
+      }) ?? [],
+      sandboxHome,
+    );
     const mandatoryDenyPaths: string[] = [];
     const mandatoryDenyRegexes: string[] = [];
     const mandatoryReadOnlyPaths: string[] = [];
@@ -14326,8 +14387,8 @@ async function spawnCli(
     if (process.platform === 'linux') {
       mandatoryDenyPaths.push(join(canonical(dataDir), 'sandboxes', cfg.sessionId));
     }
-    if (canonicalOmpSessionsRoot) {
-      mandatoryDenyPaths.push(canonicalOmpSessionsRoot);
+    if (canonicalManagedSessionsRoot) {
+      mandatoryDenyPaths.push(canonicalManagedSessionsRoot);
     }
     if (process.platform === 'darwin') {
       const osUserHomeDir = userInfo().homedir;
@@ -14554,12 +14615,16 @@ async function spawnCli(
         // migration done-markers at ~/.trae root). Exposed read-only so the CLI
         // sees them without widening the read-WRITE authPaths surface. `~`-expanded
         // here; keepExisting drops any absent on this host.
-        ...[...(cliAdapter.sandboxReadonlyPaths?.() ?? [])].map(expandTildeLexical),
+        ...[...(cliAdapter.sandboxReadonlyPaths?.({
+          ...childEnv,
+          ...perBotInjectEnv,
+        }) ?? [])].map(expandTildeLexical),
       ]),
       botmuxInstallRoot,
       outbox,
-      extraWritePaths: keepExisting([process.env.TMPDIR, canonicalOmpSessionDir]),
+      extraWritePaths: keepExisting([process.env.TMPDIR, canonicalManagedSessionDir]),
       userPaths,
+      serviceCredentialReadOnlyPaths,
       mandatoryDenyPaths,
       mandatoryDenyRegexes,
       mandatoryReadOnlyPaths,
@@ -15504,7 +15569,7 @@ async function spawnCli(
     } else {
       codexBridgeStartTimer();
     }
-  } else if (cfg.cliId === 'pi' || cfg.cliId === 'grok' || cfg.cliId === 'oh-my-pi') {
+  } else if (cfg.cliId === 'pi' || cfg.cliId === 'grok' || cfg.cliId === 'oh-my-pi' || cfg.cliId === 'ebsd') {
     // File-backed: pin path when known (pi session id / grok --session-id
     // UUID), else arm the poller. Grok collision-fallback (dir already
     // exists → no --session-id → grok mints id) is recovered via writeInput
@@ -15649,7 +15714,7 @@ async function spawnCli(
       // `Working...` in ZMX history can never block a structured terminal.
       const busyGuardedIdle = evidenceSource === 'screen'
         || (evidenceSource === 'external'
-          && (structuredBridgeIsPi() || structuredBridgeIsOmp()));
+          && (structuredBridgeIsPi() || structuredBridgeIsOmp() || structuredBridgeIsEbsd()));
       if (busyGuardedIdle && idleBackend
         && deferPromptReadyWhileBusy(`${cliName()} ${evidenceSource}-idle`, idleBackend)) return;
       drainBridgesThenMarkReady(evidenceSource);
