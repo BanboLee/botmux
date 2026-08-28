@@ -136,6 +136,9 @@ import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredSche
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
+import { ensureDevboxDashboardExport } from './platform/devbox-dashboard-export.js';
+import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/binding.js';
+import { isRemoteAccessEnabled } from './global-config.js';
 import {
   DASHBOARD_COMMAND_USAGE,
   executeDashboardCommand,
@@ -3120,6 +3123,25 @@ async function callDashboardEndpoint(path: DashboardEndpoint): Promise<Dashboard
 }
 
 /**
+ * Merlin Devbox 上为当前 dashboard 端口创建（或复用）私有短链。
+ *
+ * 端口取 dashboard 落盘的 `.dashboard-port`（端口探测可能落在 7891 之外），与
+ * `devboxDashboardBaseUrl()` 读侧用的是同一份判据，避免写 9002、读 9001。
+ * 非 Devbox / 已配置中心平台或自建反代 / `merlin-cli` 不可用时全部静默 no-op。
+ */
+async function ensureDevboxDashboardExportForCurrentPort(): Promise<void> {
+  const portFile = join(CONFIG_DIR, '.dashboard-port');
+  const port = Number((existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
+    || process.env.BOTMUX_DASHBOARD_PORT || '7891');
+  await ensureDevboxDashboardExport({
+    port,
+    remoteBaseConfigured: Boolean(
+      (isRemoteAccessEnabled() && platformMachineBaseUrl()) || publicReverseProxyBaseUrl(),
+    ),
+  });
+}
+
+/**
  * Best-effort dashboard hint printed after start/restart. Reads the LIVE link
  * via /__cli/current (non-rotating) so an already-shared URL is preserved.
  * Retries for a few seconds since the dashboard process boots after the daemon;
@@ -3130,6 +3152,10 @@ async function printDashboardHintWithRetry(): Promise<void> {
   const stepMs = 500;
   const started = Date.now();
   let last: Awaited<ReturnType<typeof callDashboardEndpoint>> | null = null;
+  // 只在轮询之前做一次：导出结果与「dashboard 起没起来」无关，放在循环体里每轮都会
+  // 重新 spawn 一次 merlin-cli，而失败路径最坏每轮付满 5s 超时——本函数自己的预算
+  // 才 6s，实测会把 start/restart 的这段拖到近两倍。
+  await ensureDevboxDashboardExportForCurrentPort();
   while (Date.now() - started < maxWaitMs) {
     last = await callDashboardEndpoint('/__cli/current');
     if (last.ok) {
@@ -3161,6 +3187,11 @@ async function printDashboardHintWithRetry(): Promise<void> {
  * `dashboard` is the non-rotating get-or-create form; help and invalid
  * subcommands never call either credential endpoint. */
 async function cmdDashboard(args: string[]): Promise<void> {
+  const rawAction = args[0]?.toLowerCase();
+  const resolvesEndpoint = args.length <= 1
+    && !args.some(arg => ['--help', '-h', 'help'].includes(arg.toLowerCase()))
+    && (rawAction === undefined || rawAction === 'current' || rawAction === 'rotate');
+  if (resolvesEndpoint) await ensureDevboxDashboardExportForCurrentPort();
   const execution = await executeDashboardCommand(args, callDashboardEndpoint);
   if (execution.kind === 'help') {
     console.log(DASHBOARD_COMMAND_USAGE);
