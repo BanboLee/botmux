@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { __setLoopbackTransportForTests } from '../src/core/loopback-fetch.js';
+import { __testOnly_resetLarkGate } from '../src/im/lark/api-gate.js';
 
 const sentMessages = vi.hoisted(() => [] as Array<{ receiveId: string; msgType: string; content: string; uuid?: string }>);
 const patchedMessages = vi.hoisted(() => [] as Array<{ messageId: string; content: string }>);
@@ -886,6 +887,7 @@ describe('VC meeting daemon session lifecycle', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    __testOnly_resetLarkGate();
     __vcMeetingAgentTest.reset();
     __testOnly_activeSessions.clear();
     sentMessages.length = 0;

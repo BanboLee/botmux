@@ -5491,6 +5491,8 @@ async function readCardUsageSnapshotForSend(
       // (parity with the daemon reader and the ledger/dashboard consumers).
       larkAppId: larkAppId ?? session.larkAppId,
       fresh: true,
+      // 定价覆盖：从 bot 配置解析，未配置时 undefined（costCny 缺省）。
+      pricing: larkAppId ? resolvePricingForCli(larkAppId) : undefined,
     });
   } catch {
     return { context: null, tokens: null };
@@ -6097,6 +6099,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   voice                配置语音总结（高级功能，独立于 setup）— 交互式填 TTS 引擎+凭证
        voice status    查看当前语音配置（凭证打码）
        voice disable   关闭语音功能（移除配置）
+       voice asr       配置语音识别（飞书语音消息→文字驱动会话）
+       voice asr status|disable   查看 / 关闭 ASR
   vc-agent tat-gate|poll
                        飞书会议智能体 P0：校验 TAT 会中事件读取、轮询会议事件并触发 workflow
   plugin              管理 botmux 插件
@@ -7210,7 +7214,8 @@ import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './servi
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
-import { effectiveDefaultWorkingDir, loadBotConfigs, resolveBrandLabel, resolveUsageDisplay } from './bot-registry.js';
+import { effectiveDefaultWorkingDir, loadBotConfigs, resolveBrandLabel, resolveUsageDisplay, getBot } from './bot-registry.js';
+import { resolvePricingConfig, type ResolvedModelPricing } from './services/model-pricing.js';
 import { config } from './config.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
@@ -7565,6 +7570,11 @@ async function registerSelfFromCredFile(): Promise<void> {
  *  `loadBotConfigs()` 重载会把沙箱残留的 stale bots.json（可能是同 appId 的旧
  *  secret）覆盖到注册表上——每次本地重载后必须把 env bot 重新注册回去压轴。 */
 let envPinnedRiffBot: import('./bot-registry.js').BotConfig | null = null;
+
+/** 从 bot 配置解析定价（bots.json pricing 块 → 内置表）。未配置时返回 undefined。 */
+function resolvePricingForCli(larkAppId: string): ResolvedModelPricing | undefined {
+  return resolvePricingConfig(getBot(larkAppId)?.config?.pricing);
+}
 
 function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { session: SessionData; botConfig: import('./bot-registry.js').BotConfig } | null {
   const appId = process.env.BOTMUX_LARK_APP_ID;
@@ -12448,6 +12458,55 @@ async function cmdVoiceSetup(args: string[]): Promise<void> {
   if (sub === 'disable' || sub === 'off') {
     mergeGlobalConfig({ voice: null });
     console.log('✅ 已移除全局语音配置（回复卡片不再显示「🔊 语音总结」按钮）。重启 daemon 生效。');
+    return;
+  }
+  if (sub === 'asr') {
+    const asrSub = (args[1] ?? '').toLowerCase();
+    const maskAsr = (s?: string) => (s ? `${s.slice(0, 4)}***` : '(未设)');
+    if (asrSub === 'status') {
+      const asr = readGlobalConfig().voice?.asr;
+      if (!asr) { console.log('语音识别（ASR）未配置。运行 `botmux voice asr` 配置。'); return; }
+      console.log('当前 ASR 配置（全局 ~/.botmux/config.json）:');
+      console.log(`  启用: ${asr.enabled ? '是' : '否'}`);
+      console.log(`  baseUrl: ${asr.baseUrl ?? '(未设)'}`);
+      console.log(`  model: ${asr.model ?? '(未设)'}`);
+      console.log(`  apiKey: ${maskAsr(asr.apiKey)}`);
+      if (asr.language) console.log(`  语言: ${asr.language}`);
+      if (typeof asr.timeoutMs === 'number') console.log(`  超时: ${asr.timeoutMs}ms`);
+      return;
+    }
+    if (asrSub === 'disable' || asrSub === 'off') {
+      const curVoice = readGlobalConfig().voice ?? {};
+      mergeGlobalConfig({ voice: { ...curVoice, asr: { ...(curVoice.asr ?? {}), enabled: false } } as any });
+      console.log('✅ 已关闭语音识别（ASR）。重启 daemon 生效。');
+      return;
+    }
+    if (asrSub && asrSub !== 'setup') {
+      console.error('用法: botmux voice asr [status|disable]（无参 = 交互式配置）');
+      process.exit(1);
+    }
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      console.log('🎤 配置语音识别（ASR）。飞书语音消息将转写为文本驱动会话。写入全局 ~/.botmux/config.json，重启后生效。\n');
+      const baseUrl = (await ask(rl, 'baseUrl（OpenAI 兼容，如 https://api.openai.com/v1）: ')).trim();
+      const apiKey = (await ask(rl, 'apiKey（无则留空）: ')).trim();
+      const model = (await ask(rl, 'model（如 whisper-1）: ')).trim();
+      if (!baseUrl || !model) { console.error('❌ baseUrl 和 model 必填，未写入。'); return; }
+      const language = (await ask(rl, '语言提示（可选，如 zh，留空跳过）: ')).trim();
+      const curVoice = readGlobalConfig().voice ?? {};
+      const asr: Record<string, any> = {
+        enabled: true,
+        baseUrl,
+        model,
+        ...(apiKey ? { apiKey } : {}),
+        ...(language ? { language } : {}),
+      };
+      mergeGlobalConfig({ voice: { ...curVoice, asr } as any });
+      console.log('\n✅ 已写入 voice.asr 配置。`botmux restart` 后，发给机器人的语音消息会自动转写。');
+      console.log('   查看：`botmux voice asr status`  关闭：`botmux voice asr disable`');
+    } finally {
+      rl.close();
+    }
     return;
   }
   if (sub && sub !== 'setup') {
