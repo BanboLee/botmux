@@ -66,6 +66,22 @@ describe('package.json — lockfile safety and packaging', () => {
   it('the file named in `files` actually exists on disk', () => {
     expect(existsSync(POSTINSTALL)).toBe(true);
   });
+
+  it('ships the PATH helper too (postinstall imports it at install time)', () => {
+    // ⚠️ Without this the whole suite stays green while the published tarball
+    // silently regresses to "just print a PATH hint": the fixture copies the
+    // helper in directly rather than consulting the manifest, and the
+    // missing-helper case deliberately asserts fail-soft. So dropping this one
+    // `files` line would reintroduce the exact npm bug this PR fixes.
+    const helper = 'scripts/install-path-entry.mjs';
+    const shipped = manifest.files.some(
+      (f: string) => f === helper || f === 'scripts/' || f === 'scripts',
+    );
+    expect(shipped).toBe(true);
+    expect(existsSync(resolve(helper))).toBe(true);
+    // And postinstall must actually be the thing that pulls it in.
+    expect(readFileSync(POSTINSTALL, 'utf-8')).toContain('./install-path-entry.mjs');
+  });
 });
 
 describe('inject-optional-binaries — release-time version wiring', () => {
@@ -146,6 +162,12 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     global?: string;
     withSubpackage?: boolean;
     sourceCheckout?: boolean;
+    /** Omit scripts/install-path-entry.mjs, to prove the import is fail-soft. */
+    withoutPathHelper?: boolean;
+    /** Pretend binDir is already on PATH, so the PATH-writing branch is skipped. */
+    binDirOnPath?: boolean;
+    /** $SHELL for the child, which decides WHICH startup file gets the PATH line. */
+    shell?: string;
   }) {
     const base = tmp();
     const home = join(base, 'home');
@@ -153,6 +175,16 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     mkdirSync(home, { recursive: true });
     mkdirSync(join(pkg, 'scripts'), { recursive: true });
     writeFileSync(join(pkg, 'scripts', 'postinstall-bin.mjs'), readFileSync(POSTINSTALL));
+    // postinstall imports this sibling to write the PATH entry. It ships via
+    // package.json `files`, so the fixture must carry it too — otherwise this
+    // exercises a package layout we never publish. (`opts.withoutPathHelper`
+    // deliberately omits it, to prove the import is fail-soft.)
+    if (!opts.withoutPathHelper) {
+      writeFileSync(
+        join(pkg, 'scripts', 'install-path-entry.mjs'),
+        readFileSync(join(__dirname, '..', 'scripts', 'install-path-entry.mjs')),
+      );
+    }
     writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'botmux', version: '3.20.0' }));
 
     if (opts.sourceCheckout) {
@@ -173,13 +205,15 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
 
     const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: home };
     if (opts.global !== undefined) env.npm_config_global = opts.global;
+    if (opts.binDirOnPath) env.PATH = `${join(home, '.botmux', 'bin')}:${process.env.PATH}`;
+    if (opts.shell) env.SHELL = opts.shell;
 
     const r = spawnSync(process.execPath, [join(pkg, 'scripts', 'postinstall-bin.mjs')], {
       encoding: 'utf-8',
       env,
     });
     const launcher = join(home, '.botmux', 'bin', 'botmux');
-    return { ...r, launcher, binary, wrote: existsSync(launcher) };
+    return { ...r, launcher, binary, home, wrote: existsSync(launcher) };
   }
 
   it('global install → writes a launcher that execs the platform binary', () => {
@@ -191,6 +225,39 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     // No node anywhere — the binary is self-contained. `node` as a command word,
     // so a path merely containing "node" cannot produce a false pass.
     expect(content).not.toMatch(/(^|\s)node(\s|$)/m);
+  });
+
+  /**
+   * PATH is the only thing that turns the launcher into a command (there is no
+   * `bin` field), so these two cover the reported "installed fine, still
+   * `command not found`" bug and its blast radius.
+   */
+  it('global install also puts binDir on PATH, in the file the user\'s shell reads', () => {
+    const r = runPostinstall({ global: 'true', shell: '/usr/bin/zsh' });
+    expect(r.status).toBe(0);
+    // zsh reads .zshenv, NOT .profile — writing .profile was the original bug.
+    const zshenv = join(r.home, '.zshenv');
+    expect(existsSync(zshenv)).toBe(true);
+    expect(readFileSync(zshenv, 'utf-8')).toContain(join(r.home, '.botmux', 'bin'));
+    expect(existsSync(join(r.home, '.profile'))).toBe(false);
+  });
+
+  it('a missing PATH helper degrades to a hint — it must NOT fail the install', () => {
+    // The launcher is already written by this point; aborting here would turn a
+    // working install into a failed one over a cosmetic step.
+    const r = runPostinstall({ global: 'true', withoutPathHelper: true });
+    expect(r.status).toBe(0);
+    expect(r.wrote).toBe(true);
+    expect(`${r.stdout}${r.stderr}`).toContain('PATH');
+  });
+
+  it('touches no startup file when binDir is already on PATH', () => {
+    // An upgrade on a machine that was set up long ago must not keep appending
+    // to (or even creating) rc files it has nothing to add to.
+    const r = runPostinstall({ global: 'true', shell: '/usr/bin/zsh', binDirOnPath: true });
+    expect(r.status).toBe(0);
+    expect(r.wrote).toBe(true);                        // launcher still written
+    expect(existsSync(join(r.home, '.zshenv'))).toBe(false);
   });
 
   it('the written launcher actually runs and preserves argument boundaries', () => {

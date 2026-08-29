@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { cliAuthBind, loadDashboardSecret, signCliAuth } from '../dashboard/auth.js';
+import { loopbackFetchImpl } from '../core/loopback-fetch.js';
 
 /**
  * Loopback HMAC client for the dashboard process's `/__cli/*` endpoints, used by
@@ -99,7 +100,8 @@ export async function requestDashboardAt(opts: {
   fetchImpl?: FetchImpl;
 }): Promise<DashboardResult> {
   const { host, port, path, secret } = opts;
-  const fetchImpl = opts.fetchImpl ?? fetch;
+  // Default is the proxy-immune loopback client above, NOT the global `fetch`.
+  const fetchImpl = opts.fetchImpl ?? loopbackFetchImpl;
   // Bind the credential to method + path + the port we're dialing. A malicious
   // server handed these headers during discovery therefore can't forward them
   // to a different `/__cli/*` route or to the real dashboard on another port —
@@ -161,7 +163,8 @@ export async function callDashboard(opts: {
   const host = opts.host ?? '127.0.0.1';
   const probeSpan = opts.probeSpan ?? 20;
   const persistPort = opts.persistPort ?? true;
-  const fetchImpl = opts.fetchImpl ?? fetch;
+  // Same reason as in requestDashboardAt: the default must stay proxy-immune.
+  const fetchImpl = opts.fetchImpl ?? loopbackFetchImpl;
 
   const secretPath = join(opts.configDir, '.dashboard-secret');
   let secret: string | null;
