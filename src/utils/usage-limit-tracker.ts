@@ -22,21 +22,22 @@ export interface UsageLimitTracker<S extends string = string> {
   detectedThisTurn(seq: number): boolean;
   noteStructuredLimit(state: CliUsageLimitState): void;
   /**
-   * A turn reached its terminal and a bridge final_output is being emitted.
+   * A turn reached its terminal.
    *
-   * `outcome` distinguishes a real model answer from a failure/notice fallback:
-   * the codex bridge routes BOTH through the same emit (`structuredFallbackKind`
-   * can be 'failed', whose content is failedBridgeFallbackContent — a notice,
-   * not an answer). Only 'answered' is positive evidence the CLI is not
-   * limit-blocked, so only that arms the stale-banner suppression. A 'failed'
-   * terminal must never arm it: a rate/usage refusal IS a failed terminal, and
-   * treating it as an answer would suppress the very banner it should surface.
+   * `outcome` distinguishes a real model answer from a failure/ambiguous
+   * terminal, and ONLY 'answered' changes any state:
    *
-   * Both outcomes still clear the structured-limit re-emit latch, preserving the
-   * existing self-heal: in an adopted session the user can recover from a
-   * structured rate limit in their own terminal without triggering beginTurn(),
-   * and without this the latch would re-pin the card / Dashboard after the
-   * daemon already cleared it.
+   *  - 'answered' drops the structured-limit re-emit latch (preserving the
+   *    existing self-heal: in an adopted session the user can recover from a
+   *    structured rate limit in their own terminal without triggering
+   *    beginTurn(), and without this the latch would re-pin the card /
+   *    Dashboard after the daemon already cleared it) and arms the stale-banner
+   *    suppression.
+   *  - 'failed' is a NO-OP. A rate/usage refusal IS a failed terminal, so it is
+   *    evidence FOR a limit, never against one — it must neither arm the
+   *    suppression nor drop the latch. Dropping the latch on a failed terminal
+   *    would silence a real 429 whose screen-scan verdict is suppressed because
+   *    the structured signal is the authority (codex).
    */
   noteTurnCompleted(outcome?: 'answered' | 'failed'): void;
 }
@@ -232,17 +233,27 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
       detectedTurn = turnSeq;
       activeStructured = { seq: turnSeq, state };
     },
-    // A turn reached its terminal. Both outcomes drop the structured re-emit
-    // latch (the daemon's final_output handler already cleared ds.usageLimit for
-    // the same recovery, and a re-emit would re-pin the card / Dashboard), but
-    // only 'answered' is evidence the CLI is not limit-blocked.
+    // A turn reached its terminal. Only 'answered' is evidence the CLI is not
+    // limit-blocked, and only 'answered' touches state at all — see below.
     // detectedTurn is intentionally left as a historical fact (it self-clears
     // on the next beginTurn).
     noteTurnCompleted(outcome: 'answered' | 'failed' = 'answered'): void {
-      activeStructured = undefined;
-      // A failed terminal proves nothing about limits — a rate/usage refusal IS
-      // a failed terminal — so it must not arm the stale-banner suppression.
+      // A failed/ambiguous terminal proves nothing about limits — a rate/usage
+      // refusal IS a failed terminal — so it must change NOTHING: it neither
+      // arms the stale-banner suppression nor drops the structured re-emit
+      // latch. Dropping the latch here would be actively harmful on the path
+      // this fix newly routes through: with a `botmux send` marker on the turn,
+      // a structured 429 sets activeStructured, then the gate branch reaches
+      // this call with outcome='failed'; clearing the latch would let the next
+      // `working` frame trigger the daemon's self-heal, and because codex's
+      // screen-scan `rate` verdict is suppressed (structured signal is the
+      // authority) nothing would ever re-report it — a real 429 gone silent.
       if (outcome !== 'answered') return;
+      // Only a real answer is evidence the CLI recovered, so only here do we
+      // drop the latch — the daemon's final_output handler already cleared
+      // ds.usageLimit for the same recovery, and a re-emit would re-pin the
+      // card / Dashboard.
+      activeStructured = undefined;
       // Positive evidence this turn is NOT limit-blocked: the CLI produced a
       // harvested answer. Any limit banner that was already on screen when
       // the turn opened is therefore leftover text from an earlier episode.

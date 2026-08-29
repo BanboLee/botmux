@@ -281,6 +281,31 @@ describe('usage-limit tracker — 屏幕上的旧限额横幅不得每轮重新�
     expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('limited');
   });
 
+  it('failed 终态不得清结构化 latch（真 429 不得静默）', () => {
+    // 本 PR 在 gate 分支新增了 noteTurnCompleted 调用点，把 failed 终态接进了
+    // 「清 latch」这条路——而 master 上这条路根本不会被走到。真路径：本轮已有
+    // botmux send marker，结构化 429 先置 latch，随后 gate=true 带着 failed 终态
+    // 调到这里。若清了 latch，下一帧 working 会触发 daemon 自愈清限额，而 codex
+    // 的扫屏 rate 判定本来就被 suppress（结构化才是权威）⟹ 真 429 永久静默。
+    const tracker = codexTracker();
+    tracker.beginTurn('');
+    tracker.noteStructuredLimit(structuredLimit());
+    expect(tracker.classify('模型正常输出', 'working').status).toBe('limited');
+    tracker.noteTurnCompleted('failed');
+    expect(tracker.classify('模型正常输出', 'working').status).toBe('limited');
+    expect(tracker.classify('模型正常输出', 'idle').status).toBe('limited');
+  });
+
+  it('answered 终态仍清结构化 latch（既有自愈不变）', () => {
+    // 反向校准：failed 不清 latch 这条改动不能顺手把 answered 的自愈也关掉。
+    const tracker = codexTracker();
+    tracker.beginTurn('');
+    tracker.noteStructuredLimit(structuredLimit());
+    expect(tracker.classify('模型正常输出', 'working').status).toBe('limited');
+    tracker.noteTurnCompleted('answered');
+    expect(tracker.classify('模型正常输出', 'working').status).toBe('working');
+  });
+
   it('ambiguous 终态同样不得置成功位', () => {
     const tracker = codexTracker();
     tracker.beginTurn(STALE_BANNER);
