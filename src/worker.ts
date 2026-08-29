@@ -360,7 +360,7 @@ import {
 } from './utils/herdr-web-history.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
 import { structuredRateLimitState, isStructuredRateLimitAuthoritative, type CliUsageLimitState } from './utils/cli-usage-limit.js';
-import { createUsageLimitTracker } from './utils/usage-limit-tracker.js';
+import { bridgeTurnOutcome, createUsageLimitTracker } from './utils/usage-limit-tracker.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
 import { applySessionOwnerEnv, redactChildEnv, scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import {
@@ -5758,6 +5758,9 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
 
     const gateInput = { markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, finalText: assistantText };
     if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
+      // Completed turn whose output went out via `botmux send` (or deliberate
+      // silence) — see the codex bridge's twin for why this must arm here.
+      usageLimitTracker.noteTurnCompleted('answered');
       const reason = turn.isLocal ? 'local-typed' : 'model called botmux send within window';
       log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (${reason})`);
       // Positive silence evidence for the terminal — only a bare nothing-to-send
@@ -5802,7 +5805,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
         // limit that parked it — mirror the daemon's final_output self-heal
         // (worker-pool clears ds.usageLimit there) by dropping the tracker's
         // re-emit latch so the next classify() does not re-pin the card.
-        usageLimitTracker.noteTurnCompleted();
+        usageLimitTracker.noteTurnCompleted('answered');
         send({
           type: 'final_output',
           content: fields.content,
@@ -5817,7 +5820,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
       // Headless local turn — see formatHeadlessLocalTurnContent for context.
       const headlessContent = formatHeadlessLocalTurnContent(postText);
       if (!headlessContent) continue;
-      usageLimitTracker.noteTurnCompleted();
+      usageLimitTracker.noteTurnCompleted('answered');
       send({
         type: 'final_output',
         content: headlessContent,
@@ -5836,7 +5839,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     const deliveredText = turn.restoredFromJournal
       ? `${t('worker.bridge_restored_turn_notice')}\n\n${postText}`
       : postText;
-    usageLimitTracker.noteTurnCompleted();
+    usageLimitTracker.noteTurnCompleted('answered');
     send({
       type: 'final_output',
       content: deliveredText,
@@ -7353,6 +7356,12 @@ function emitReadyCodexTurns(): void {
           : '';
     if (!content) continue;
     if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
+      // The turn still COMPLETED — its content went out via `botmux send`, or it
+      // was a deliberate nothing-to-send. That is the ordinary success path, so
+      // it is positive evidence the CLI is not limit-blocked and must arm the
+      // stale-banner suppression HERE: the emit below is skipped on this path,
+      // so binding `answered` to the emit alone would miss the common case.
+      usageLimitTracker.noteTurnCompleted(bridgeTurnOutcome(turn));
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
       // Distinguish DELIBERATE SILENCE (bare nothing-to-send sentinel, no prose,
       // no send) from other suppression reasons (already `botmux send`-ed this
@@ -7388,7 +7397,7 @@ function emitReadyCodexTurns(): void {
       if (!fields) continue;
       // Harvested answer → drop the structured-limit re-emit latch (mirrors
       // the daemon's final_output self-heal; see emitReadyTurns).
-      usageLimitTracker.noteTurnCompleted();
+      usageLimitTracker.noteTurnCompleted(bridgeTurnOutcome(turn));
       send({
         type: 'final_output',
         ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),
@@ -7401,7 +7410,7 @@ function emitReadyCodexTurns(): void {
       });
       continue;
     }
-    usageLimitTracker.noteTurnCompleted();
+    usageLimitTracker.noteTurnCompleted(bridgeTurnOutcome(turn));
     send({
       type: 'final_output',
       ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),

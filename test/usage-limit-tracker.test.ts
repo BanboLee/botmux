@@ -13,8 +13,10 @@
  * Run: pnpm vitest run test/usage-limit-tracker.test.ts
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
+import { bridgeTurnOutcome, createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
 import { detectCliUsageLimit } from '../src/utils/cli-usage-limit.js';
+import { structuredFallbackKind } from '../src/services/bridge-fallback-gate.js';
+import { CODEX_RATE_LIMIT_ERROR_CODE } from '../src/services/codex-transcript.js';
 import type { CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 
 function structuredLimit(): CliUsageLimitState {
@@ -200,94 +202,180 @@ describe('usage-limit tracker — outputActive 门控（working 不等于输出�
 });
 
 describe('usage-limit tracker — 屏幕上的旧限额横幅不得每轮重新钉住卡片', () => {
-  // 线上真实横幅（Codex）。关键性质有两条：
+  // 线上真实横幅（Codex）。关键性质：
   //  ① 只带钟点不带日期 ⟹ detectCliUsageLimit 对「已过去的 PM 时间」刻意留在
   //     今天（见其注释），所以一天里 20:45 之前的任意时刻，这条隔夜横幅都被
   //     解析成「今天 20:45」这个未来时刻 ⟹ retryReady === false。
-  //  ② Codex 整个 pane 只打印一次就一直留在 viewport 里（实测 261 个 live
-  //     tmux 会话、-S -20000 深回滚，没有任何 pane 出现第二次），所以它不是
-  //     「CLI 又拒了一次」的活证据，而是一块不会消失的旧背景。
-  // 二者叠加：若过期横幅抑制只在 retryReady 时武装，它就恰好在最需要它的场景
-  // 里失效——每开一轮新会话都被同一条陈旧文案重新判成限额。
+  //  ② Codex 整个 pane 只打印一次就一直留在 viewport 里（实测 261 个 live tmux
+  //     会话、-S -20000 深回滚，没有任何 pane 出现第二次），所以它不是「CLI 又
+  //     拒了一次」的活证据，而是一块不会消失的旧背景。
+  // 判据不能只看横幅文本/key：那分不开「旧横幅」与「同文案的新拒绝」。也不能
+  // 要求「出现新的结构化记录」：实测全仓 1925 个 rollout 里，带
+  // usage_limit_exceeded task_complete 的 8 个**各自只有一条**，且其中有会话在
+  // 限额之后仍跑了 7 个 turn / 12 条用户消息——usage kind 的结构化信号只写一次。
+  // 所以用的是正向成功证据：本轮 CLI 真的答出了东西（noteTurnCompleted
+  // 'answered'）——被限额阻塞的轮次永远不会产出成功终态。
   const STALE_BANNER = "■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 8:45 PM.";
+  // 另一个 CLI 家族的「带明确重置时刻的 rate 限额」（仓库既有真路径，见
+  // cli-usage-limit.test.ts）。它走 parseMeridiemTime 拿固定钟点，不走 5 分钟
+  // 分桶，所以 key 不会自己递进——这类必须保持原语义，绝不能被抑制。
+  const GEMINI_RATE_BANNER = 'Rate limit exceeded. Try again at 10:36 PM.';
 
   // 把时钟钉在 8:45 PM 之前，让 retryReady 稳定为 false（回归的前提条件）。
-  // 不钉时钟的话，这个用例在每天 20:45 之后会因为 retryReady 变 true 而
-  // 「自己变绿」——那是最坏的一种假绿：它会在 CI 的某些时段掩盖真回归。
+  // 不钉时钟的话，用例在每天 20:45 之后会因为 retryReady 变 true 而「自己变
+  // 绿」——那是最坏的一种假绿：它会在 CI 的某些时段掩盖真回归。
   const beforeReset = new Date('2026-08-29T10:00:00-07:00');
   beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(beforeReset); });
   afterEach(() => { vi.useRealTimers(); });
 
-  function codexTracker() {
-    // codex：emitsStructuredRateLimit ⟹ suppressRateKind=true（rate 走结构化，
-    // 扫屏只留 usage 判定）；限额错误屏上 PTY 已静默 ⟹ outputActive=false。
-    return createUsageLimitTracker({
-      isRateKindSuppressed: () => true,
-      isOutputActive: () => false,
-    });
-  }
+  /** codex：emitsStructuredRateLimit ⟹ suppressRateKind=true（rate 走结构化，
+   *  扫屏只留 usage）；限额错误屏上 PTY 已静默 ⟹ outputActive=false。 */
+  const codexTracker = () => createUsageLimitTracker({
+    isRateKindSuppressed: () => true,
+    isOutputActive: () => false,
+  });
+  /** 非结构化 CLI（gemini/grok/traex…）：rate 扫屏在用，且没有结构化兜底。 */
+  const plainTracker = () => createUsageLimitTracker({
+    isRateKindSuppressed: () => false,
+    isOutputActive: () => false,
+  });
 
   it('前提校验：这条横幅在重置时刻之前确实解析为 retryReady=false', () => {
-    // 这不是被测行为，而是「上面两条性质」的自证。如果哪天解析规则改了、
-    // 这条横幅变成 retryReady=true，下面的回归用例就不再覆盖它声称的场景
-    // （会退化成一个恒真断言），必须由这条前提用例先红出来。
+    // 这不是被测行为，而是上面「性质①」的自证。如果哪天解析规则改了、这条横幅
+    // 变成 retryReady=true，下面的回归用例就不再覆盖它声称的场景（会退化成恒真
+    // 断言），必须由这条前提用例先红出来。
     const detected = detectCliUsageLimit(STALE_BANNER);
     expect(detected.limited).toBe(true);
     expect((detected as CliUsageLimitState).kind).toBe('usage');
     expect((detected as CliUsageLimitState).retryReady).toBe(false);
   });
 
-  it('新一轮开始时屏幕上就有横幅 ⟹ 本轮不再判限额（回归）', () => {
+  it('本轮真答完后，屏幕上的旧横幅不再判限额（回归）', () => {
     const tracker = codexTracker();
     // 第 1 轮：真限额命中（canary——若这里就不 limited，本用例什么都没测到）。
     tracker.beginTurn('');
     expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('limited');
 
-    // 第 2 轮：用户重新发消息。daemon 的 beginNewTurn 已清 ds.usageLimit，
-    // 但屏幕上那条横幅还在（Codex 不会重印、也不会自己消失）。
+    // 第 2 轮：用户重新发消息，屏幕上那条横幅还在（Codex 不重印也不消失）。
     const seq2 = tracker.beginTurn(STALE_BANNER);
-    expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('idle');
-    expect(tracker.detectedThisTurn(seq2)).toBe(false);
-  });
-
-  it('CLI 正常答完一轮后，后续 idle tick 也不会被旧横幅重新钉住', () => {
-    // 完整还原线上症状：自愈路径（noteTurnCompleted + daemon 侧
-    // clearUsageLimitState）全都执行了，卡片却又被扫屏重新钉回 limited。
-    const tracker = codexTracker();
-    tracker.beginTurn(STALE_BANNER);
-    tracker.noteTurnCompleted();
+    tracker.noteTurnCompleted('answered');
     expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('idle');
     expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('idle');
     expect(tracker.classify(STALE_BANNER, 'stalled').status).toBe('stalled');
+    expect(tracker.detectedThisTurn(seq2)).toBe(false);
+  });
+
+  it('本轮尚未答出东西时，旧横幅照常判限额（不得 fail-open）', () => {
+    // 这是抑制的「有牙」边界：没有成功证据就不抑制，真限额仍然上报。
+    const tracker = codexTracker();
+    tracker.beginTurn(STALE_BANNER);
+    expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('limited');
+  });
+
+  it('failed 终态不得置成功位（限额拒绝本身就是 failed 终态）', () => {
+    // codex bridge 的失败 fallback 与成功路径共用同一个出口，若把它当成功
+    // 证据，等于「用限额拒绝证明没被限额」。
+    const tracker = codexTracker();
+    tracker.beginTurn(STALE_BANNER);
+    tracker.noteTurnCompleted('failed');
+    expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('limited');
+  });
+
+  it('ambiguous 终态同样不得置成功位', () => {
+    const tracker = codexTracker();
+    tracker.beginTurn(STALE_BANNER);
+    tracker.noteTurnCompleted('failed'); // bridgeTurnOutcome 把 ambiguous 映射到 failed
+    expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('limited');
+  });
+
+  it('成功判据必须取终态，不能取 fallbackKind（失败+已send 的组合）', () => {
+    // structuredFallbackKind 决定「展示哪种 fallback」，不是终态：当失败 fallback
+    // 被 gate 掉（本轮已 botmux send / 命中 codex 限额短路 rateLimitHandled）时，
+    // 它会返回 'final'。此处以 bridge-fallback-gate 的真实返回值驱动，确认按
+    // fallbackKind 判会把 failed 终态误判成成功，而按 terminalStatus 判不会。
+    const failedButGated = structuredFallbackKind(
+      { turnId: 't', isLocal: false, finalText: 'x', markTimeMs: Date.now(),
+        terminalStatus: 'failed', terminalErrorCode: CODEX_RATE_LIMIT_ERROR_CODE } as any,
+      undefined, [], false, true,
+    );
+    // 真路径自证：这个组合下 fallbackKind 确实不是 'failed'。
+    expect(failedButGated).not.toBe('failed');
+
+    // 按终态判（worker 的 bridgeTurnOutcome 口径）：failed ⟹ 不置位 ⟹ 仍上报。
+    const tracker = codexTracker();
+    tracker.beginTurn(STALE_BANNER);
+    tracker.noteTurnCompleted('failed');
+    expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('limited');
+  });
+
+  it('已 botmux send（fallback 被 gate 掉）也算成功终态', () => {
+    // 最常见的成功路径：模型本轮已 botmux send，shouldSuppressBridgeEmit 会在
+    // final_output 之前 continue。若把成功证据绑在「是否又发了一条 final_output」
+    // 上，这条路径永远不置位，原横幅仍会每轮重钉——即本 bug 的主场景。
+    const tracker = codexTracker();
+    tracker.beginTurn(STALE_BANNER);
+    tracker.noteTurnCompleted('answered');
+    expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('idle');
   });
 
   it('抑制严格按 episode 收敛：干净开局时中途出现的限额仍要检出', () => {
-    // 反向校准：这条修法不能把「真限额」一起抑制掉。
     const tracker = codexTracker();
     tracker.beginTurn('干净屏幕，完全没有限额文案');
+    tracker.noteTurnCompleted('answered');
     const detected = tracker.classify(STALE_BANNER, 'idle');
     expect(detected.status).toBe('limited');
     expect(detected.usageLimit?.kind).toBe('usage');
   });
 
-  it('抑制只认同一 episode：换成另一个重置钟点即视为新限额', () => {
-    // usageLimitStateKey 含 retryAtMs + label，所以「另一次限额」自带不同 key。
+  it('抑制只认同一横幅：换成另一个重置钟点即视为新限额', () => {
     const tracker = codexTracker();
     tracker.beginTurn(STALE_BANNER);
+    tracker.noteTurnCompleted('answered');
     expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('idle');
-    const newEpisode = STALE_BANNER.replace('8:45 PM', '11:15 PM');
-    const detected = tracker.classify(newEpisode, 'idle');
+    const detected = tracker.classify(STALE_BANNER.replace('8:45 PM', '11:15 PM'), 'idle');
     expect(detected.status).toBe('limited');
     expect(detected.usageLimit?.retryLabel).toBe('11:15 PM');
   });
 
-  it('已抑制的 episode 不影响结构化限流重发', () => {
-    // 结构化信号是权威的：屏幕上有陈旧横幅时，它照样要能把卡片钉住。
+  it('横幅身份不含时钟：跨午夜不得因 retryAtMs 漂移而重新钉住', () => {
+    // usageLimitStateKey 含 retryAtMs，而 retryAtMs 是按「今天」解析的，所以同
+    // 一段屏幕文字在午夜前后会产生不同的 key。若用它当横幅身份，抑制会在 00:01
+    // 静默失效、在没有任何新输入的情况下把卡片重新钉住。
+    const tracker = codexTracker();
+    vi.setSystemTime(new Date('2026-08-29T23:59:00-07:00'));
+    tracker.beginTurn(STALE_BANNER);
+    tracker.noteTurnCompleted('answered');
+    expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('idle');
+    vi.setSystemTime(new Date('2026-08-30T00:01:00-07:00'));
+    expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('idle');
+  });
+
+  it('结构化限额到达后撤销成功抑制（权威信号优先）', () => {
+    // 成功答完之后又收到权威限额（steer / 多答交错）：CLI 现在确实被阻塞，
+    // 不能再让「本轮答过」把该显示的横幅继续吞掉。
     const tracker = codexTracker();
     tracker.beginTurn(STALE_BANNER);
+    tracker.noteTurnCompleted('answered');
     expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('idle');
     tracker.noteStructuredLimit(structuredLimit());
     expect(tracker.classify(STALE_BANNER, 'working').status).toBe('limited');
+  });
+
+  it('非结构化 CLI 的带钟点限额：重试仍被拒时必须继续上报', () => {
+    // 无结构化兜底的 CLI（gemini/grok/traex…）：其带明确钟点的限额走固定
+    // retryAtMs、不走 5 分钟分桶，key 不会自己递进。用户在真限额期间重试、
+    // CLI 以同文案再拒时，必须照报——否则真限额被静默到跨日。
+    const tracker = plainTracker();
+    tracker.beginTurn(GEMINI_RATE_BANNER);
+    expect(tracker.classify(GEMINI_RATE_BANNER, 'idle').status).toBe('limited');
+  });
+
+  it('非结构化 CLI 连续多轮重试都要上报', () => {
+    const tracker = plainTracker();
+    for (let turn = 0; turn < 5; turn++) {
+      tracker.beginTurn(GEMINI_RATE_BANNER);
+      expect(tracker.classify(GEMINI_RATE_BANNER, 'idle').status).toBe('limited');
+    }
   });
 
   it('working + 输出在进展时的既有门控不受影响', () => {
@@ -296,6 +384,34 @@ describe('usage-limit tracker — 屏幕上的旧限额横幅不得每轮重新�
       isOutputActive: () => true,
     });
     tracker.beginTurn('干净屏幕');
+    tracker.noteTurnCompleted('answered');
     expect(tracker.classify(STALE_BANNER, 'working').status).toBe('working');
+  });
+});
+
+describe('usage-limit tracker — bridgeTurnOutcome 按终态而非 fallbackKind 判成功', () => {
+  // 这个 predicate 是「本轮算不算答出东西」的唯一判据，worker 的三个 bridge
+  // 出口都调它。它必须只认终态：structuredFallbackKind 决定的是「展示哪种
+  // fallback 文案」，在失败 fallback 被 gate 掉时会对 failed 终态返回 'final'。
+  it('completed / undefined 终态算 answered', () => {
+    expect(bridgeTurnOutcome({ terminalStatus: 'completed' })).toBe('answered');
+    expect(bridgeTurnOutcome({})).toBe('answered');
+  });
+
+  it('failed / ambiguous 终态算 failed', () => {
+    expect(bridgeTurnOutcome({ terminalStatus: 'failed' })).toBe('failed');
+    expect(bridgeTurnOutcome({ terminalStatus: 'ambiguous' })).toBe('failed');
+  });
+
+  it('failed 终态 + 失败 fallback 被 gate 掉时，仍判 failed（真路径自证）', () => {
+    // 先用 bridge-fallback-gate 的真实返回值证明「按 fallbackKind 判会误判」，
+    // 再确认 bridgeTurnOutcome 不受它影响。缺了前半段，这条断言就无从判断自己
+    // 是否真的覆盖了那个绕过路径。
+    const turn = {
+      turnId: 't', isLocal: false, finalText: 'x', markTimeMs: Date.now(),
+      terminalStatus: 'failed' as const, terminalErrorCode: CODEX_RATE_LIMIT_ERROR_CODE,
+    };
+    expect(structuredFallbackKind(turn as any, undefined, [], false, true)).not.toBe('failed');
+    expect(bridgeTurnOutcome(turn)).toBe('failed');
   });
 });

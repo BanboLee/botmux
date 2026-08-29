@@ -22,15 +22,50 @@ export interface UsageLimitTracker<S extends string = string> {
   detectedThisTurn(seq: number): boolean;
   noteStructuredLimit(state: CliUsageLimitState): void;
   /**
-   * A turn completed successfully (a harvested bridge final_output is being
-   * emitted). Clears the structured-limit latch so a stale limit is not
-   * re-emitted on the next classify(). Mirrors the daemon's final_output
-   * self-heal (worker-pool clears ds.usageLimit on a real harvested answer):
-   * in an adopted session the user can recover from a structured rate limit
-   * in their own terminal without triggering beginTurn(), so without this the
-   * latch would re-pin the card / Dashboard after the daemon already cleared.
+   * A turn reached its terminal and a bridge final_output is being emitted.
+   *
+   * `outcome` distinguishes a real model answer from a failure/notice fallback:
+   * the codex bridge routes BOTH through the same emit (`structuredFallbackKind`
+   * can be 'failed', whose content is failedBridgeFallbackContent — a notice,
+   * not an answer). Only 'answered' is positive evidence the CLI is not
+   * limit-blocked, so only that arms the stale-banner suppression. A 'failed'
+   * terminal must never arm it: a rate/usage refusal IS a failed terminal, and
+   * treating it as an answer would suppress the very banner it should surface.
+   *
+   * Both outcomes still clear the structured-limit re-emit latch, preserving the
+   * existing self-heal: in an adopted session the user can recover from a
+   * structured rate limit in their own terminal without triggering beginTurn(),
+   * and without this the latch would re-pin the card / Dashboard after the
+   * daemon already cleared it.
    */
-  noteTurnCompleted(): void;
+  noteTurnCompleted(outcome?: 'answered' | 'failed'): void;
+}
+
+/**
+ * Clock-free identity of a limit banner: what the SCREEN TEXT says, with no
+ * resolved timestamp in it. usageLimitStateKey embeds retryAtMs, which
+ * detectCliUsageLimit resolves against the current day — so one unchanged
+ * banner produces a different key before and after midnight. Any "is this the
+ * same banner I saw earlier?" comparison must therefore use this instead.
+ */
+function bannerTextIdentity(state: CliUsageLimitState): string {
+  return `${state.kind}:${state.retryLabel}`;
+}
+
+/** Whether a bridge turn's terminal is positive evidence the CLI produced an
+ *  answer (as opposed to a failure/ambiguous terminal). Keyed on
+ *  `terminalStatus` and NOT on `structuredFallbackKind`: the latter decides
+ *  WHICH fallback text to display and returns 'final' for a failed terminal
+ *  whenever the failed fallback is gated away — including the codex
+ *  rate-limit short-circuit (rateLimitHandled), i.e. precisely the limit case
+ *  that must never be read as success. `undefined` means the drainer recorded
+ *  no failure, which is the ordinary completed shape. */
+export function bridgeTurnOutcome(
+  turn: { terminalStatus?: 'failed' | 'ambiguous' | 'completed' },
+): 'answered' | 'failed' {
+  return turn.terminalStatus === undefined || turn.terminalStatus === 'completed'
+    ? 'answered'
+    : 'failed';
 }
 
 export function createUsageLimitTracker<S extends string = string>(opts: {
@@ -50,29 +85,57 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
   let turnSeq = 0;
   let detectedTurn: number | undefined;
   /**
-   * usageLimitStateKey of a limit banner ALREADY on screen when this turn
-   * opened — i.e. a previous episode's leftover text, not evidence about this
-   * turn. classify() skips exactly that key so the stale banner cannot re-pin
-   * the card every turn.
-   *
-   * Deliberately NOT conditioned on retryReady. A CLI's banner carries only a
-   * wall-clock time ("try again at 8:45 PM"), and detectCliUsageLimit keeps a
-   * passed PM time on TODAY (see its comment) — so for most of the day a
-   * day-old banner parses as a FUTURE reset, i.e. retryReady === false. Codex
-   * prints that banner once and leaves it in the viewport forever (verified on
-   * live panes: never a second occurrence, even 20k lines back), so the
-   * "the CLI will reject the retry again and self-heal" assumption behind the
-   * retry-time rule does not hold there. Gating the suppression on retryReady
-   * therefore disarmed it precisely in the case it exists for: every new turn
-   * re-detected the same leftover text and re-pinned 「限额已达」 even after
-   * the CLI had answered normally — and, because clearUsageLimitState() also
-   * resets rateLimitNotifiedKey, re-sent the @owner "turn paused" ping each
-   * time. The state key (kind + retryAtMs + label) is the episode identity;
-   * retryReady is just a countdown flag on it, so a genuinely NEW limit —
-   * different reset clock, or a banner that appears mid-turn on a screen that
-   * started clean — has a different key (or none recorded) and still fires.
+   * usageLimitStateKey of a retry-READY limit banner already on screen when this
+   * turn opened — a previous episode whose reset time has demonstrably passed,
+   * so it is definitionally leftover text. Unchanged from before; the
+   * answered-turn rule below is what was added.
    */
   let staleBannerKey: string | undefined;
+  /**
+   * Clock-free identity (bannerTextIdentity) of ANY limit banner already on
+   * screen when this turn opened, retry-ready or not. Consulted only once
+   * turnProducedAnswer is true — see that flag for why an answer is the
+   * discriminator, and why a key/text comparison alone could not be.
+   *
+   * Deliberately NOT usageLimitStateKey: that embeds retryAtMs, which
+   * detectCliUsageLimit resolves against "today", so one unchanged banner
+   * yields a different key after midnight and the suppression would silently
+   * lapse — re-pinning the card at 00:01 with no new input at all.
+   */
+  let preExistingBannerKey: string | undefined;
+  /**
+   * This turn produced a harvested answer (noteTurnCompleted).
+   *
+   * This is the discriminator for the reported bug: a session that had hit its
+   * limit stayed pinned at 「限额已达」 for every later turn, even after the CLI
+   * answered normally. Codex prints its limit banner ONCE and leaves it in the
+   * viewport indefinitely (verified on live panes: never a second occurrence,
+   * even 20k scrollback lines back), so on each new turn the screen scan
+   * re-detected that same leftover text and re-pinned the card — and because
+   * clearUsageLimitState() also resets rateLimitNotifiedKey, re-sent the @owner
+   * "turn paused" ping each time.
+   *
+   * An answer is POSITIVE evidence: a turn that is actually limit-blocked never
+   * yields a harvested final_output. So "the CLI answered this turn" + "this
+   * banner was already on screen when the turn opened" is sufficient to call the
+   * text leftover, whatever its clock says. Without an answer we never suppress,
+   * so a genuine re-refusal still reports — which matters because two weaker
+   * discriminators do NOT work here:
+   *
+   *  - Comparing the banner text/key alone cannot separate "leftover banner"
+   *    from "identical text from a fresh refusal".
+   *  - Requiring a NEW structured record does not work for `usage`: across all
+   *    1925 local rollouts, the 8 carrying a `usage_limit_exceeded`
+   *    task_complete each carry exactly ONE, including sessions that went on to
+   *    run 7 more turns / 12 more user messages afterwards. Unlike the 429 path
+   *    (one appended record per refusal), a usage refusal is recorded once.
+   *
+   * Consequence, deliberately: CLIs that never reach noteTurnCompleted (gemini
+   * is not in STRUCTURED_BRIDGE_ALWAYS_CLI_IDS) keep the previous behavior
+   * exactly. Those are the CLIs with no authoritative limit signal at all, where
+   * suppressing a repeated banner would risk hiding a real block.
+   */
+  let turnProducedAnswer = false;
   // A STRUCTURED limit (transcript error record, Claude/Codex) is authoritative
   // and one-shot at the source (UUID-deduped emit). Re-emit it on every
   // classify() until the turn ends: a genuinely blocked CLI keeps its
@@ -95,7 +158,11 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
       detectedTurn = undefined;
       activeStructured = undefined;
       const current = detectCliUsageLimit(snapshot, undefined, { suppressRateKind: opts.isRateKindSuppressed() });
-      staleBannerKey = current.limited ? usageLimitStateKey(current) : undefined;
+      preExistingBannerKey = current.limited ? bannerTextIdentity(current) : undefined;
+      staleBannerKey = current.limited && current.retryReady
+        ? usageLimitStateKey(current)
+        : undefined;
+      turnProducedAnswer = false;
       return turnSeq;
     },
     // Map a runtime status to a usage-limit-aware status, recording whether this
@@ -128,9 +195,15 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
       }
 
       const key = usageLimitStateKey(detected);
-      // Same episode as the banner that was already on screen at turn start —
-      // leftover text, not a fresh verdict about this turn.
-      if (key === staleBannerKey) {
+      // (a) master's rule: a banner already on screen whose reset time has
+      //     already passed is definitionally leftover.
+      // (b) the new rule: a banner that was ALREADY on screen when this turn
+      //     opened, on a turn where the CLI has since produced a real answer.
+      //     The answer is positive proof the limit is not blocking, so the
+      //     text is leftover no matter what its clock says. Without an
+      //     answer we never suppress — a genuine re-refusal still reports.
+      if (key === staleBannerKey
+        || (turnProducedAnswer && bannerTextIdentity(detected) === preExistingBannerKey)) {
         return { status };
       }
 
@@ -149,18 +222,31 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
     // the turn ends. The actual emit is done by the caller.
     noteStructuredLimit(state: CliUsageLimitState): void {
       staleBannerKey = undefined;
+      // An authoritative limit arriving AFTER this turn produced an answer
+      // (steered / multi-answer turns can interleave) supersedes that answer as
+      // evidence: the CLI is blocked NOW. Re-arm both suppressions off, or the
+      // answered-turn rule would keep swallowing the banner the structured
+      // signal is telling us to show.
+      preExistingBannerKey = undefined;
+      turnProducedAnswer = false;
       detectedTurn = turnSeq;
       activeStructured = { seq: turnSeq, state };
     },
-    // A successfully harvested turn (bridge final_output) is definitive
-    // evidence the CLI recovered from any structured limit that parked it.
-    // Drop the latch so the next classify() does not re-emit the stale limit
-    // — the daemon's final_output handler already cleared ds.usageLimit for
-    // the same recovery, and a re-emit would re-pin the card / Dashboard.
+    // A turn reached its terminal. Both outcomes drop the structured re-emit
+    // latch (the daemon's final_output handler already cleared ds.usageLimit for
+    // the same recovery, and a re-emit would re-pin the card / Dashboard), but
+    // only 'answered' is evidence the CLI is not limit-blocked.
     // detectedTurn is intentionally left as a historical fact (it self-clears
     // on the next beginTurn).
-    noteTurnCompleted(): void {
+    noteTurnCompleted(outcome: 'answered' | 'failed' = 'answered'): void {
       activeStructured = undefined;
+      // A failed terminal proves nothing about limits — a rate/usage refusal IS
+      // a failed terminal — so it must not arm the stale-banner suppression.
+      if (outcome !== 'answered') return;
+      // Positive evidence this turn is NOT limit-blocked: the CLI produced a
+      // harvested answer. Any limit banner that was already on screen when
+      // the turn opened is therefore leftover text from an earlier episode.
+      turnProducedAnswer = true;
     },
   };
 }
