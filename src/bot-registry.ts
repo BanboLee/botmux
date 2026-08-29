@@ -2074,6 +2074,16 @@ function shortLarkPath(url: unknown): string {
  * access token can't leak.
  */
 export function formatLarkError(v: any): string | null {
+  // The SDK logger calls logger.error(formatErrors(error)), so its first
+  // argument is an array containing the already-sanitized Axios shape. Accept
+  // that wrapper here as well as the raw error received by CLI callers.
+  if (Array.isArray(v)) {
+    for (const item of v) {
+      const formatted = formatLarkError(item);
+      if (formatted) return formatted;
+    }
+    return null;
+  }
   if (!v || typeof v !== 'object') return null;
   const isAxios = v.isAxiosError === true || v.name === 'AxiosError' || (v.config && (v.response || v.status != null));
   if (!isAxios) return null;
@@ -2093,6 +2103,12 @@ export function formatLarkError(v: any): string | null {
   if (typeof code === 'number') parts.push(`code=${code}`);
   if (typeof msg === 'string' && msg) parts.push(`"${msg}"`);
   if (logId) parts.push(`log_id=${logId}`);
+  // Without an HTTP response, the transport code/message is the only useful
+  // signal. Keep it while still excluding config, headers, and stack.
+  if (httpStatus == null && typeof code !== 'number') {
+    if (typeof v.code === 'string' && v.code) parts.push(v.code);
+    if (typeof v.message === 'string' && v.message) parts.push(`"${v.message}"`);
+  }
   if (!parts.length) return null;
   return parts.join(' ');
 }

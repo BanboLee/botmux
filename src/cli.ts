@@ -132,7 +132,7 @@ import {
   PM2_DAEMON_KILL_TIMEOUT_MS,
   PM2_DAEMON_RESTART_DELAY_MS,
 } from './core/shutdown-budgets.js';
-import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
+import { describeSendFailure, dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
 import { buildCardPatchSuccessOutput, CARD_COMMAND_USAGE, CARD_PATCH_USAGE, cardPatchArgsWantHelp, executeCardPatch, parseCardPatchArgs, readCardPatchInput } from './cli/card-dispatch.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
@@ -8497,7 +8497,7 @@ async function cmdSend(rest: string[]): Promise<void> {
           : {}),
       }));
     } catch (e: any) {
-      console.error(`语音发送失败：${e?.message ?? e}`);
+      console.error(`语音发送失败：${describeSendFailure(e)}`);
       if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* */ } }
       process.exit(1);
     }
@@ -8565,7 +8565,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       console.error(`✓ 已回复文档评论 ${exactDocTarget.commentId.slice(0, 12)}（${chunks.length} 条）`);
       console.log(JSON.stringify({ success: true, commentId: exactDocTarget.commentId, sessionId: originSessionId, kind: 'doc-comment', chunks: chunks.length }));
     } catch (e: any) {
-      console.error(`文档评论发送失败：${e?.message ?? e}`);
+      console.error(`文档评论发送失败：${describeSendFailure(e)}`);
       process.exit(1);
     }
     return;
@@ -9567,7 +9567,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         : {}),
     }));
   } catch (err: any) {
-    console.error(`发送失败: ${err.message}`);
+    console.error(`发送失败: ${describeSendFailure(err)}`);
     process.exit(1);
   }
 }
