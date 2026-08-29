@@ -509,7 +509,19 @@ describe('usage-limit tracker — worker 接线不变量（源码守卫）', () 
     // 语义相同，守卫不该因为后者而误红（实测过绑 `(turn)` 会红）。这个 bridge
     // 有失败终态，写死成功位会把限额拒绝读成成功。
     const body = codexEmitBody();
-    expect(body).toMatch(/bridgeTurnOutcome\(/);
-    expect(body).not.toMatch(/noteTurnCompleted\(\s*['"]answered['"]\s*\)/);
+    // 必须真正把 predicate 的结果喂给 tracker，而不是「函数体里某处出现过」：
+    // 先抓 noteTurnCompleted 的实参标识符，再证明那个标识符正是由
+    // bridgeTurnOutcome 赋值的。只 grep 两个名字都存在是**欠约束**的——实测把
+    // bridgeTurnOutcome 的结果弃用、另写一个恒为 'answered' 的同名局部变量，
+    // 那种守卫照样全绿。
+    const calls = [...body.matchAll(/noteTurnCompleted\(([^)]*)\)/g)].map(m => m[1].trim());
+    expect(calls.length).toBeGreaterThan(0);            // 锚点自证
+    for (const arg of calls) {
+      // 实参必须是个标识符（不是字面量），且该标识符由 bridgeTurnOutcome 赋值。
+      expect(arg).toMatch(/^[A-Za-z_$][\w$]*$/);
+      expect(body).toMatch(
+        new RegExp(`(?:const|let)\\s+${arg}[^=\\n]*=\\s*bridgeTurnOutcome\\(`),
+      );
+    }
   });
 });
