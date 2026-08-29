@@ -5760,6 +5760,10 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
       // Completed turn whose output went out via `botmux send` (or deliberate
       // silence) — see the codex bridge's twin for why this must arm here.
+      // Hardcoded 'answered' rather than bridgeTurnOutcome(turn): this queue has
+      // no failure terminal at all (no terminalStatus field), so reaching a ready
+      // turn here already means completed. The claude family's limits arrive via
+      // maybeEmitStructuredRateLimit → noteStructuredLimit, which revokes this.
       usageLimitTracker.noteTurnCompleted('answered');
       const reason = turn.isLocal ? 'local-typed' : 'model called botmux send within window';
       log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (${reason})`);
@@ -7354,14 +7358,22 @@ function emitReadyCodexTurns(): void {
         : fallbackKind === 'empty_completed'
           ? emptyCompletedBridgeFallbackContent()
           : '';
+    // Record the turn's outcome for the usage-limit tracker BEFORE the
+    // `!content` bail-out. A completed turn is positive evidence the CLI is not
+    // limit-blocked, and that is true whether or not there is fallback text to
+    // post: the ordinary shape here is "model answered via `botmux send`", which
+    // leaves `last_agent_message` empty (253 such success terminals across the
+    // 1925 local rollouts) and makes structuredFallbackKind return 'none' — so
+    // `content` is '' and every later statement is unreachable. Binding the
+    // outcome to the emit, or even to the gate branch below, therefore misses
+    // the most common success path of all. failed/ambiguous stay a no-op via
+    // bridgeTurnOutcome, so a limit refusal never reads as success.
+    const turnOutcome = bridgeTurnOutcome(turn);
+    if (!content || shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
+      usageLimitTracker.noteTurnCompleted(turnOutcome);
+    }
     if (!content) continue;
     if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
-      // The turn still COMPLETED — its content went out via `botmux send`, or it
-      // was a deliberate nothing-to-send. That is the ordinary success path, so
-      // it is positive evidence the CLI is not limit-blocked and must arm the
-      // stale-banner suppression HERE: the emit below is skipped on this path,
-      // so binding `answered` to the emit alone would miss the common case.
-      usageLimitTracker.noteTurnCompleted(bridgeTurnOutcome(turn));
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
       // Distinguish DELIBERATE SILENCE (bare nothing-to-send sentinel, no prose,
       // no send) from other suppression reasons (already `botmux send`-ed this
@@ -7397,7 +7409,7 @@ function emitReadyCodexTurns(): void {
       if (!fields) continue;
       // Harvested answer → drop the structured-limit re-emit latch (mirrors
       // the daemon's final_output self-heal; see emitReadyTurns).
-      usageLimitTracker.noteTurnCompleted(bridgeTurnOutcome(turn));
+      usageLimitTracker.noteTurnCompleted(turnOutcome);
       send({
         type: 'final_output',
         ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),
@@ -7410,7 +7422,7 @@ function emitReadyCodexTurns(): void {
       });
       continue;
     }
-    usageLimitTracker.noteTurnCompleted(bridgeTurnOutcome(turn));
+    usageLimitTracker.noteTurnCompleted(turnOutcome);
     send({
       type: 'final_output',
       ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),

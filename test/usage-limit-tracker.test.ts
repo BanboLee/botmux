@@ -12,10 +12,11 @@
  *
  * Run: pnpm vitest run test/usage-limit-tracker.test.ts
  */
+import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { bridgeTurnOutcome, createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
 import { detectCliUsageLimit } from '../src/utils/cli-usage-limit.js';
-import { structuredFallbackKind } from '../src/services/bridge-fallback-gate.js';
+import { shouldSuppressBridgeEmit, structuredFallbackKind } from '../src/services/bridge-fallback-gate.js';
 import { CODEX_RATE_LIMIT_ERROR_CODE } from '../src/services/codex-transcript.js';
 import type { CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 
@@ -343,6 +344,36 @@ describe('usage-limit tracker — 屏幕上的旧限额横幅不得每轮重新�
     expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('idle');
   });
 
+  it('Codex 静默成功（last_agent_message 空 + 已 send）也必须置成功位（接线回归）', () => {
+    // 这一格是 worker 侧的**接线**回归，不是两个纯函数各自的返回值：
+    // codex-transcript 会把空 last_agent_message 产成 assistant_final(text:'')，
+    // 而本轮有 in-window send marker 时 structuredFallbackKind 返回 'none' ⟹
+    // content='' ⟹ worker 的 `if (!content) continue` 先触发，gate 分支里的
+    // noteTurnCompleted 结构上不可达。这是最常见的成功形态（全仓 1925 个 rollout
+    // 里有 253 个这种成功终态），漏了它旧横幅照旧每轮重钉。
+    // 先用真函数自证这个组合确实走到 content='' 且 gate=true——否则本用例可能
+    // 在测一个根本不存在的形态。
+    const gateInput = { turnId: 't', isLocal: false, finalText: '', markTimeMs: 100 };
+    const markers = [{ sentAtMs: 150 }];
+    const kind = structuredFallbackKind(gateInput as any, undefined, markers, false, true);
+    expect(kind).toBe('none');                                    // ⟹ content 会是 ''
+    expect(shouldSuppressBridgeEmit(gateInput as any, undefined, markers, false)).toBe(true);
+
+    // worker 现在在 `!content` 分支上也记录终态（bridgeTurnOutcome 决定 answered/
+    // failed），所以同一条旧横幅不再被重新判成限额。
+    const tracker = codexTracker();
+    tracker.beginTurn(STALE_BANNER);
+    tracker.noteTurnCompleted(bridgeTurnOutcome({}));             // 成功终态：无 terminalStatus
+    expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('idle');
+  });
+
+  it('同一形态但终态是 failed 时仍须上报（不得因 content 空就当成功）', () => {
+    const tracker = codexTracker();
+    tracker.beginTurn(STALE_BANNER);
+    tracker.noteTurnCompleted(bridgeTurnOutcome({ terminalStatus: 'failed' }));
+    expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('limited');
+  });
+
   it('抑制严格按 episode 收敛：干净开局时中途出现的限额仍要检出', () => {
     const tracker = codexTracker();
     tracker.beginTurn('干净屏幕，完全没有限额文案');
@@ -438,5 +469,41 @@ describe('usage-limit tracker — bridgeTurnOutcome 按终态而非 fallbackKind
     };
     expect(structuredFallbackKind(turn as any, undefined, [], false, true)).not.toBe('failed');
     expect(bridgeTurnOutcome(turn)).toBe('failed');
+  });
+});
+
+describe('usage-limit tracker — worker 接线不变量（源码守卫）', () => {
+  // worker.ts 没有单测面，而这条缺陷是**语句顺序**：把终态记录放在
+  // `if (!content) continue;` 之后，它对「静默成功 + 已 botmux send」这一最常见
+  // 形态结构上不可达（content 恒为 ''）。行为用例咬不住顺序——实测把顺序改回
+  // 缺陷版本，35 条用例全绿——所以这条只能由源码守卫兜。
+  const workerSrc = readFileSync(
+    new URL('../src/worker.ts', import.meta.url), 'utf8',
+  );
+
+  /** emitReadyCodexTurns 的函数体（从签名到下一个顶层 function）。 */
+  function codexEmitBody(): string {
+    const start = workerSrc.indexOf('function emitReadyCodexTurns(');
+    expect(start).toBeGreaterThan(-1);          // 锚点自证：函数还在
+    const end = workerSrc.indexOf('\nfunction ', start + 1);
+    expect(end).toBeGreaterThan(start);
+    return workerSrc.slice(start, end);
+  }
+
+  it('终态记录必须出现在 `if (!content) continue;` 之前', () => {
+    const body = codexEmitBody();
+    const bail = body.indexOf('if (!content) continue;');
+    const record = body.indexOf('usageLimitTracker.noteTurnCompleted(');
+    // 窗口自证：两个锚点都真的在这个函数体里找到了，否则断言是空真的。
+    expect(bail).toBeGreaterThan(-1);
+    expect(record).toBeGreaterThan(-1);
+    expect(record).toBeLessThan(bail);
+  });
+
+  it('该记录必须由 bridgeTurnOutcome 决定，不得写死 answered', () => {
+    const body = codexEmitBody();
+    expect(body).toContain('bridgeTurnOutcome(turn)');
+    // 这个 bridge 有失败终态，写死成功位会把限额拒绝读成成功。
+    expect(body).not.toContain("noteTurnCompleted('answered')");
   });
 });
