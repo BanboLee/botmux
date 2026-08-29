@@ -12,8 +12,9 @@
  *
  * Run: pnpm vitest run test/usage-limit-tracker.test.ts
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
+import { detectCliUsageLimit } from '../src/utils/cli-usage-limit.js';
 import type { CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 
 function structuredLimit(): CliUsageLimitState {
@@ -195,5 +196,106 @@ describe('usage-limit tracker — outputActive 门控（working 不等于输出�
     tracker.beginTurn('');
     tracker.noteStructuredLimit(structuredLimit());
     expect(tracker.classify('output', 'working').status).toBe('limited');
+  });
+});
+
+describe('usage-limit tracker — 屏幕上的旧限额横幅不得每轮重新钉住卡片', () => {
+  // 线上真实横幅（Codex）。关键性质有两条：
+  //  ① 只带钟点不带日期 ⟹ detectCliUsageLimit 对「已过去的 PM 时间」刻意留在
+  //     今天（见其注释），所以一天里 20:45 之前的任意时刻，这条隔夜横幅都被
+  //     解析成「今天 20:45」这个未来时刻 ⟹ retryReady === false。
+  //  ② Codex 整个 pane 只打印一次就一直留在 viewport 里（实测 261 个 live
+  //     tmux 会话、-S -20000 深回滚，没有任何 pane 出现第二次），所以它不是
+  //     「CLI 又拒了一次」的活证据，而是一块不会消失的旧背景。
+  // 二者叠加：若过期横幅抑制只在 retryReady 时武装，它就恰好在最需要它的场景
+  // 里失效——每开一轮新会话都被同一条陈旧文案重新判成限额。
+  const STALE_BANNER = "■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 8:45 PM.";
+
+  // 把时钟钉在 8:45 PM 之前，让 retryReady 稳定为 false（回归的前提条件）。
+  // 不钉时钟的话，这个用例在每天 20:45 之后会因为 retryReady 变 true 而
+  // 「自己变绿」——那是最坏的一种假绿：它会在 CI 的某些时段掩盖真回归。
+  const beforeReset = new Date('2026-08-29T10:00:00-07:00');
+  beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(beforeReset); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  function codexTracker() {
+    // codex：emitsStructuredRateLimit ⟹ suppressRateKind=true（rate 走结构化，
+    // 扫屏只留 usage 判定）；限额错误屏上 PTY 已静默 ⟹ outputActive=false。
+    return createUsageLimitTracker({
+      isRateKindSuppressed: () => true,
+      isOutputActive: () => false,
+    });
+  }
+
+  it('前提校验：这条横幅在重置时刻之前确实解析为 retryReady=false', () => {
+    // 这不是被测行为，而是「上面两条性质」的自证。如果哪天解析规则改了、
+    // 这条横幅变成 retryReady=true，下面的回归用例就不再覆盖它声称的场景
+    // （会退化成一个恒真断言），必须由这条前提用例先红出来。
+    const detected = detectCliUsageLimit(STALE_BANNER);
+    expect(detected.limited).toBe(true);
+    expect((detected as CliUsageLimitState).kind).toBe('usage');
+    expect((detected as CliUsageLimitState).retryReady).toBe(false);
+  });
+
+  it('新一轮开始时屏幕上就有横幅 ⟹ 本轮不再判限额（回归）', () => {
+    const tracker = codexTracker();
+    // 第 1 轮：真限额命中（canary——若这里就不 limited，本用例什么都没测到）。
+    tracker.beginTurn('');
+    expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('limited');
+
+    // 第 2 轮：用户重新发消息。daemon 的 beginNewTurn 已清 ds.usageLimit，
+    // 但屏幕上那条横幅还在（Codex 不会重印、也不会自己消失）。
+    const seq2 = tracker.beginTurn(STALE_BANNER);
+    expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('idle');
+    expect(tracker.detectedThisTurn(seq2)).toBe(false);
+  });
+
+  it('CLI 正常答完一轮后，后续 idle tick 也不会被旧横幅重新钉住', () => {
+    // 完整还原线上症状：自愈路径（noteTurnCompleted + daemon 侧
+    // clearUsageLimitState）全都执行了，卡片却又被扫屏重新钉回 limited。
+    const tracker = codexTracker();
+    tracker.beginTurn(STALE_BANNER);
+    tracker.noteTurnCompleted();
+    expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('idle');
+    expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('idle');
+    expect(tracker.classify(STALE_BANNER, 'stalled').status).toBe('stalled');
+  });
+
+  it('抑制严格按 episode 收敛：干净开局时中途出现的限额仍要检出', () => {
+    // 反向校准：这条修法不能把「真限额」一起抑制掉。
+    const tracker = codexTracker();
+    tracker.beginTurn('干净屏幕，完全没有限额文案');
+    const detected = tracker.classify(STALE_BANNER, 'idle');
+    expect(detected.status).toBe('limited');
+    expect(detected.usageLimit?.kind).toBe('usage');
+  });
+
+  it('抑制只认同一 episode：换成另一个重置钟点即视为新限额', () => {
+    // usageLimitStateKey 含 retryAtMs + label，所以「另一次限额」自带不同 key。
+    const tracker = codexTracker();
+    tracker.beginTurn(STALE_BANNER);
+    expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('idle');
+    const newEpisode = STALE_BANNER.replace('8:45 PM', '11:15 PM');
+    const detected = tracker.classify(newEpisode, 'idle');
+    expect(detected.status).toBe('limited');
+    expect(detected.usageLimit?.retryLabel).toBe('11:15 PM');
+  });
+
+  it('已抑制的 episode 不影响结构化限流重发', () => {
+    // 结构化信号是权威的：屏幕上有陈旧横幅时，它照样要能把卡片钉住。
+    const tracker = codexTracker();
+    tracker.beginTurn(STALE_BANNER);
+    expect(tracker.classify(STALE_BANNER, 'idle').status).toBe('idle');
+    tracker.noteStructuredLimit(structuredLimit());
+    expect(tracker.classify(STALE_BANNER, 'working').status).toBe('limited');
+  });
+
+  it('working + 输出在进展时的既有门控不受影响', () => {
+    const tracker = createUsageLimitTracker({
+      isRateKindSuppressed: () => true,
+      isOutputActive: () => true,
+    });
+    tracker.beginTurn('干净屏幕');
+    expect(tracker.classify(STALE_BANNER, 'working').status).toBe('working');
   });
 });

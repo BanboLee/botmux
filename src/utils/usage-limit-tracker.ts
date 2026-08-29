@@ -7,7 +7,7 @@ import {
 
 /**
  * Per-turn usage-limit state machine. Owns the turn counter, the
- * "did this turn hit a limit" flag, the stale retry-ready banner suppression,
+ * "did this turn hit a limit" flag, the stale-banner suppression,
  * and the stickiness of authoritative STRUCTURED limits — so classify()'s
  * state writes are explicit method calls rather than hidden mutations of
  * module globals.
@@ -49,7 +49,30 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
 }): UsageLimitTracker<S> {
   let turnSeq = 0;
   let detectedTurn: number | undefined;
-  let suppressedRetryReadyKey: string | undefined;
+  /**
+   * usageLimitStateKey of a limit banner ALREADY on screen when this turn
+   * opened — i.e. a previous episode's leftover text, not evidence about this
+   * turn. classify() skips exactly that key so the stale banner cannot re-pin
+   * the card every turn.
+   *
+   * Deliberately NOT conditioned on retryReady. A CLI's banner carries only a
+   * wall-clock time ("try again at 8:45 PM"), and detectCliUsageLimit keeps a
+   * passed PM time on TODAY (see its comment) — so for most of the day a
+   * day-old banner parses as a FUTURE reset, i.e. retryReady === false. Codex
+   * prints that banner once and leaves it in the viewport forever (verified on
+   * live panes: never a second occurrence, even 20k lines back), so the
+   * "the CLI will reject the retry again and self-heal" assumption behind the
+   * retry-time rule does not hold there. Gating the suppression on retryReady
+   * therefore disarmed it precisely in the case it exists for: every new turn
+   * re-detected the same leftover text and re-pinned 「限额已达」 even after
+   * the CLI had answered normally — and, because clearUsageLimitState() also
+   * resets rateLimitNotifiedKey, re-sent the @owner "turn paused" ping each
+   * time. The state key (kind + retryAtMs + label) is the episode identity;
+   * retryReady is just a countdown flag on it, so a genuinely NEW limit —
+   * different reset clock, or a banner that appears mid-turn on a screen that
+   * started clean — has a different key (or none recorded) and still fires.
+   */
+  let staleBannerKey: string | undefined;
   // A STRUCTURED limit (transcript error record, Claude/Codex) is authoritative
   // and one-shot at the source (UUID-deduped emit). Re-emit it on every
   // classify() until the turn ends: a genuinely blocked CLI keeps its
@@ -65,16 +88,14 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
     currentTurn(): number {
       return turnSeq;
     },
-    // Open a new turn; remember any stale retry-ready banner still on screen so
-    // classify() doesn't re-flag it as a fresh limit this turn.
+    // Open a new turn; remember any limit banner still on screen so classify()
+    // doesn't re-flag that leftover text as a fresh limit this turn.
     beginTurn(snapshot: string): number {
       turnSeq++;
       detectedTurn = undefined;
       activeStructured = undefined;
       const current = detectCliUsageLimit(snapshot, undefined, { suppressRateKind: opts.isRateKindSuppressed() });
-      suppressedRetryReadyKey = current.limited && current.retryReady
-        ? usageLimitStateKey(current)
-        : undefined;
+      staleBannerKey = current.limited ? usageLimitStateKey(current) : undefined;
       return turnSeq;
     },
     // Map a runtime status to a usage-limit-aware status, recording whether this
@@ -107,11 +128,13 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
       }
 
       const key = usageLimitStateKey(detected);
-      if (detected.retryReady && key === suppressedRetryReadyKey) {
+      // Same episode as the banner that was already on screen at turn start —
+      // leftover text, not a fresh verdict about this turn.
+      if (key === staleBannerKey) {
         return { status };
       }
 
-      suppressedRetryReadyKey = undefined;
+      staleBannerKey = undefined;
       detectedTurn = turnSeq;
       return { status: 'limited', usageLimit: detected };
     },
@@ -122,10 +145,10 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
     // record) rather than screen text. Mirrors classify()'s state writes so
     // the tracker stays coherent: mark this turn as having hit a limit (read
     // by detectedThisTurn for the submit-confirmation recheck), clear any
-    // stale retry-ready suppression, and hold the state for re-emission until
+    // stale-banner suppression, and hold the state for re-emission until
     // the turn ends. The actual emit is done by the caller.
     noteStructuredLimit(state: CliUsageLimitState): void {
-      suppressedRetryReadyKey = undefined;
+      staleBannerKey = undefined;
       detectedTurn = turnSeq;
       activeStructured = { seq: turnSeq, state };
     },
