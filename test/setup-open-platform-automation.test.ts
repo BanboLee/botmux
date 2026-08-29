@@ -3,14 +3,19 @@
  *
  * Run: pnpm vitest run test/setup-open-platform-automation.test.ts
  */
-import { mkdirSync, mkdtempSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import {
   automateOpenPlatformSetup,
   BOT_BASELINE_APP_EVENTS,
   BOT_BASELINE_CALLBACKS,
+  BOT_OPTIONAL_APP_EVENTS,
+  LONG_CONNECTION_EVENT_MODE,
+  VC_MEETING_APP_EVENTS,
+  VC_MEETING_USER_EVENTS,
   BOTMUX_REDIRECT_URL,
   botmuxFeishuSessionFilePath,
   buildFeishuQrPayload,
@@ -2572,6 +2577,447 @@ describe('automateOpenPlatformSetup', () => {
       .toContain('长连接');
     // 走不到订阅阶段的早期失败(missingVcEvents/eventModeReady 均 undefined)保持原 best-effort 语义
     expect(vcListenerEventGateError({})).toBeNull();
+  });
+
+  // 无变更短路：redirect / scope / 事件 / 回调 / 接收模式一路下来都没落地过写操作时，
+  // 不应再 create+publish 一个新版本（存量 bot 每次重启命中自检都凭空多一版的根因）。
+  describe('无变更时跳过发版', () => {
+    // 「什么都不缺」的 mock：所有 botmux 需要的事件/回调/长连接模式都已就位，
+    // redirect 白名单已含全部 wanted，scope 传空清单 → 全程零写请求。
+    function noopMock(appId: string) {
+      return openPlatformSubscriptionMock(appId, {
+        initial: {
+          appEvents: [...BOT_BASELINE_APP_EVENTS, ...BOT_OPTIONAL_APP_EVENTS, ...VC_MEETING_APP_EVENTS],
+          userEvents: [...VC_MEETING_USER_EVENTS],
+          eventMode: LONG_CONNECTION_EVENT_MODE,
+          callbacks: [...BOT_BASELINE_CALLBACKS],
+          callbackMode: LONG_CONNECTION_EVENT_MODE,
+          redirectUrls: collectBotmuxRedirectUrls(),
+        },
+      });
+    }
+
+    function noopFetch(appId: string, sub: ReturnType<typeof openPlatformSubscriptionMock>, calls: string[]) {
+      return (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes(`/scope/all/${appId}`)) {
+          return Response.json({ code: 0, data: { appScopeList: [], userScopeList: [] } });
+        }
+        // 命中发版端点直接抛：无变更时它们绝不该被调用。
+        if (href.includes('/app_version/create/') || href.includes('/publish/commit/')) {
+          throw new Error(`must not publish on no-op: ${href}`);
+        }
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+    }
+
+    it('权限/事件/回调全就位时不 create+publish，直接回成功且 versionId 为空', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-noop-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl: noopFetch('cli_x', sub, calls),
+        // 空清单 → importedScopeCount=0 → 不发 scope/update
+        scopeManifest: { scopes: { tenant: [], user: [] } },
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.versionId).toBeUndefined();
+      // 一条发版请求都没有；也没有任何写请求（redirect/scope/event/callback update）。
+      expect(calls.some(u => u.includes('/app_version/create/'))).toBe(false);
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
+      expect(calls.some(u => u.includes('/scope/update/'))).toBe(false);
+      expect(sub.updateBodies).toEqual([]);
+      expect(sub.redirectWrites).toEqual([]);
+    });
+
+    it('appJustCreated=true 时即便无变更也照常发版（新应用要靠首发上架）', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-noop-new-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes('/scope/all/cli_x')) return Response.json({ code: 0, data: { appScopeList: [], userScopeList: [] } });
+        if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl,
+        scopeManifest: { scopes: { tenant: [], user: [] } },
+        appJustCreated: true,
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.versionId).toBe('v1');
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
+    });
+
+    it('requireVerifiedEvents=true 时即便无变更也照常发版（受管激活靠精确 versionId ACK）', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-noop-managed-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes('/scope/all/cli_x')) return Response.json({ code: 0, data: { appScopeList: [], userScopeList: [] } });
+        if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl,
+        scopeManifest: { scopes: { tenant: [], user: [] } },
+        requireVerifiedEvents: true,
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.versionId).toBe('v1');
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
+    });
+
+    // 锁生产链路：走**真实默认 manifest**（不注入 scopeManifest）+ 已授权集合。
+    // 这是维护者复审揪出的空白——之前 3 例都注入空 manifest，恰好绕开了唯一有意义
+    // 的那条路径（默认 171+130 项、importedScopeCount 恒 >0 → mutated 恒真 → 短路
+    // 永不触发）。这里用「manifest 全部已授权」模拟「配置本就齐全」的重启自检。
+    const defaultManifest = JSON.parse(
+      readFileSync(join(fileURLToPath(new URL('../src/setup/lark-scopes.json', import.meta.url))), 'utf-8'),
+    ) as { scopes: { tenant: string[]; user: string[] } };
+    const allDefaultScopeNames = [...defaultManifest.scopes.tenant, ...defaultManifest.scopes.user];
+
+    // 用默认 manifest 里的名字构造一份「租户目录」——scope/all 返回它，automation 据此
+    // 把 name 映射成 ID。ID 只要唯一即可。
+    function defaultCatalogFetch(
+      appId: string,
+      sub: ReturnType<typeof openPlatformSubscriptionMock>,
+      calls: string[],
+      captured: { scopeUpdateBodies: Array<Record<string, unknown>> },
+    ) {
+      const nameToId = new Map<string, string>();
+      allDefaultScopeNames.forEach((name, i) => nameToId.set(name, `id_${i}`));
+      return (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes(`/scope/all/${appId}`)) {
+          return Response.json({
+            code: 0,
+            data: {
+              appScopeList: defaultManifest.scopes.tenant.map(name => ({ name, id: nameToId.get(name) })),
+              userScopeList: defaultManifest.scopes.user.map(name => ({ name, id: nameToId.get(name) })),
+            },
+          });
+        }
+        if (href.includes(`/scope/update/${appId}`)) {
+          captured.scopeUpdateBodies.push(JSON.parse(String(init?.body)));
+          return Response.json({ code: 0 });
+        }
+        if (href.includes('/app_version/create/') || href.includes('/publish/commit/')) {
+          throw new Error(`must not publish on no-op: ${href}`);
+        }
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+    }
+
+    it('默认全量 manifest + grantedScopeNames 覆盖全部权限时，短路生效、零 scope/update、不发版', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-noop-default-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+      const captured = { scopeUpdateBodies: [] as Array<Record<string, unknown>> };
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl: defaultCatalogFetch('cli_x', sub, calls, captured),
+        // 关键：不传 scopeManifest（走真实默认清单），但告知「全部已授权」——
+        // 按桶传：tenant / user 两桶各自全授权。
+        grantedScopeNames: {
+          tenant: [...defaultManifest.scopes.tenant],
+          user: [...defaultManifest.scopes.user],
+        },
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.versionId).toBeUndefined();
+        expect(result.publishSkipped).toBe(true);
+      }
+      // 全部已授权 → 差集为空 → 一次 scope/update 都不发、也不发版。
+      expect(captured.scopeUpdateBodies).toEqual([]);
+      expect(calls.some(u => u.includes('/scope/update/'))).toBe(false);
+      expect(calls.some(u => u.includes('/app_version/create/'))).toBe(false);
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
+    });
+
+    // #1042 × #1044 合并回归：`narrowRequiredPrivilegeRanges` 会真发 `privilege/update`
+    // （返回值就是写进去的条目数）。它排在无变更短路之前，所以「scope/事件/回调全齐、
+    // 只有权限数据范围被收敛」的那一轮**确实改了线上配置**，必须照常发版——否则改动
+    // 留在草稿里不生效。反向变异（删掉 `privilegeRangeCount > 0` 那句置位）时本例转红。
+    it('只有权限数据范围被收敛时仍算一次变更、照常发版（不被无变更短路吞掉）', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-privilege-only-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+      const nameToId = new Map<string, string>();
+      allDefaultScopeNames.forEach((name, i) => nameToId.set(name, `id_${i}`));
+      // 线上 `privilege/all` 的真实条目形态：isRequired + content 为空 + 单个选人字段
+      // ⇒ 落进 selectPrivilegesNeedingAppAvailability，会触发一次 privilege/update。
+      const vcPrivilege = {
+        bizId: 'vc',
+        resource: 'meeting.meetingid',
+        name: '会议号查询会议信息',
+        isRequired: true,
+        content: '',
+        privilegeStatus: 3,
+        schemaType: 1,
+        organizationType: 1,
+        schemaContent: {
+          selectionExpressionSchemaContent: {
+            fields: [{
+              id: 'owner_scope', name: '会议的归属者', type: 'object', multi: false,
+              operators: ['in'], data_source: { type: 'select_staff', val: '' },
+            }],
+            select_mode_options: ['all', 'part', 'null'],
+            fallback_value: { mode: 'all' },
+          },
+        },
+      };
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes('/scope/all/cli_x')) {
+          return Response.json({
+            code: 0,
+            data: {
+              appScopeList: defaultManifest.scopes.tenant.map(name => ({ name, id: nameToId.get(name) })),
+              userScopeList: defaultManifest.scopes.user.map(name => ({ name, id: nameToId.get(name) })),
+            },
+          });
+        }
+        if (href.includes('/privilege/all/cli_x')) {
+          return Response.json({ code: 0, data: { scopeBiz: [{ bizId: 'vc', bizName: '视频会议' }], privileges: [vcPrivilege] } });
+        }
+        if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v-priv' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl,
+        // scope 两桶全授权 ⇒ 差集为空、零 scope/update；唯一的变更来自数据范围收敛。
+        grantedScopeNames: {
+          tenant: [...defaultManifest.scopes.tenant],
+          user: [...defaultManifest.scopes.user],
+        },
+      });
+
+      expect(result.ok).toBe(true);
+      // 真发过一次 privilege/update，且没有任何 scope/update。
+      expect(calls.some(u => u.includes('/privilege/update/'))).toBe(true);
+      expect(calls.some(u => u.includes('/scope/update/'))).toBe(false);
+      if (result.ok) {
+        expect(result.privilegeRangeCount).toBe(1);
+        // 关键断言：这一轮**不是**无变更，必须发版。
+        expect(result.publishSkipped).toBeUndefined();
+        expect(result.versionId).toBe('v-priv');
+      }
+      expect(calls.some(u => u.includes('/app_version/create/'))).toBe(true);
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
+    });
+
+    // PR #1044 R2 回归：dual-bucket 名字（tenant/user 两桶都有）的 user 侧独缺时，
+    // 必须仍对 user 侧发 scope/update——不能因为 tenant 侧已授权就把它从 user 桶误删。
+    // 用扁平集合做差会把这一项静默吞掉（0 次 scope/update + publishSkipped），本例锁死。
+    it('dual-bucket 名字仅 user 侧缺失时，按桶做差仍申请其 user 授权、不误报无变更', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-dual-user-missing-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+      const captured = { scopeUpdateBodies: [] as Array<Record<string, unknown>> };
+      // 取一个同时出现在 tenant 与 user 两桶的名字。
+      const tenantSet = new Set(defaultManifest.scopes.tenant);
+      const dualName = defaultManifest.scopes.user.find(n => tenantSet.has(n))!;
+      expect(dualName, 'expected a dual-bucket scope name in the default manifest').toBeTruthy();
+      const nameToId = new Map<string, string>();
+      allDefaultScopeNames.forEach((name, i) => nameToId.set(name, `id_${i}`));
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes('/scope/all/cli_x')) {
+          return Response.json({
+            code: 0,
+            data: {
+              appScopeList: defaultManifest.scopes.tenant.map(name => ({ name, id: nameToId.get(name) })),
+              userScopeList: defaultManifest.scopes.user.map(name => ({ name, id: nameToId.get(name) })),
+            },
+          });
+        }
+        if (href.includes('/scope/update/cli_x')) {
+          captured.scopeUpdateBodies.push(JSON.parse(String(init?.body)));
+          return Response.json({ code: 0 });
+        }
+        if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v-NEW' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl,
+        // tenant 侧全授权；user 侧独缺 dualName。扁平集合会因 tenant 有 dualName 而误删 user 桶。
+        grantedScopeNames: {
+          tenant: [...defaultManifest.scopes.tenant],
+          user: defaultManifest.scopes.user.filter(n => n !== dualName),
+        },
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        // 确有新增（user 侧那一项）→ 必须发版、不是无变更。
+        expect(result.publishSkipped).toBeUndefined();
+      }
+      // 恰好对「user 侧缺的那一项」发一次 scope/update：零 tenant id、一个 user id。
+      expect(captured.scopeUpdateBodies).toHaveLength(1);
+      expect(captured.scopeUpdateBodies[0].appScopeIDs).toEqual([]);
+      expect(captured.scopeUpdateBodies[0].userScopeIDs).toEqual([nameToId.get(dualName)]);
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
+    });
+
+    it('默认全量 manifest + grantedScopeNames 缺一项时，只对缺的那项发 scope/update 并发版', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-default-onemissing-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+      const captured = { scopeUpdateBodies: [] as Array<Record<string, unknown>> };
+      // 缺一项**仅出现在 tenant 桶**的 scope（避免 dual 名字干扰，其余全部已授权）。
+      const userSet = new Set(defaultManifest.scopes.user);
+      const missingName = defaultManifest.scopes.tenant.find(n => !userSet.has(n))!;
+      expect(missingName, 'expected a tenant-only scope name').toBeTruthy();
+      const nameToId = new Map<string, string>();
+      allDefaultScopeNames.forEach((name, i) => nameToId.set(name, `id_${i}`));
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes('/scope/all/cli_x')) {
+          return Response.json({
+            code: 0,
+            data: {
+              appScopeList: defaultManifest.scopes.tenant.map(name => ({ name, id: nameToId.get(name) })),
+              userScopeList: defaultManifest.scopes.user.map(name => ({ name, id: nameToId.get(name) })),
+            },
+          });
+        }
+        if (href.includes('/scope/update/cli_x')) {
+          captured.scopeUpdateBodies.push(JSON.parse(String(init?.body)));
+          return Response.json({ code: 0 });
+        }
+        if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v-NEW' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl,
+        grantedScopeNames: {
+          tenant: defaultManifest.scopes.tenant.filter(n => n !== missingName),
+          user: [...defaultManifest.scopes.user],
+        },
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.versionId).toBe('v-NEW');
+        expect(result.publishSkipped).toBeUndefined();
+      }
+      // 只对「真正还缺的那一项」发 scope/update：payload 里恰好一个 tenant scope id、零 user scope。
+      expect(captured.scopeUpdateBodies).toHaveLength(1);
+      expect(captured.scopeUpdateBodies[0].appScopeIDs).toEqual([nameToId.get(missingName)]);
+      expect(captured.scopeUpdateBodies[0].userScopeIDs).toEqual([]);
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
+    });
+
+    it('不传 grantedScopeNames（默认全量 manifest）时保持原保守行为：发 scope/update 且发版', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-default-nogrant-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+      const captured = { scopeUpdateBodies: [] as Array<Record<string, unknown>> };
+      const nameToId = new Map<string, string>();
+      allDefaultScopeNames.forEach((name, i) => nameToId.set(name, `id_${i}`));
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes('/scope/all/cli_x')) {
+          return Response.json({
+            code: 0,
+            data: {
+              appScopeList: defaultManifest.scopes.tenant.map(name => ({ name, id: nameToId.get(name) })),
+              userScopeList: defaultManifest.scopes.user.map(name => ({ name, id: nameToId.get(name) })),
+            },
+          });
+        }
+        if (href.includes('/scope/update/cli_x')) {
+          captured.scopeUpdateBodies.push(JSON.parse(String(init?.body)));
+          return Response.json({ code: 0 });
+        }
+        if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v-NEW' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl,
+        // 不传 grantedScopeNames：拿不到已授权信号 → 保守近似 → 照发不误。
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.versionId).toBe('v-NEW');
+        expect(result.publishSkipped).toBeUndefined();
+      }
+      // 保守行为：整份 manifest 全量映射 → 发一次非空 scope/update → 发版。
+      expect(captured.scopeUpdateBodies).toHaveLength(1);
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
+    });
   });
 });
 

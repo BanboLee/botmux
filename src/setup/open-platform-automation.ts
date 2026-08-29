@@ -197,6 +197,11 @@ export type OpenPlatformAutomationResult =
       /** Managed onboarding only: exact baseline event + callback count read back before session cleanup. */
       verifiedEventCount?: number;
       versionId?: string;
+      /**
+       * 本次因「无任何配置变更」而**跳过了 create+publish**。区别于「发了版但没解析到
+       * versionId」：前者根本没建版（下游别去后台找不存在的草稿、也别把它当 warning）。
+       */
+      publishSkipped?: boolean;
     }
   | {
       ok: false;
@@ -261,6 +266,24 @@ export interface OpenPlatformAutomationOptions {
   appJustCreated?: boolean;
   fetchImpl?: typeof fetch;
   scopeManifest?: ScopeManifest;
+  /**
+   * 调用方已经确知**当前已授权**的 scope 名字集合，**按 token 类型分桶**（来自
+   * tenant-token `application/v6` 的 scope 列表，见 event-dispatcher 的
+   * `checkRequiredScopes`——该接口每个 scope 条目自带 `token_types: (tenant|user)[]`）。
+   *
+   * 传入时，本函数会在**映射成 ID 之前**分别用 `tenant` / `user` 桶对 manifest 的
+   * 对应桶做 name 差集，只对「该 token 类型下真正还没授权」的 scope 发 `scope/update`，
+   * 并且**只在差集非空**时把 scope 记为一次变更（驱动末尾是否发版）。不传时保持历史
+   * 行为：拿不到已授权信号，就以「发出过一次非空 scope/update」作为保守近似（宁可偶尔
+   * 多发一版，也不少发导致新权限不生效）。
+   *
+   * ⚠️ 必须**按桶**做差、且在 name 空间做：`lark-scopes.json` 里约 121 个名字同时出现
+   * 在 tenant 与 user 两个桶，而 tenant/user 是两份独立授权。若把已授权名字拍平成一个
+   * 扁平集合去过滤两个桶，「tenant 已授权」会连带把 user 桶里的同名 scope 也误删，导致
+   * 真正缺失的 user 侧权限被静默吞掉、永远补不上（PR #1044 R2）。catalog 映射后是 ID，
+   * 与 name 不可直接比，故差集只能在 mapped 之前的 name 空间做。
+   */
+  grantedScopeNames?: { tenant: string[]; user: string[] };
   pollIntervalMs?: number;
   maxWaitMs?: number;
   onQrCode?: (info: { qrText: string; qrPayload: string }) => void | Promise<void>;
@@ -1321,6 +1344,15 @@ export async function automateOpenPlatformSetup(
   // 不了)。这一步独立 try/catch:失败只记 redirectWarning,不 return、不阻断后续。
   let redirectConfigured = false;
   let redirectWarning: string | undefined;
+  // 「本次自动化到底改没改过线上配置」。只有确实落地过写操作（redirect 白名单、
+  // scope、事件、回调、接收模式）才置 true。用来在流程末尾判断是否值得再
+  // create+publish 一个新版本——权限/事件全都本就齐全时，历史实现仍会无条件
+  // 发一版（scope 不 diff、发版无短路），存量 bot 每次重启命中自检都凭空多一个
+  // 版本。⚠️ scope/update 用整份 catalog 映射、平台侧幂等 add，botmux 拿不到
+  // 「哪些本就已授权」的可靠信号（scope/all 只是可选权限目录，无 grant flag），
+  // 所以这里以「本次 scope/update 是否真的发出且成功」作为保守近似：宁可偶尔
+  // 多发一版，也不少发导致新权限不生效。
+  let mutated = false;
   try {
     // wanted 显式算一次并原样传下去：`redirectConfigured` 要靠「wanted 是否全部落盘」
     // 判定（见 {@link missingRedirectUrls}），拿不到这份 wanted 就只能退回按 status
@@ -1330,6 +1362,11 @@ export async function automateOpenPlatformSetup(
       // 只有「本次刚建出来的 app」才允许在读失败时盲写覆盖；存量 app 读不到就零写入。
       allowBlindWrite: options.appJustCreated === true,
     });
+    // 只有真的发了写请求（updated / updated_fallback）才算改过；unchanged（幂等
+    // 短路）与 skipped_unreadable（一次都没写）都不置位。
+    if (written.status === 'updated' || written.status === 'updated_fallback') {
+      mutated = true;
+    }
     if (written.status === 'skipped_unreadable') {
       // 「读不到线上现值 → 一次写请求都没发」。与下面的「写了但没写全」是两回事：
       // 这里连线上有什么都不知道，谈不上缺哪几条，措辞也要分开。
@@ -1365,8 +1402,31 @@ export async function automateOpenPlatformSetup(
   }
 
   const manifest = options.scopeManifest ?? readDefaultScopeManifest();
+  // 调用方给了「已授权」名字集合时，在**映射成 ID 之前**做 name 差集，把 manifest
+  // 收窄成「本次真正还缺的」——只有它非空才需要发 scope/update、也才算一次变更。
+  // 这正是「无变更短路」在走默认全量 manifest 的生产链路里能真正生效的关键：否则
+  // manifest 恒非空 → scope/update 恒发 → mutated 恒真 → 短路永不触发。
+  //
+  // 差集必须**按 token 桶各自做**：约 121 个名字同时在 tenant/user 两桶，而两者是
+  // 两份独立授权。若拿一个扁平集合过滤两桶，「tenant 已授权」会连带删掉 user 桶的
+  // 同名 scope，把真正缺的 user 侧权限静默吞掉（PR #1044 R2）。
+  const grantedTenant = options.grantedScopeNames
+    ? new Set(options.grantedScopeNames.tenant)
+    : undefined;
+  const grantedUser = options.grantedScopeNames
+    ? new Set(options.grantedScopeNames.user)
+    : undefined;
+  const hasGrantedSignal = !!(grantedTenant || grantedUser);
+  const effectiveManifest: ScopeManifest = hasGrantedSignal
+    ? {
+        scopes: {
+          tenant: (manifest.scopes?.tenant ?? []).filter(name => !grantedTenant?.has(name)),
+          user: (manifest.scopes?.user ?? []).filter(name => !grantedUser?.has(name)),
+        },
+      }
+    : manifest;
   const catalog = extractOpenPlatformScopeEntries(allScopesPayload);
-  const mapped = mapManifestScopesToOpenPlatformIds(manifest, catalog);
+  const mapped = mapManifestScopesToOpenPlatformIds(effectiveManifest, catalog);
   const missing = [...mapped.missingTenantScopes, ...mapped.missingUserScopes];
   const skippedScopeCount = missing.length;
   if (missing.length > 0) {
@@ -1380,6 +1440,10 @@ export async function automateOpenPlatformSetup(
   if (importedScopeCount > 0) {
     try {
       await postJson(`/developers/v1/scope/update/${options.appId}`, buildScopeUpdatePayload(options.appId, mapped));
+      // 已知 granted 时：manifest 已收窄成「真正还缺的」，走到这里就一定有新增权限，
+      // 记为变更、允许后续发版让新权限生效。未知 granted 时保守近似：拿不到「哪些本就
+      // 已授权」的信号，只要成功发出了一次非空 scope/update 就当作可能改动过权限。
+      mutated = true;
     } catch (err: any) {
       scopeWarning = safeErrorMessage(err);
       importedScopeCount = 0;
@@ -1401,6 +1465,10 @@ export async function automateOpenPlatformSetup(
   let privilegeRangeWarning: string | undefined;
   try {
     privilegeRangeCount = await narrowRequiredPrivilegeRanges({ postJson }, options.appId);
+    // 返回值就是「实际写进去的条目数」：>0 说明真发了 privilege/update，属于一次
+    // 落地的配置变更，必须计入 mutated——否则「只有数据范围被收敛」的那一轮会走
+    // 无变更短路、不发版，改动留在草稿里不生效（#1042 与 #1044 合并处新增）。
+    if (privilegeRangeCount > 0) mutated = true;
   } catch (err: any) {
     privilegeRangeWarning = safeErrorMessage(err);
   }
@@ -1449,6 +1517,9 @@ export async function automateOpenPlatformSetup(
   const missingAppEvents = wantedAppEvents.filter(name => !hasEvent(name));
   const missingUserEvents = VC_MEETING_USER_EVENTS.filter(name => !hasEvent(name));
   if (missingAppEvents.length > 0 || missingUserEvents.length > 0) {
+    // 有缺失事件才进这一支，说明确实要发写请求补订阅——置 mutated。逐个补的
+    // 兜底分支即使个别失败，也已经改过一部分，仍算改动过。
+    mutated = true;
     const eventMode = eventState?.eventMode ?? LONG_CONNECTION_EVENT_MODE;
     try {
       await addEvents(missingAppEvents, missingUserEvents, eventMode);
@@ -1498,6 +1569,8 @@ export async function automateOpenPlatformSetup(
     eventWarnings.push(`读取当前回调订阅失败: ${safeErrorMessage(err)}`);
   }
   if (callbackState && callbackState.callbackMode !== LONG_CONNECTION_EVENT_MODE) {
+    // 回调接收模式不是长连接才需要切——发了 switch 写请求即算改动过。
+    mutated = true;
     try {
       await postJson(`/developers/v1/callback/switch/${options.appId}`, {
         clientId: options.appId,
@@ -1510,6 +1583,8 @@ export async function automateOpenPlatformSetup(
   }
   let missingCallbacks = BOT_BASELINE_CALLBACKS.filter(name => !callbackState?.callbacks.includes(name));
   if (missingCallbacks.length > 0) {
+    // 有缺失回调才补——发了 callback/update 写请求即算改动过。
+    mutated = true;
     try {
       await postJson(
         `/developers/v1/callback/update/${options.appId}`,
@@ -1560,6 +1635,43 @@ export async function automateOpenPlatformSetup(
       eventModeReady,
       redirectConfigured,
       redirectWarning,
+    };
+  }
+
+  // 无变更短路：redirect / scope / 事件 / 回调 / 接收模式一路下来都没落地过任何
+  // 写操作，说明应用配置本就齐全，再 create+publish 一个新版本纯属凭空多一版
+  // （存量 bot 每次重启命中权限自检/VC 自检都发一版）。此时跳过发版，直接回成功。
+  //
+  // 两个例外**必须**照常发版：
+  //  • appJustCreated —— 刚建出来的 app 要靠首次发版才能上架启用；
+  //  • requireVerifiedEvents —— 受管 onboarding/恢复靠回读到的精确 versionId 作为
+  //    激活 ACK（见 bot-onboarding 的 hasExactManagedAutomationAck / versionId 读取），
+  //    不发版就拿不到 versionId，激活会判失败。
+  // 这两条都传 false / 未传时，才走无变更短路。
+  const mustPublish = options.appJustCreated === true || options.requireVerifiedEvents === true;
+  if (!mutated && !mustPublish) {
+    return {
+      ok: true,
+      sessionFile,
+      sessionSource: preparedSession.source,
+      cookieCount: preparedSession.cookieCount,
+      scopeCount: importedScopeCount,
+      skippedScopeCount,
+      scopeWarning,
+      privilegeRangeCount,
+      privilegeRangeWarning,
+      subscribedEventCount,
+      eventWarning,
+      missingVcEvents,
+      eventModeReady,
+      redirectConfigured,
+      redirectWarning,
+      // 没发版：versionId 留空，另置 publishSkipped 标记「本次确实没建版」。非受管
+      // 路径本就不依赖 versionId（受管路径已被 mustPublish 排除在短路之外），下游据
+      // publishSkipped 区分「跳过发版」与「发了版但没解析到 versionId」——前者不该被
+      // classifySetupOpenPlatformOutcome 计入 warning，也不该让 CLI 提示去后台找草稿。
+      versionId: undefined,
+      publishSkipped: true,
     };
   }
 
