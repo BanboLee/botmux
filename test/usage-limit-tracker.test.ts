@@ -490,9 +490,12 @@ describe('usage-limit tracker — worker 接线不变量（源码守卫）', () 
     return workerSrc.slice(start, end);
   }
 
-  it('终态记录必须出现在 `if (!content) continue;` 之前', () => {
+  it('终态记录必须出现在「无 fallback 文案就 continue」那个 bail-out 之前', () => {
+    // 锚点刻意不绑变量名：按 `if (!<ident>) continue;` 这个**形状**匹配，所以把
+    // 局部变量 content 改名为 fallbackText 之类的正常重构不会让守卫误红（实测
+    // 过：写死 'if (!content)' 的版本一改名就红，那种守卫迟早被人删掉）。
     const body = codexEmitBody();
-    const bail = body.indexOf('if (!content) continue;');
+    const bail = body.search(/if \(!\w+\) continue;/);
     const record = body.indexOf('usageLimitTracker.noteTurnCompleted(');
     // 窗口自证：两个锚点都真的在这个函数体里找到了，否则断言是空真的。
     expect(bail).toBeGreaterThan(-1);
@@ -501,9 +504,12 @@ describe('usage-limit tracker — worker 接线不变量（源码守卫）', () 
   });
 
   it('该记录必须由 bridgeTurnOutcome 决定，不得写死 answered', () => {
+    // 只锁「用了这个 predicate」+「没写死成功位」这两点，不锁它的实参形状：
+    // `bridgeTurnOutcome(turn)` 与 `bridgeTurnOutcome({ terminalStatus: … })`
+    // 语义相同，守卫不该因为后者而误红（实测过绑 `(turn)` 会红）。这个 bridge
+    // 有失败终态，写死成功位会把限额拒绝读成成功。
     const body = codexEmitBody();
-    expect(body).toContain('bridgeTurnOutcome(turn)');
-    // 这个 bridge 有失败终态，写死成功位会把限额拒绝读成成功。
-    expect(body).not.toContain("noteTurnCompleted('answered')");
+    expect(body).toMatch(/bridgeTurnOutcome\(/);
+    expect(body).not.toMatch(/noteTurnCompleted\(\s*['"]answered['"]\s*\)/);
   });
 });
