@@ -429,6 +429,62 @@ export function parseBotSelection(
   return byProcessName >= 0 ? byProcessName : undefined;
 }
 
+/**
+ * 把源 Bot 的行为配置覆盖到刚创建的目标 Bot，同时保留目标应用自己的身份。
+ * Dashboard 与 CLI clone 共用这里，避免两条入口各维护一份排除字段。
+ */
+export function cloneBotConfig(
+  source: Record<string, any>,
+  target: Record<string, any>,
+): Record<string, any> {
+  const cloned: Record<string, any> = { ...target, ...source };
+
+  for (const key of [
+    'apiOnly',
+    'name',
+    'displayName',
+    'messageListeners',
+    'oncallChats',
+    'allowedChatGroups',
+    'chatGrants',
+    'globalGrants',
+    'quotaState',
+    'grantExpiryState',
+    'sessionGroup',
+    'chatReplyModes',
+    'noCardChats',
+    'activationPending',
+    'activationDeactivating',
+    'activationStarting',
+    'activationCommitted',
+  ]) {
+    delete cloned[key];
+  }
+
+  for (const key of ['larkAppId', 'larkAppSecret', 'brand', 'allowedUsers', 'ownerOpenId']) {
+    if (Object.prototype.hasOwnProperty.call(target, key) && target[key] !== undefined) {
+      cloned[key] = target[key];
+    } else {
+      delete cloned[key];
+    }
+  }
+
+  return cloned;
+}
+
+/** 只允许 daemon 已认证的 source open_id 进入共享的跨应用 owner 归一化。 */
+export function cloneOwnerEntries(
+  source: Record<string, any>,
+  sourceAppId?: string,
+  sourceOwnerOpenId?: string,
+): string[] {
+  const managedOwner = sourceAppId === source.larkAppId ? sourceOwnerOpenId : undefined;
+  if (!Array.isArray(source.allowedUsers)) return [];
+  return source.allowedUsers.filter((entry: unknown): entry is string => (
+    typeof entry === 'string' && (!entry.startsWith('ou_') || entry === managedOwner)
+  ));
+}
+
 export function removeBotConfig<T extends { larkAppId?: string; name?: unknown }>(
   bots: T[],
   selection: string,
