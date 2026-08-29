@@ -101,7 +101,7 @@ import { hasProtectedSessionMutationOwnership } from './core/session-mutation-gu
 import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
 import { reapLegacyPm2, liveGodAt } from './core/legacy-pm2-reaper.js';
-import { withFileLock, withFileLockSync } from './utils/file-lock.js';
+import { withFileLock, withFileLockSync, FileLockTimeoutError } from './utils/file-lock.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional, hasFlagOrEq } from './cli/arg-utils.js';
@@ -151,7 +151,10 @@ import {
   resolveGlobalInstallPlan,
   UnsupportedGlobalInstallError,
 } from './utils/global-install.js';
-import { isLocalDevInstall, botmuxCliEntryAt, bakedBinaryVersion } from './utils/install-info.js';
+import { isLocalDevInstall, botmuxCliEntryAt, bakedBinaryVersion, botmuxInstallRoot } from './utils/install-info.js';
+import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-self-update.js';
+import { fetchLatestVersion, isNewerVersion } from './core/update-check.js';
+import { resolveCurrentVersion } from './utils/install-diagnostics.js';
 import {
   resolveLocalDevCheckoutDir,
   isGitWorktree,
@@ -3009,7 +3012,7 @@ async function cmdStatus(): Promise<void> {
   // warnIfLegacyBotmuxAlive above, which is what a pre-migration host needs.
 }
 
-function cmdUpgrade(): void {
+async function cmdUpgrade(): Promise<void> {
   // 本地 checkout（有 .git/src）：走 git pull --ff-only → 重新 build → 从本
   // checkout 重启，而不是拿全局包管理器去升级（那对 dev 部署无效，见
   // install-info.ts 的 isLocalDevInstall 说明）。
@@ -3017,8 +3020,64 @@ function cmdUpgrade(): void {
     cmdUpgradeLocalDev();
     return;
   }
+  // 编译版单文件二进制没有 package.json 落盘 ⟹ resolveGlobalInstallPlan 恒抛
+  // Unsupported（实测真实 v3.18.4 二进制就是这条）。改为先按「二进制装在哪」
+  // 判形态：npm 子包形态交回 npm/pnpm/bun，install.sh 形态自己换二进制。
+  const strategy = currentUpdateStrategy(botmuxInstallRoot());
+  if (strategy.kind === 'self-replace') {
+    try {
+      const latest = await fetchLatestVersion();
+      if (!latest) {
+        console.error('❌ 无法获取最新版本号（网络不可达或 registry 异常）。');
+        process.exit(1);
+      }
+      const current = resolveCurrentVersion();
+      if (!isNewerVersion(latest, current)) {
+        console.log(`✅ 已是最新版本（${current}）。`);
+        return;
+      }
+      console.log(`🔄 升级中：下载 v${latest} 二进制并替换 ${strategy.target}`);
+      // 握与 dashboard / maintenance 同一把跨进程锁：这条路径是**写同一个文件**，
+      // 两个 update 并发跑会互相盖掉临时文件与 rename。锁文件父目录可能还不存在
+      // （daemon 从未在本机起过就先跑 update），先建再握，否则 ENOENT 会盖掉真实错误。
+      const lockTarget = globalInstallUpdateLockTarget();
+      mkdirSync(dirname(lockTarget), { recursive: true });
+      let acquired = false;
+      try {
+        await withFileLock(lockTarget, async () => {
+          acquired = true;
+          const r = await replaceStandaloneBinary(latest, strategy.target);
+          console.log(`✅ 升级完成：${r.asset} → ${r.target}（${current} → ${latest}）。运行 botmux restart 以应用更新。`);
+        }, { maxWaitMs: 2_000 });
+      } catch (error) {
+        // ⚠️ 三态，不是二态。`withFileLock` 拿不到锁时是**抛异常**不是安静返回，
+        // 但 `acquired === false` 只证明「回调没执行」，**不等于「别人持锁」**：
+        // 回调之前还可能因 `open` 的 EACCES/ENOSPC、holder 写入失败、holder 元数据
+        // 不可读、stale-claim `link` 失败而抛错。只看 `acquired` 会把这些**真实故障
+        // 全部误报成「另一个更新正在进行」**——磁盘满被说成并发冲突，是最坏的那种
+        // 误导。所以必须同时要求它是 timeout 类型：
+        //   ① 超时且回调未进入        → 友好并发提示（正常互斥结果，不是故障）
+        //   ② 回调已进入后失败        → 透出真实错误（下载/校验/替换）
+        //   ③ 回调前的基础设施失败    → 同样透出真实错误
+        // 判类型而不是匹文案：file-lock 的文案被多处按字符串匹配，不能动，但新代码
+        // 应该用 FileLockTimeoutError（async/sync 两处语义一致）。
+        if (!acquired && error instanceof FileLockTimeoutError) {
+          console.error('❌ 另一个更新正在进行中（dashboard 或定时任务），请稍后重试。');
+          process.exit(1);
+        }
+        throw error; // ②③ 交给外层统一报错，不被友好文案吞掉
+      }
+    } catch (error) {
+      console.error(`❌ 升级失败：${error instanceof Error ? error.message : error}`);
+      process.exit(1);
+    }
+    return;
+  }
   try {
-    const plan = resolveGlobalInstallPlan();
+    if (strategy.kind === 'unsupported') {
+      throw new UnsupportedGlobalInstallError('unknown', process.execPath);
+    }
+    const plan = resolveGlobalInstallPlan(strategy.packageRoot);
     console.log(`🔄 升级中：${formatGlobalInstallCommand(plan)}`);
     installLatestBotmuxSync(plan);
     console.log('\n✅ 升级完成。运行 botmux restart 以应用更新。');
@@ -12066,6 +12125,38 @@ if (__entrySubcommand) {
   await new Promise<never>(() => {});
 }
 
+// Hidden: perform a compiled-binary self-replace and exit. Invoked by
+// `runSelfReplaceBlocking` (src/core/maintenance.ts) so the synchronous
+// maintenance tick / dashboard handler can wait on one child instead of
+// restructuring around an await. Not a user-facing command; it only ever makes
+// sense for the standalone binary, which owns its own file.
+if (command === '__self-update') {
+  const requested = process.argv[3] || 'latest';
+  try {
+    const { replaceStandaloneBinary, currentBinaryInstallShape } = await import('./core/binary-self-update.js');
+    if (currentBinaryInstallShape() !== 'curl-binary') {
+      // Fail closed rather than write into a tree a package manager owns.
+      console.error('__self-update: 当前不是独立二进制安装（install.sh 形态），拒绝自替换');
+      process.exit(1);
+    }
+    const { fetchLatestVersion } = await import('./core/update-check.js');
+    const version = requested === 'latest' ? await fetchLatestVersion() : requested;
+    if (!version) {
+      console.error('__self-update: 无法解析最新版本（网络不可达或 registry 异常）');
+      process.exit(1);
+    }
+    const r = await replaceStandaloneBinary(version);
+    // The caller parses this line: after a self-replace the running process still
+    // reports its OWN baked version, so it cannot discover the new one by re-reading.
+    console.log(`BOTMUX_SELF_UPDATE_VERSION=${version}`);
+    console.log(`__self-update: ${r.asset} → ${r.target} (${r.bytes} bytes)`);
+    process.exit(0);
+  } catch (error) {
+    console.error(`__self-update: ${error instanceof Error ? error.message : error}`);
+    process.exit(1);
+  }
+}
+
 
 const ROOT_FLEET_MUTATION_COMMANDS = new Set(['start', 'stop', 'restart', 'upgrade', 'update']);
 if (
@@ -12910,7 +13001,7 @@ switch (command) {
   case 'logs':    await cmdLogs(); break;
   case 'status':  await cmdStatus(); break;
   case 'upgrade':
-  case 'update':  cmdUpgrade(); break;
+  case 'update':  await cmdUpgrade(); break;
   case 'dashboard': await cmdDashboard(process.argv.slice(3)); break;
   case 'bind': {
     // `botmux bind <code>` — 把本机绑定到中心化平台
