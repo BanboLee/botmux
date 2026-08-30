@@ -2746,6 +2746,11 @@ export async function restoreActiveSessions(
   logger.info(`Restored ${active.length} session(s)${hasPersistentBackend ? '' : ', waiting for messages to resume'}`);
 }
 
+/** Re-attaching to a pane that is already alive: the worker only has to reconnect. */
+const TERMINAL_REATTACH_TIMEOUT_MS = 10_000;
+/** Cold wake: create the backing pane, boot the CLI, then report `ready`. */
+const TERMINAL_COLD_WAKE_TIMEOUT_MS = 40_000;
+
 /**
  * Resolve a session's live web-terminal worker port, WAKING the worker on demand
  * if needed.
@@ -2760,11 +2765,19 @@ export async function restoreActiveSessions(
  * worker to re-attach (empty prompt = no new turn, same as restart reattach) and
  * wait for it to report its port.
  *
+ * A pane that is definitively GONE is still serveable: `forkWorker` recreates
+ * it, which is exactly what an incoming message already does for the same
+ * session. Panes get reclaimed routinely — the idle-worker sweeper suspends
+ * worker + CLI + pane together once a session is over `maxLiveWorkers` — so
+ * refusing to wake on 'missing' makes the terminal 502 permanently for every
+ * dormant session. Adopted sessions are the exception (see below).
+ *
  * Returns the port, or undefined when there's nothing serveable (no live worker
- * possible: not active, non-persistent backend, or the pane is gone). The
- * `forkWorker` double-fork guard plus its synchronous `ds.worker` assignment make
- * concurrent calls (the terminal's HTML GET + WS upgrade arrive together) safe —
- * only the first forks; the rest just await the same `ds.workerPort`.
+ * possible: not active, non-persistent backend, an unprobeable pane, or an
+ * adopted session whose pane is gone). The `forkWorker` double-fork guard plus
+ * its synchronous `ds.worker` assignment make concurrent calls (the terminal's
+ * HTML GET + WS upgrade arrive together) safe — only the first forks; the rest
+ * just await the same `ds.workerPort`.
  */
 export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<number | undefined> {
   const frozenBackendType = ds.initConfig?.backendType ?? ds.session.backendType;
@@ -2776,31 +2789,49 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
 
   const backendType = getSessionPersistentBackendType(ds);
   if (!backendType) return undefined;
-  // Non-destructive read path: only wake a worker when the backing pane is
-  // CONFIRMED alive. 'missing' or 'unknown' both bail (a 502 the terminal
-  // retries) — same conservative stance as the old boolean check, with no risk
-  // of closing anything.
   const backendTarget = persistentBackendTargetForSession(ds)!;
-  if (probePersistentBackendTarget(backendTarget) !== 'exists') {
-    return undefined;
-  }
+  const paneProbe = probePersistentBackendTarget(backendTarget);
+  // 'unknown' is ignorance, not absence — the probe itself failed. Bail (a 502
+  // the terminal retries) rather than act on it; this is the one case where the
+  // old `!== 'exists'` stance was right.
+  if (paneProbe === 'unknown') return undefined;
+  const coldWake = paneProbe === 'missing';
+  // Adopted sessions are the exception to waking on 'missing': the wake below
+  // goes through `forkWorker`, NOT `forkAdoptWorker`, so it would create a fresh
+  // `bmx-*` pane and push wrapped input into a CLI the user never injected.
+  // Same hazard, same predicate as the idle sweeper's own exclusion
+  // (`idle-worker-sweeper.ts`: `!ds.adoptedFrom && !ds.session.adoptedFrom`) —
+  // both fields, because a restored adopt session only carries the persisted one.
+  if (coldWake && (ds.adoptedFrom || ds.session.adoptedFrom)) return undefined;
 
+  // Only a fork we perform here can be a cold start. If a worker is already
+  // live we are just waiting for its port, which is the re-attach budget no
+  // matter what the pane probe said.
+  let forkedCold = false;
   if (!ds.worker) {
-    logger.info(`[${ds.session.sessionId.substring(0, 8)}] terminal accessed with no live worker — waking to re-attach`);
+    logger.info(
+      `[${ds.session.sessionId.substring(0, 8)}] terminal accessed with no live worker — `
+      + (coldWake ? 'backing pane is gone, waking cold' : 'waking to re-attach'),
+    );
     // Lazy-wake is a fork boundary too. The central guard inside forkWorker
     // refuses (returns false) for a quarantined tail-only owner whose promotion
     // still fails — waking a blank worker beside an unpromoted tail would wedge
     // the FIFO gate. Report unavailable (the terminal retries / 502s) instead of
-    // blocking 10s for a port that will never arrive.
+    // blocking for a port that will never arrive.
     if (!forkWorker(ds, '', true)) {
       logger.warn(`[${ds.session.sessionId.substring(0, 8)}] terminal wake refused (quarantined tail-only owner); serving unavailable`);
       return undefined;
     }
+    forkedCold = coldWake;
   }
 
   // Wait (bounded) for the re-forked worker to report its HTTP port via `ready`.
   // Re-attach is fast (~1-2s in practice); 10s covers a slow CLI restart.
-  const deadlineMs = Date.now() + 10_000;
+  // A cold wake is a different, slower operation — it has to create the pane and
+  // boot the CLI before `ready` can be sent — so it gets its own bound instead
+  // of widening the re-attach one.
+  const deadlineMs = Date.now()
+    + (forkedCold ? TERMINAL_COLD_WAKE_TIMEOUT_MS : TERMINAL_REATTACH_TIMEOUT_MS);
   while (Date.now() < deadlineMs) {
     if (ds.workerPort) return ds.workerPort;
     await new Promise((r) => setTimeout(r, 100));
