@@ -635,6 +635,97 @@ describe('ordinary Claude semantic recovery', () => {
     }));
   });
 
+  // The failure card must not become a SECOND notice for a failure the user can
+  // already see. Structured-bridge CLIs (codex/pi/omp/grok/traex/ebsd) post
+  // their own `final_output` card on a `failed` terminal — one that also
+  // preserves any partial answer — so this path must stay out of their way and
+  // only cover what was previously SILENT.
+  it('does not double-notify a structured CLI whose failed turn already posted a card', async () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex' }));
+    const sessionReply = vi.fn(async () => 'om_x');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs({ sessionOverrides: { cliId: 'codex' } } as any);
+    forkWorker(ds, 'codex turn', 'om_codex');
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_codex',
+      status: 'failed',
+      errorCode: 'codex_task_failed',
+    });
+    // Let the terminal handler's async work settle. No fake timers in this
+    // describe block, so yield the real microtask/macrotask queue instead.
+    await new Promise(r => setTimeout(r, 50));
+
+    const cards = vi.mocked(sessionReply).mock.calls.filter(c => c[2] === 'interactive');
+    expect(cards).toHaveLength(0);
+  });
+
+  it('posts a card for a structured CLI turn that would otherwise be silent', async () => {
+    // `ambiguous` is the gap: the bridge gate only emits its own notice for
+    // `failed`, so a dead CLI / failed input write previously produced NOTHING
+    // and looked exactly like a clean finish.
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex' }));
+    const sessionReply = vi.fn(async () => 'om_x');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs({ sessionOverrides: { cliId: 'codex' } } as any);
+    forkWorker(ds, 'codex turn', 'om_codex2');
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_codex2',
+      status: 'ambiguous',
+      errorCode: 'cli_exit',
+    });
+
+    await vi.waitFor(() => {
+      const cards = vi.mocked(sessionReply).mock.calls.filter(c => c[2] === 'interactive');
+      expect(cards).toHaveLength(1);
+      expect(cards[0][1]).toContain('cli_exit');
+    });
+  });
+
+  it('stays silent when the user aborted the turn themselves', async () => {
+    // Esc → `*_turn_aborted`. The user already knows; a card here would be the
+    // very alert noise this feature exists to reduce.
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex' }));
+    const sessionReply = vi.fn(async () => 'om_x');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs({ sessionOverrides: { cliId: 'codex' } } as any);
+    forkWorker(ds, 'codex turn', 'om_codex3');
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_codex3',
+      status: 'ambiguous',
+      errorCode: 'rpc_turn_aborted',
+    });
+    await new Promise(r => setTimeout(r, 50));
+
+    expect(vi.mocked(sessionReply).mock.calls.filter(c => c[2] === 'interactive')).toHaveLength(0);
+  });
+
   it('keeps turn N as recovery owner when type-ahead N+1 is admitted', async () => {
     vi.useFakeTimers();
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
