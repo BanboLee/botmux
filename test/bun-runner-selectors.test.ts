@@ -122,3 +122,62 @@ describe('bun leg selectors — this guard runs inside the leg it guards', () =>
     expect(isDeferredFromBunLeg(readFileSync('test/bun-runner-selectors.test.ts', 'utf8'))).toBe(false);
   });
 });
+
+describe('no test file may use a bare empty-array each row', () => {
+  it('finds none across the whole suite', async () => {
+    // A BARE `[]` row in `it.each([...])` spreads to ZERO arguments under `bun test`, so
+    // a callback declaring a parameter looks like it wants a `done` callback: the runner
+    // waits and the case dies at the timeout. Three files had it, each burning the full
+    // 180s ceiling on a body that cannot hang, which reads as a deadlock rather than as
+    // bad data. Writing `[[]]` is unambiguous under both runners.
+    //
+    // Scanned with the TypeScript AST, not a regex: a text pattern for this missed
+    // `test/model-pricing.test.ts` (the row sat among other bare values), and a
+    // silently-incomplete scan is exactly how the third instance survived the first fix.
+    const ts = await import('typescript');
+    const { readdirSync, readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+
+    const excluded = new Set(['e2e-browser', 'node_modules', 'fixtures', '__snapshots__']);
+    const walk = (dir: string): string[] => {
+      const out: string[] = [];
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (!excluded.has(entry.name)) out.push(...walk(full));
+        } else if (/\.(test|spec)\.ts$/.test(entry.name)) {
+          out.push(full);
+        }
+      }
+      return out;
+    };
+
+    const files = walk('test');
+    // Guard the guard: an empty file list would make this pass vacuously.
+    expect(files.length).toBeGreaterThan(500);
+
+    const offenders: string[] = [];
+    for (const file of files) {
+      const source = readFileSync(file, 'utf8');
+      const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+      const visit = (node: import('typescript').Node): void => {
+        if (ts.isCallExpression(node)
+          && ts.isPropertyAccessExpression(node.expression)
+          && node.expression.name.text === 'each') {
+          for (const arg of node.arguments) {
+            if (!ts.isArrayLiteralExpression(arg)) continue;
+            for (const el of arg.elements) {
+              if (ts.isArrayLiteralExpression(el) && el.elements.length === 0) {
+                const { line } = sf.getLineAndCharacterOfPosition(el.getStart(sf));
+                offenders.push(`${file}:${line + 1}`);
+              }
+            }
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sf);
+    }
+    expect(offenders).toEqual([]);
+  });
+});
