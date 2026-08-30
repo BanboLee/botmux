@@ -705,6 +705,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     botToBotSameDir: body.botToBotSameDir,
     autoStartOnGroupJoin: body.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: body.autoStartOnGroupJoinPrompt,
+    autoStartOnGroupJoinSeed: body.autoStartOnGroupJoinSeed,
     autoStartOnNewTopic: body.autoStartOnNewTopic,
     regularGroupReplyMode: body.regularGroupReplyMode,
     regularGroupMentionMode: body.regularGroupMentionMode,
@@ -2852,12 +2853,14 @@ function workingDirState(bot: BotDefaultsRow): { mode: 'off' | 'default' | 'onca
   return { mode, workingDir: bot.defaultWorkingDir || def.workingDir || '' };
 }
 
-function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const { bot, putCardPref } = props;
   const [onJoin, setOnJoin] = useState(bot.autoStartOnGroupJoin === true);
   const [onTopic, setOnTopic] = useState(bot.autoStartOnNewTopic === true);
   const [prompt, setPrompt] = useState(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
+  // 编辑态软预填：未自定义时显示内置默认文案，只有点保存才落盘（空 = 跟随动态默认）。
+  const [seed, setSeed] = useState(bot.autoStartOnGroupJoinSeed || bot.autoStartOnGroupJoinSeedDefault || '');
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -2865,7 +2868,15 @@ function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: Card
     setOnJoin(bot.autoStartOnGroupJoin === true);
     setOnTopic(bot.autoStartOnNewTopic === true);
     setPrompt(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
-  }, [bot.autoStartOnGroupJoin, bot.autoStartOnGroupJoinPrompt, bot.autoStartOnNewTopic]);
+    setSeed(bot.autoStartOnGroupJoinSeed || bot.autoStartOnGroupJoinSeedDefault || '');
+  }, [
+    bot.larkAppId,
+    bot.autoStartOnGroupJoin,
+    bot.autoStartOnGroupJoinPrompt,
+    bot.autoStartOnGroupJoinSeed,
+    bot.autoStartOnGroupJoinSeedDefault,
+    bot.autoStartOnNewTopic,
+  ]);
 
   async function savePatch(patch: CardPrefPatch, key: string): Promise<void> {
     setBusy(key);
@@ -2900,6 +2911,18 @@ function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: Card
           <textarea data-input="autoJoinPrompt" rows={3} placeholder={tr('botDefaults.autoStartJoinPromptPlaceholder')} value={prompt} onChange={event => setPrompt(event.currentTarget.value)} />
         </label>
       </div>
+      <div className="bd-row">
+        <label>
+          <FieldTitle help={tr('botDefaults.autoStartJoinSeedHelp')}>{tr('botDefaults.autoStartJoinSeed')}</FieldTitle>
+          <textarea
+            data-input="autoJoinSeed"
+            rows={2}
+            placeholder={bot.autoStartOnGroupJoinSeedDefault || tr('botDefaults.autoStartJoinSeedPlaceholder')}
+            value={seed}
+            onChange={event => setSeed(event.currentTarget.value)}
+          />
+        </label>
+      </div>
       <ToggleRow
         checked={onTopic}
         disabled={busy === 'topic'}
@@ -2915,6 +2938,21 @@ function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: Card
         <button type="button" className="primary" data-action="save-auto-join-prompt" disabled={busy === 'prompt'} onClick={() => void savePatch({ autoStartOnGroupJoinPrompt: prompt }, 'prompt')}>
           {tr('botDefaults.autoStartJoinPromptSave')}
         </button>
+        <button type="button" className="primary" data-action="save-auto-join-seed" disabled={busy === 'seed'} onClick={() => void savePatch({
+          autoStartOnGroupJoinSeed: seed,
+          // 一并回传「这个页面当时预填给用户看的那句默认」。服务端据此判断本次提交
+          // 是不是原样回存的软预填值——只跟服务端当刻默认比是不够的：页面拿到
+          // payload 之后 bot locale 可能已被改掉（/config lang 立即生效且不发
+          // bots.changed，本页不会重拉），此时软预填仍是旧语言那句。
+          autoStartOnGroupJoinSeedDefault: bot.autoStartOnGroupJoinSeedDefault ?? '',
+        }, 'seed')}>
+          {tr('botDefaults.autoStartJoinSeedSave')}
+        </button>
+        {bot.autoStartOnGroupJoinSeed ? (
+          <button type="button" data-action="reset-auto-join-seed" disabled={busy === 'seedreset'} onClick={() => void savePatch({ autoStartOnGroupJoinSeed: '' }, 'seedreset')}>
+            {tr('botDefaults.autoStartJoinSeedReset')}
+          </button>
+        ) : null}
         <StatusSpan status={status} attr={{ 'data-auto-start-status': '' }} />
       </div>
     </div>
