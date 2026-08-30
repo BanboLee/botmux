@@ -218,7 +218,7 @@ function makeDs(over: Partial<DaemonSession> & { sessionOverrides?: Partial<Sess
 }
 
 /** `turnId === null` omits turn_id entirely (an old card built before the pin). */
-function actionData(turnId: string | null = TURN): any {
+function actionData(turnId: string | null = TURN, mode: string | null = 'resend'): any {
   return {
     operator: { open_id: OWNER },
     action: {
@@ -227,6 +227,7 @@ function actionData(turnId: string | null = TURN): any {
         root_id: ROOT,
         session_id: SID,
         ...(turnId === null ? {} : { turn_id: turnId }),
+        ...(mode === null ? {} : { mode }),
       },
     },
     context: { open_message_id: 'om_clicked' },
@@ -258,15 +259,39 @@ beforeEach(() => {
 });
 
 describe('retry_turn — happy path', () => {
-  it('re-injects the recorded CLI input over the live worker', async () => {
+  it('re-injects the recorded CLI input verbatim in resend mode', async () => {
+    // resend is only offered when the input provably never reached the CLI, so
+    // restating the request verbatim is the cleanest thing we can do.
     const ds = makeDs();
-    const res = await handleCardAction(actionData(), depsWith(ds), LARK_APP_ID);
+    const res = await handleCardAction(actionData(TURN, 'resend'), depsWith(ds), LARK_APP_ID);
     expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
-    // The ORIGINAL wrapped input must be resent — not the display prompt.
     expect(sendWorkerInputMock.mock.calls[0][1]).toMatchObject({
       content: 'wrapped: do the thing',
     });
     expect(res?.toast?.type).toBe('success');
+  });
+
+  it('submits a checkpoint-continue instruction in continue mode', async () => {
+    // The turn may have half-executed. Replaying the original prompt verbatim
+    // would risk repeating side effects, so the CLI is asked to inspect state
+    // and resume instead.
+    const ds = makeDs();
+    const res = await handleCardAction(actionData(TURN, 'continue'), depsWith(ds), LARK_APP_ID);
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    const sent = sendWorkerInputMock.mock.calls[0][1].content as string;
+    expect(sent).toContain('[BOTMUX_CONTINUE]');
+    expect(sent).toContain('不要重复已经完成的外部副作用');
+    // The original task must be embedded: after a cli_exit the CLI is a fresh
+    // process, so a bare "continue" could leave it with nothing to continue.
+    expect(sent).toContain('do the thing');
+    expect(res?.toast?.type).toBe('success');
+  });
+
+  it('treats a card with no mode as continue (fail-safe for older cards)', async () => {
+    // Defaulting to resend would blindly replay a possibly-executed turn.
+    const ds = makeDs();
+    await handleCardAction(actionData(TURN, null), depsWith(ds), LARK_APP_ID);
+    expect(sendWorkerInputMock.mock.calls[0][1].content).toContain('[BOTMUX_CONTINUE]');
   });
 
   it('forks a worker when the session has none alive', async () => {
@@ -276,7 +301,7 @@ describe('retry_turn — happy path', () => {
     expect(sendWorkerInputMock).not.toHaveBeenCalled();
   });
 
-  it('strips clientUserMessageId so the resubmit cannot be deduped away', async () => {
+  it('strips clientUserMessageId so a resend cannot be deduped away', async () => {
     const ds = makeDs({
       sessionOverrides: {
         lastFailedTurn: makeFailedTurn({
@@ -284,10 +309,25 @@ describe('retry_turn — happy path', () => {
         }),
       },
     });
-    await handleCardAction(actionData(), depsWith(ds), LARK_APP_ID);
+    await handleCardAction(actionData(TURN, 'resend'), depsWith(ds), LARK_APP_ID);
     const sent = sendWorkerInputMock.mock.calls[0][1];
     expect(sent.codexAppInput).toBeDefined();
     expect(sent.codexAppInput.clientUserMessageId).toBeUndefined();
+  });
+
+  it('drops the codex-app sidecar in continue mode', async () => {
+    // The sidecar describes "replay THIS structured input". A continue turn is
+    // a different instruction, so carrying it would hand the CLI a structured
+    // payload that contradicts the text.
+    const ds = makeDs({
+      sessionOverrides: {
+        lastFailedTurn: makeFailedTurn({
+          codexAppInput: { clientUserMessageId: 'prior-id', items: [] } as any,
+        }),
+      },
+    });
+    await handleCardAction(actionData(TURN, 'continue'), depsWith(ds), LARK_APP_ID);
+    expect(sendWorkerInputMock.mock.calls[0][1].codexAppInput).toBeUndefined();
   });
 
   it('stamps the retry attempt and persists it', async () => {

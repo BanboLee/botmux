@@ -24,6 +24,7 @@ import {
   mayOfferTurnRetry,
   userAbortErrorCodes,
   preExecutionErrorCodes,
+  buildTurnContinuePrompt,
 } from '../src/services/turn-failure-notice.js';
 import { globalConfigPath, invalidateGlobalConfigCache } from '../src/global-config.js';
 
@@ -102,8 +103,9 @@ describe('turnRetryOffer', () => {
 
   it('caveats retry for a turn that may have already executed', () => {
     // cli_exit is the motivating case: the CLI may have pushed a commit before
-    // dying. We still offer the button (hiding it strands the user) but the
-    // card must warn — /retry re-sends the ORIGINAL input verbatim.
+    // dying. We still offer the button (hiding it strands the user), but the
+    // card must warn AND the action switches to checkpoint-continue rather than
+    // replaying the original input verbatim.
     expect(turnRetryOffer({ status: 'ambiguous', errorCode: 'cli_exit' })).toBe('caveated');
     expect(turnRetryOffer({ status: 'failed', errorCode: 'pi_turn_error' })).toBe('caveated');
   });
@@ -150,6 +152,42 @@ describe('turnRetryOffer', () => {
     // failure sprout a retry button — contradictory. Pin the disjointness.
     const aborts = new Set(userAbortErrorCodes());
     for (const code of preExecutionErrorCodes()) expect(aborts.has(code)).toBe(false);
+  });
+});
+
+// ─── The continue prompt ────────────────────────────────────────────────────
+
+describe('buildTurnContinuePrompt', () => {
+  it('embeds the original task so a fresh CLI has something to continue', () => {
+    // After cli_exit the worker forks a NEW CLI process. If transcript resume
+    // does not restore context, a bare "continue" leaves the model guessing.
+    const p = buildTurnContinuePrompt('deploy the staging box');
+    expect(p).toContain('deploy the staging box');
+  });
+
+  it('instructs the model to inspect state before acting', () => {
+    const p = buildTurnContinuePrompt('x');
+    expect(p).toContain('读取当前会话与工作区状态');
+  });
+
+  it('forbids repeating completed side effects', () => {
+    // This is the whole reason continue exists instead of a verbatim replay.
+    expect(buildTurnContinuePrompt('x')).toContain('不要重复已经完成的外部副作用');
+  });
+
+  it('tells the model to stop and hand back when it cannot tell', () => {
+    expect(buildTurnContinuePrompt('x')).toContain('交回人工决策');
+  });
+
+  it('does not claim a provider fault', () => {
+    // The recovery ladder's prompt asserts a transient provider failure. That
+    // is false for cli_exit (a dead process), and naming a wrong cause sends
+    // the model looking in the wrong place.
+    expect(buildTurnContinuePrompt('x')).not.toContain('provider');
+  });
+
+  it('carries a machine-recognisable marker', () => {
+    expect(buildTurnContinuePrompt('x')).toContain('[BOTMUX_CONTINUE]');
   });
 });
 
@@ -210,6 +248,29 @@ describe('buildTurnFailedCard', () => {
     // A possibly-destructive action must not be the visual default.
     expect(btn.type).toBe('default');
     expect(bodyText(card)).toContain('可能已经执行了一部分');
+  });
+
+  it('labels and tags the caveated button as continue, not retry', () => {
+    // The button must promise what the handler will actually do: inspect state
+    // and resume, NOT replay the original prompt verbatim.
+    const btn = actions(build({ retryOffer: 'caveated' }))
+      .find((a: any) => a.value?.action === 'retry_turn');
+    expect(btn.value.mode).toBe('continue');
+    expect(btn.text.content).toContain('继续');
+    expect(btn.text.content).not.toContain('重试');
+  });
+
+  it('labels and tags the safe button as a resend', () => {
+    const btn = actions(build({ retryOffer: 'safe' }))
+      .find((a: any) => a.value?.action === 'retry_turn');
+    expect(btn.value.mode).toBe('resend');
+    expect(btn.text.content).toContain('重试');
+  });
+
+  it('does not promise a verbatim replay in the caveated body text', () => {
+    // Earlier wording said retry "re-sends the original task verbatim"; that
+    // became false once caveated switched to checkpoint-continue semantics.
+    expect(bodyText(build({ retryOffer: 'caveated' }))).not.toContain('原样重发');
   });
 
   it('makes a provably-safe retry the primary action', () => {

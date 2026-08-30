@@ -125,6 +125,40 @@ export function mayOfferTurnRetry(
   return turnRetryOffer(turn) !== 'none';
 }
 
+/**
+ * What to actually submit when the user presses the failure card's button.
+ *
+ * `safe` → re-send the original input verbatim. Nothing executed, so restating
+ * the request is the cleanest, most predictable thing we can do; asking the
+ * model to infer state would be strictly worse.
+ *
+ * `caveated` → the turn may have half-executed, so a verbatim re-send risks
+ * repeating side effects. Submit a continue instruction instead: have the model
+ * inspect the workspace and resume from the last verifiable checkpoint.
+ *
+ * Deliberately NOT reusing `ORDINARY_TURN_RECOVERY_PROMPT`: its first line
+ * asserts "上一执行因暂态 provider 故障中止", which is false for the codes that
+ * land here (`cli_exit` is a dead CLI process, not a provider fault). Telling
+ * the model a wrong cause invites it to look in the wrong place.
+ *
+ * The original task text is EMBEDDED rather than assumed to survive: after a
+ * `cli_exit` the worker forks a fresh CLI, and if transcript resume does not
+ * restore context, a bare "continue" would leave the model with nothing to
+ * continue. Including the task makes this degrade gracefully either way.
+ */
+export function buildTurnContinuePrompt(originalPrompt: string): string {
+  return [
+    '[BOTMUX_CONTINUE]',
+    '上一轮执行被异常中断（CLI 进程退出或状态不明），可能已经完成了一部分工作。',
+    '请先读取当前会话与工作区状态，判断哪些步骤已经完成，然后从最后一个可验证的 checkpoint 继续；',
+    '不要重复已经完成的外部副作用（例如重复提交、重复发消息、重复写文件）。',
+    '若无法安全判断已完成到哪一步，请停止并说明你看到的现场，交回人工决策。',
+    '',
+    '原任务：',
+    originalPrompt,
+  ].join('\n');
+}
+
 /** Test/introspection helpers. Copies, so callers cannot mutate the policy. */
 export function userAbortErrorCodes(): string[] {
   return [...USER_ABORT_ERROR_CODES];

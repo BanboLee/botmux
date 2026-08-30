@@ -89,6 +89,7 @@ import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../../services/failed-turn-retry.js';
+import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, silentIdleCardFlag, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
@@ -2932,9 +2933,22 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const retryCodexAppInput = failedTurn.codexAppInput
         ? (({ clientUserMessageId: _prior, ...input }) => input)(failedTurn.codexAppInput)
         : undefined;
+      // 提交什么由卡上的 mode 决定，而 mode 由渲染时的 retryOffer 决定，所以
+      // 「卡上写的语义」与「实际发生的事」永远一致：
+      //   resend   —— 输入证明没送达 CLI，零副作用，重发原话最干净可靠；
+      //   continue —— 可能已执行一部分，原样重发会重复副作用，改发续跑指令
+      //               （读现场 → 从 checkpoint 接着做 → 判断不了就交回人工）。
+      // 旧卡片没有 mode 字段：按 continue 处理（fail-safe —— 宁可让模型先看
+      // 现场，也不要在可能已执行过的轮次上闷头重发一遍）。
+      const continueMode = value?.mode !== 'resend';
+      const submittedContent = continueMode
+        ? buildTurnContinuePrompt(failedTurn.userPrompt || failedTurn.cliInput)
+        : failedTurn.cliInput;
       const retryInput = {
-        content: failedTurn.cliInput,
-        ...(retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
+        content: submittedContent,
+        // codexAppInput 描述的是「原样重发那条结构化输入」。续跑发的是一条新指令，
+        // 带上旧 sidecar 会让 CLI 收到与正文不符的结构化载荷。
+        ...(!continueMode && retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
       };
       let accepted = false;
       try {
@@ -2966,9 +2980,19 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       persistStreamCardState(ds);
       logger.info(
         `[${tag(ds)}] retry_turn re-injected turn ${failedTurn.turnId.slice(0, 8)} `
+        + `mode=${continueMode ? 'continue' : 'resend'} `
         + `(attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`,
       );
-      return { toast: { type: 'success', content: t('card.action.retry_turn_success', undefined, locDs) } };
+      return {
+        toast: {
+          type: 'success',
+          content: t(
+            continueMode ? 'card.action.continue_turn_success' : 'card.action.retry_turn_success',
+            undefined,
+            locDs,
+          ),
+        },
+      };
     }
 
     if (actionType === 'tui_keys' && ds) {

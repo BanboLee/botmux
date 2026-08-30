@@ -1852,10 +1852,26 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
   if (canRetry) {
     actions.push({
       tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.retry_turn', undefined, locale) },
+      text: {
+        tag: 'plain_text',
+        // 语义跟着动作走：没跑过 = 重试（重发原话）；跑过一半 = 继续（读现场后
+        // 从 checkpoint 接着做）。文案说错会让用户对副作用风险判断错。
+        content: t(
+          o.retryOffer === 'safe' ? 'card.btn.retry_turn' : 'card.btn.continue_turn',
+          undefined,
+          locale,
+        ),
+      },
       // caveated 用 default 而不是 primary：可能重复副作用的操作不该是视觉默认项。
       type: o.retryOffer === 'safe' ? 'primary' : 'default',
-      value: { action: 'retry_turn', turn_id: o.retryTurnId, ...actionBase },
+      value: {
+        action: 'retry_turn',
+        turn_id: o.retryTurnId,
+        // handler 据此决定提交「原话」还是「续跑指令」。渲染与执行读同一个
+        // retryOffer，卡上写的语义就是真正会发生的事。
+        mode: o.retryOffer === 'safe' ? 'resend' : 'continue',
+        ...actionBase,
+      },
     });
   }
   if (o.terminalUrl) {

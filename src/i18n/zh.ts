@@ -31,6 +31,7 @@ export const messages: Record<string, string> = {
   'card.btn.send_custom': '📝 发送自定义回复',
   'card.btn.retry_last_task': '🔁 重发上一条任务',
   'card.btn.retry_turn': '🔁 重试这一轮',
+  'card.btn.continue_turn': '▶️ 继续这一轮',
   'card.btn.stop': '⏹ 停止',
   'card.btn.compact': '🗜️ 压缩',
 
@@ -920,7 +921,7 @@ export const messages: Record<string, string> = {
   // 「没跑就挂了」——重发无副作用风险，可以放心点。
   'card.turn_failed.retry_safe': '这一轮的输入没有送达 CLI，**没有任何已执行的操作**，可以安全重试。',
   // 「跑到一半挂了」——重发会重跑，必须让用户自己判断。
-  'card.turn_failed.retry_caveated': '⚠️ 这一轮**可能已经执行了一部分**（改文件 / 提交 / 发消息等）。重试会把原任务**原样重发一遍**，已完成的操作可能重复执行。不确定时请先打开 Web 终端确认现场。',
+  'card.turn_failed.retry_caveated': '⚠️ 这一轮**可能已经执行了一部分**（改文件 / 提交 / 发消息等）。点「继续」不会原样重跑：会让 CLI **先读取当前现场**，判断做到哪一步，再从上次的进度接着做；判断不了会停下来交回你决定。仍建议先看一眼 Web 终端。',
   'card.turn_failed.no_retry': '当前错误重发同样的输入也无法成功，请检查后发送新的消息。',
   'card.turn_failed.no_input': '这一轮没有可重发的输入记录（任务在提交前就中断了），请直接发送新的消息。',
 
@@ -929,6 +930,7 @@ export const messages: Record<string, string> = {
   'card.action.retry_turn_cooldown': '⏳ 重试冷却中，请在 {seconds} 秒后再试。',
   'card.action.retry_turn_submit_failed': '⚠️ 重试提交失败：worker 当前不接受输入，请稍后再试。',
   'card.action.retry_turn_success': '🔁 已重新提交这一轮任务，请等待执行。',
+  'card.action.continue_turn_success': '▶️ 已请 CLI 读取现场后从上次的进度继续，请等待执行。',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': '请先在飞书开放平台创建应用: https://open.feishu.cn/app',

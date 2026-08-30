@@ -28,6 +28,7 @@ export const messages: Record<string, string> = {
   'card.btn.send_custom': '📝 Send Custom Reply',
   'card.btn.retry_last_task': '🔁 Retry Last Task',
   'card.btn.retry_turn': '🔁 Retry This Turn',
+  'card.btn.continue_turn': '▶️ Continue This Turn',
   'card.btn.stop': '⏹ Stop',
   'card.btn.compact': '🗜️ Compact',
 
@@ -917,7 +918,7 @@ export const messages: Record<string, string> = {
   'card.turn_failed.field_continuations': '**Auto-continuations**: {count} (still not recovered)',
   'card.turn_failed.reason': '**Reason**: {reason}',
   'card.turn_failed.retry_safe': 'This turn\'s input never reached the CLI, so **nothing was executed**. Retrying is safe.',
-  'card.turn_failed.retry_caveated': '⚠️ This turn **may have partially executed** (edited files, commits, messages sent). Retrying re-sends the original task **verbatim**, so completed actions may run again. If unsure, open the Web Terminal and check the current state first.',
+  'card.turn_failed.retry_caveated': '⚠️ This turn **may have partially executed** (edited files, commits, messages sent). Continue does NOT replay it verbatim: the CLI is asked to **inspect the current state first**, work out how far it got, and resume from there — stopping and handing back to you if it cannot tell. Still worth a glance at the Web Terminal.',
   'card.turn_failed.no_retry': 'Re-sending the same input cannot succeed for this error. Check the cause, then send a new message.',
   'card.turn_failed.no_input': 'No re-sendable input was recorded for this turn (it stopped before submission). Send a new message instead.',
 
@@ -926,6 +927,7 @@ export const messages: Record<string, string> = {
   'card.action.retry_turn_cooldown': '⏳ Retry is cooling down. Try again in {seconds}s.',
   'card.action.retry_turn_submit_failed': '⚠️ Retry submission failed: the worker is not accepting input right now. Try again shortly.',
   'card.action.retry_turn_success': '🔁 This turn has been resubmitted. Waiting for execution.',
+  'card.action.continue_turn_success': '▶️ Asked the CLI to inspect the current state and resume from where it stopped. Waiting for execution.',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': 'First create a Lark app at: https://open.feishu.cn/app',
