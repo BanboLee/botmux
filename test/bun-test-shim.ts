@@ -25,6 +25,15 @@ import { vi } from 'vitest';
  *     (`test/remote-shutdown-detach.test.ts`, which fails with
  *     `results.every is not a function`). Overriding a matcher cannot fix how the
  *     runner threads the awaited value into it.
+ *   An `it.each` row that is a BARE EMPTY ARRAY (`it.each([null, [], 'x'])`) spreads
+ *     to ZERO arguments under `bun test`. A callback that declares a parameter then
+ *     looks like it wants a `done` callback, so the runner waits for one and the case
+ *     dies at the timeout — measured: 180s on a body that is fully synchronous and
+ *     cannot hang, which makes it read as a hang rather than as bad data. vitest
+ *     passes the empty array through as the single argument instead. Cannot be shimmed:
+ *     `it.each` is the runner's own, and the arity check happens before any of our code.
+ *     WRITE `[[]]` — a tuple-wrapped row is unambiguous under both runners. Guarded by
+ *     `test/bun-shim-parity.test.ts` so the divergence cannot come back unnoticed.
  *
  * DELIBERATELY NOT SHIMMED — these are module-system semantics, not missing
  * functions, and any fake would silently not-mock while reporting success:
