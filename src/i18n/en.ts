@@ -27,6 +27,7 @@ export const messages: Record<string, string> = {
   'card.btn.half_page_down': '⇟ Page ½ Down',
   'card.btn.send_custom': '📝 Send Custom Reply',
   'card.btn.retry_last_task': '🔁 Retry Last Task',
+  'card.btn.retry_turn': '🔁 Retry This Turn',
   'card.btn.stop': '⏹ Stop',
   'card.btn.compact': '🗜️ Compact',
 
@@ -906,6 +907,25 @@ export const messages: Record<string, string> = {
   'worker.ordinary_recovery_dispatch_interrupted': '⚠️ Botmux restarted while an automatic Claude continuation was being handed off, so its execution state is unknown. To avoid repeating external side effects, Botmux did not replay it. Check the Web Terminal, then send a message to continue.',
   'worker.ordinary_recovery_non_retryable': '⚠️ This Claude turn failed, and the current error cannot be retried safely. Botmux stopped automatic processing to avoid repeating external side effects. Check the Web Terminal and model-service status, then send a message to continue.',
   'worker.claude_terminal_failure_unrecovered': '⚠️ This Claude turn stopped with a model-service error ({errorCode}). This delivery channel did not start an automatic continuation. Check the Web Terminal, then retry or send a message to continue.',
+
+  // ─── Turn-failure card (generic failure card: @mention + retry button) ────
+  'card.turn_failed.title': '⚠️ {cliName} turn failed',
+  'card.turn_failed.title_ambiguous': '⚠️ {cliName} turn stopped unexpectedly',
+  'card.turn_failed.field_error': '**Error code**: {errorCode}',
+  'card.turn_failed.field_when': '**Failed at**: {when}',
+  'card.turn_failed.field_task': '**Task**: {task}',
+  'card.turn_failed.field_continuations': '**Auto-continuations**: {count} (still not recovered)',
+  'card.turn_failed.reason': '**Reason**: {reason}',
+  'card.turn_failed.retry_safe': 'This turn\'s input never reached the CLI, so **nothing was executed**. Retrying is safe.',
+  'card.turn_failed.retry_caveated': '⚠️ This turn **may have partially executed** (edited files, commits, messages sent). Retrying re-sends the original task **verbatim**, so completed actions may run again. If unsure, open the Web Terminal and check the current state first.',
+  'card.turn_failed.no_retry': 'Re-sending the same input cannot succeed for this error. Check the cause, then send a new message.',
+  'card.turn_failed.no_input': 'No re-sendable input was recorded for this turn (it stopped before submission). Send a new message instead.',
+
+  'card.action.retry_turn_missing': '⚠️ No input record found for this turn, so it cannot be retried. Send a new message instead.',
+  'card.action.retry_turn_stale': '⚠️ This card is out of date (the session failed again or was already retried). Use the latest card, or send a new message.',
+  'card.action.retry_turn_cooldown': '⏳ Retry is cooling down. Try again in {seconds}s.',
+  'card.action.retry_turn_submit_failed': '⚠️ Retry submission failed: the worker is not accepting input right now. Try again shortly.',
+  'card.action.retry_turn_success': '🔁 This turn has been resubmitted. Waiting for execution.',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': 'First create a Lark app at: https://open.feishu.cn/app',

@@ -30,7 +30,7 @@ import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self
 import { resolveSessionLaunchModel } from './session-model.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
-import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
@@ -387,6 +387,7 @@ import {
   requireOrdinaryTurnRecoveryAttention,
   type OrdinaryTurnRecoveryDispatch,
 } from '../services/ordinary-turn-recovery.js';
+import { turnRetryOffer, shouldNotifyTurnFailure } from '../services/turn-failure-notice.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
@@ -1259,6 +1260,54 @@ function ordinaryTurnRecoveryWarning(
   return tr('worker.ordinary_recovery_non_retryable', undefined, locale);
 }
 
+/** 构造一张通用失败卡。两条通知路径（recovery warn / claude 终态兜底）共用它，
+ *  以免同一件事在两处长得不一样。
+ *
+ *  重试按钮只在 `lastFailedTurn` 与本次失败**同一轮**时出现：那条记录是按钮的
+ *  一次性凭据（handler 用 turnId 逐字比对），没有它就只剩「去看 Web 终端」。
+ *  记录缺失是正常情况——turn 在 prompt 被 wrap 前就死掉时 buildFailedTurnRecord
+ *  返回 undefined。 */
+function buildSessionTurnFailedCard(
+  ds: DaemonSession,
+  opts: {
+    status: 'failed' | 'ambiguous';
+    errorCode?: string;
+    reason?: string;
+    continuations?: number;
+    retryable?: boolean;
+  },
+): string {
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const failedTurn = ds.session.lastFailedTurn;
+  const offer = turnRetryOffer({
+    status: opts.status,
+    ...(opts.errorCode !== undefined ? { errorCode: opts.errorCode } : {}),
+    ...(opts.retryable !== undefined ? { retryable: opts.retryable } : {}),
+  });
+  // 没有真人 footer 收件人时才回退 @ bot 管理员（与失败兜底通知同口径，且
+  // 绝不 @ bot——那会触发对方新一轮）。
+  const mentionOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId)
+    ?? failureNoticeFallbackMentionOpenId(ds);
+  return buildTurnFailedCard({
+    rootId: sessionAnchorId(ds),
+    sessionId: ds.session.sessionId,
+    cliId: effectiveCliId,
+    cliName: sessionRuntimeDisplayName(ds) ?? getCliDisplayName(effectiveCliId),
+    status: opts.status,
+    ...(opts.errorCode !== undefined ? { errorCode: opts.errorCode } : {}),
+    ...(opts.reason !== undefined ? { reason: opts.reason } : {}),
+    failedAt: new Date(),
+    ...(failedTurn?.userPrompt !== undefined ? { task: failedTurn.userPrompt } : {}),
+    ...(opts.continuations !== undefined ? { continuations: opts.continuations } : {}),
+    retryOffer: offer,
+    ...(failedTurn ? { retryTurnId: failedTurn.turnId } : {}),
+    ...(mentionOpenId ? { mentionOpenId } : {}),
+    terminalUrl: readableTerminalUrlFor(ds),
+    locale: localeForBot(ds.larkAppId),
+  });
+}
+
 /** Attach the crash-safe timer owner for one eligible ordinary Claude/Lark
  * session. Session state is persisted; this runtime registry only owns timers. */
 export function ensureOrdinaryTurnRecoveryAttached(
@@ -1310,8 +1359,16 @@ export function ensureOrdinaryTurnRecoveryAttached(
       });
       void requireCallbacks().sessionReply(
         sessionAnchorId(ds),
-        warning,
-        'text',
+        buildSessionTurnFailedCard(ds, {
+          status: 'failed',
+          ...(state.lastErrorCode !== undefined ? { errorCode: state.lastErrorCode } : {}),
+          // recovery 走到 warn 一定是「自动续跑救不回来」，把已试次数摊给用户，
+          // 免得他以为系统什么都没做。
+          continuations: state.continuationsStarted,
+          // 这条路径的 retryable 已经在 coordinator 里判过并否掉了（否则不会
+          // warn），所以按钮的安全性交给 errorCode 白名单判断，不再谎称 safe。
+        }),
+        'interactive',
         ds.larkAppId,
         state.logicalTurnId,
       ).catch(err => logger.error(
@@ -12151,11 +12208,28 @@ function setupWorkerHandlers(
           }
         }
 
-        if (isClaudeProviderFailure
+        // 失败通知的 Lark 出口。原先只覆盖 claude 的 `provider_*` 终态，导致两个
+        // 缺口：
+        //  1. 结构化 CLI（codex/pi/…）的 `ambiguous` 终态——CLI 进程挂了、输入没
+        //     写进去——**一条消息都不发**（Channel B 的 gate 只放 `failed`），
+        //     卡片悄悄回到「等待输入」，与「正常干完」在用户眼里完全同形。
+        //  2. claude 的通知是纯文本，没有可操作入口。
+        // 现在统一走失败卡。仍然刻意**不**碰已经有可见卡片的路径：`failed` 的
+        // 结构化终态由 Channel B 的 final_output 卡承载（还带半截答案），在这里
+        // 再发一张就是重复通知。
+        const structuredFailedOwnsNotice = !isClaudeProviderFailure && msg.status === 'failed';
+        const shouldPostFailureCard = shouldNotifyTurnFailure({
+          status: msg.status,
+          ...(msg.errorCode !== undefined ? { errorCode: msg.errorCode } : {}),
+        })
+          && !structuredFailedOwnsNotice
           && !nonLarkFailureHandled
           && !recoveryHandled
-          && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
+        if (shouldPostFailureCard) {
           const failureCode = msg.errorCode ?? msg.status;
+          // agentAttention / dashboard「需要你」仍用纯文本摘要：那一列渲染的是
+          // 文本，不是卡片。
           const warning = tr(
             'worker.claude_terminal_failure_unrecovered',
             { errorCode: failureCode },
@@ -12169,10 +12243,18 @@ function setupWorkerHandlers(
             turnId: msg.turnId,
           });
           try {
-            await scopedReply(warning, 'text', msg.turnId);
+            await scopedReply(
+              buildSessionTurnFailedCard(ds, {
+                status: msg.status === 'ambiguous' ? 'ambiguous' : 'failed',
+                ...(msg.errorCode !== undefined ? { errorCode: msg.errorCode } : {}),
+                ...(msg.retryable !== undefined ? { retryable: msg.retryable } : {}),
+              }),
+              'interactive',
+              msg.turnId,
+            );
           } catch (err) {
             logger.error(
-              `[${t}] Failed to deliver Claude terminal failure warning: `
+              `[${t}] Failed to deliver turn failure card: `
               + `${err instanceof Error ? err.message : String(err)}`,
             );
           }

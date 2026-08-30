@@ -38,6 +38,15 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildTuiPromptCard: vi.fn(() => '{"type":"tui"}'),
   buildTuiPromptResolvedCard: vi.fn(() => '{"type":"tui-resolved"}'),
   getCliDisplayName: vi.fn(() => 'Codex'),
+  // Echo the inputs the failure-notice assertions care about (error code +
+  // retry action) rather than a fixed blob, so those assertions test the
+  // delivery path instead of this stub's literal.
+  buildTurnFailedCard: vi.fn((o: any) => JSON.stringify({
+    type: 'turn-failed',
+    errorCode: o.errorCode ?? o.status,
+    retryOffer: o.retryOffer,
+    action: o.retryOffer !== 'none' && o.retryTurnId ? 'retry_turn' : undefined,
+  })),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
@@ -70,6 +79,10 @@ vi.mock('../src/bot-registry.js', () => ({
     plugins: ['demo'],
     skills: { include: ['skill:deploy'] },
   }]),
+  // The failure card resolves a human to @-mention; with no allowlisted user
+  // configured here it must degrade to "nobody to mention" rather than throw.
+  getOwnerOpenId: vi.fn(() => undefined),
+  loadKnownBotOpenIdsForApp: vi.fn(() => new Set<string>()),
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -512,14 +525,20 @@ describe('ordinary Claude semantic recovery', () => {
     await Promise.resolve();
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
+    // The recovery notice is now an interactive failure card rather than plain
+    // text. This fixture never recorded a lastFailedTurn (no onTurnTerminal
+    // callback is wired here), so the card correctly offers NO retry button —
+    // there is no input to re-send. The raw error code must still be visible:
+    // it is the only thing distinguishing a real provider fault from the
+    // unconditional "cannot retry safely" fallback wording.
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
-      expect.stringContaining('自动续跑 2 次'),
-      'text',
+      expect.stringContaining('provider_unexpected_eof'),
+      'interactive',
       'app_test',
       'om_original',
     );
-    expect(ds.agentAttention).toEqual(expect.objectContaining({
+    expect(vi.mocked(sessionReply).mock.calls[0][1]).not.toContain('retry_turn');    expect(ds.agentAttention).toEqual(expect.objectContaining({
       kind: 'blocked',
       reason: expect.stringContaining('自动续跑 2 次'),
     }));
@@ -597,10 +616,14 @@ describe('ordinary Claude semantic recovery', () => {
       retryable: true,
     });
 
+    // Adopt sessions have no recovery consumer, so this failure now surfaces as
+    // the interactive failure card. The raw error code stays visible in the
+    // card body — it is the only thing distinguishing a real provider fault
+    // from the unconditional "cannot retry safely" fallback wording.
     await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
       expect.stringContaining('provider_unexpected_eof'),
-      'text',
+      'interactive',
       'app_test',
       'om_adopted',
       undefined,
@@ -943,10 +966,13 @@ describe('ordinary Claude semantic recovery', () => {
         && message?.turnId?.startsWith('bmx-recovery-'));
     expect(recoverySends).toHaveLength(2);
     expect(sessionReply).toHaveBeenCalledTimes(1);
+    // Now an interactive failure card. `recovery_delivery_failed` is a
+    // pre-execution code (the continuation never reached the worker), so this
+    // card offers retry as provably safe.
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
-      expect.stringContaining('未能送达 Worker'),
-      'text',
+      expect.stringContaining('recovery_delivery_failed'),
+      'interactive',
       'app_test',
       'om_original',
     );
