@@ -271,19 +271,20 @@ describe('retry_turn — happy path', () => {
     expect(res?.toast?.type).toBe('success');
   });
 
-  it('submits a checkpoint-continue instruction in continue mode', async () => {
+  it('submits a short continue instruction in continue mode', async () => {
     // The turn may have half-executed. Replaying the original prompt verbatim
-    // would risk repeating side effects, so the CLI is asked to inspect state
-    // and resume instead.
+    // would risk repeating side effects, so the CLI is told to continue and
+    // explicitly not redo finished work.
     const ds = makeDs();
     const res = await handleCardAction(actionData(TURN, 'continue'), depsWith(ds), LARK_APP_ID);
     expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
     const sent = sendWorkerInputMock.mock.calls[0][1].content as string;
     expect(sent).toContain('[BOTMUX_CONTINUE]');
-    expect(sent).toContain('不要重复已经完成的外部副作用');
-    // The original task must be embedded: after a cli_exit the CLI is a fresh
-    // process, so a bare "continue" could leave it with nothing to continue.
-    expect(sent).toContain('do the thing');
+    expect(sent).toContain('不要重复已完成的操作');
+    // The fork resumes the transcript, so the task text is already available to
+    // the model. Re-sending it here would just burn tokens.
+    expect(sent).not.toContain('do the thing');
+    expect(sent).not.toContain('wrapped:');
     expect(res?.toast?.type).toBe('success');
   });
 

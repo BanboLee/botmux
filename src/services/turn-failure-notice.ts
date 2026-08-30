@@ -129,34 +129,33 @@ export function mayOfferTurnRetry(
  * What to actually submit when the user presses the failure card's button.
  *
  * `safe` → re-send the original input verbatim. Nothing executed, so restating
- * the request is the cleanest, most predictable thing we can do; asking the
- * model to infer state would be strictly worse.
+ * the request is the cleanest, most predictable thing we can do.
  *
  * `caveated` → the turn may have half-executed, so a verbatim re-send risks
- * repeating side effects. Submit a continue instruction instead: have the model
- * inspect the workspace and resume from the last verifiable checkpoint.
+ * repeating side effects. Submit a continue instruction instead.
  *
- * Deliberately NOT reusing `ORDINARY_TURN_RECOVERY_PROMPT`: its first line
- * asserts "上一执行因暂态 provider 故障中止", which is false for the codes that
- * land here (`cli_exit` is a dead CLI process, not a provider fault). Telling
- * the model a wrong cause invites it to look in the wrong place.
+ * Kept deliberately SHORT. The click lands on a session that resumes its own
+ * transcript (`forkWorker(..., ds.hasHistory)` → `--resume <id>`), so the model
+ * already has the original task and everything it did before dying. Restating
+ * the task, or explaining at length what "continue" means, would spend tokens
+ * re-teaching the model what it can already read. Verified in practice: a bare
+ * "继续" is enough to get a CLI to pick up where it stopped.
  *
- * The original task text is EMBEDDED rather than assumed to survive: after a
- * `cli_exit` the worker forks a fresh CLI, and if transcript resume does not
- * restore context, a bare "continue" would leave the model with nothing to
- * continue. Including the task makes this degrade gracefully either way.
+ * So this carries exactly the two things the transcript does NOT tell it:
+ *  1. that the previous turn was cut off mid-flight (the transcript just ends —
+ *     it cannot distinguish "interrupted" from "finished"), and
+ *  2. that work may already have landed, so completed side effects must not be
+ *     repeated. This is the one instruction worth the tokens: it is the whole
+ *     reason this is a continue rather than a replay.
+ *
+ * Also NOT reusing `ORDINARY_TURN_RECOVERY_PROMPT`: its first line asserts a
+ * transient provider fault, which is false for the codes that land here
+ * (`cli_exit` is a dead process). A wrong cause sends the model looking in the
+ * wrong place.
  */
-export function buildTurnContinuePrompt(originalPrompt: string): string {
-  return [
-    '[BOTMUX_CONTINUE]',
-    '上一轮执行被异常中断（CLI 进程退出或状态不明），可能已经完成了一部分工作。',
-    '请先读取当前会话与工作区状态，判断哪些步骤已经完成，然后从最后一个可验证的 checkpoint 继续；',
-    '不要重复已经完成的外部副作用（例如重复提交、重复发消息、重复写文件）。',
-    '若无法安全判断已完成到哪一步，请停止并说明你看到的现场，交回人工决策。',
-    '',
-    '原任务：',
-    originalPrompt,
-  ].join('\n');
+export function buildTurnContinuePrompt(): string {
+  return '[BOTMUX_CONTINUE] 上一轮被异常中断，可能已完成了一部分。'
+    + '请确认现场后从中断处继续，不要重复已完成的操作。';
 }
 
 /** Test/introspection helpers. Copies, so callers cannot mutate the policy. */

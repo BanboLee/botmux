@@ -158,36 +158,43 @@ describe('turnRetryOffer', () => {
 // ─── The continue prompt ────────────────────────────────────────────────────
 
 describe('buildTurnContinuePrompt', () => {
-  it('embeds the original task so a fresh CLI has something to continue', () => {
-    // After cli_exit the worker forks a NEW CLI process. If transcript resume
-    // does not restore context, a bare "continue" leaves the model guessing.
-    const p = buildTurnContinuePrompt('deploy the staging box');
-    expect(p).toContain('deploy the staging box');
+  it('stays short: the resumed transcript already carries the task', () => {
+    // The click forks with resume (`--resume <id>`), so the model can read the
+    // original request and everything it did before dying. Restating those
+    // would spend tokens re-teaching it what it can already see; verified in
+    // practice that a bare "继续" suffices to make a CLI pick up where it
+    // stopped. Keep a hard ceiling so this cannot quietly regrow.
+    const p = buildTurnContinuePrompt();
+    expect(p.length).toBeLessThan(80);
+    expect(p.split('\n')).toHaveLength(1);
   });
 
-  it('instructs the model to inspect state before acting', () => {
-    const p = buildTurnContinuePrompt('x');
-    expect(p).toContain('读取当前会话与工作区状态');
+  it('does not restate the original task', () => {
+    // Redundant with the resumed transcript.
+    expect(buildTurnContinuePrompt()).not.toContain('原任务');
   });
 
-  it('forbids repeating completed side effects', () => {
-    // This is the whole reason continue exists instead of a verbatim replay.
-    expect(buildTurnContinuePrompt('x')).toContain('不要重复已经完成的外部副作用');
+  it('says the previous turn was cut off', () => {
+    // The transcript just ends; it cannot distinguish interrupted from
+    // finished. This is one of the two things resume does NOT convey.
+    expect(buildTurnContinuePrompt()).toContain('中断');
   });
 
-  it('tells the model to stop and hand back when it cannot tell', () => {
-    expect(buildTurnContinuePrompt('x')).toContain('交回人工决策');
+  it('forbids repeating completed work', () => {
+    // The other thing resume does not convey — and the entire reason this is a
+    // continue rather than a verbatim replay. Worth its tokens.
+    expect(buildTurnContinuePrompt()).toContain('不要重复已完成的操作');
   });
 
   it('does not claim a provider fault', () => {
     // The recovery ladder's prompt asserts a transient provider failure. That
     // is false for cli_exit (a dead process), and naming a wrong cause sends
     // the model looking in the wrong place.
-    expect(buildTurnContinuePrompt('x')).not.toContain('provider');
+    expect(buildTurnContinuePrompt()).not.toContain('provider');
   });
 
   it('carries a machine-recognisable marker', () => {
-    expect(buildTurnContinuePrompt('x')).toContain('[BOTMUX_CONTINUE]');
+    expect(buildTurnContinuePrompt()).toContain('[BOTMUX_CONTINUE]');
   });
 });
 

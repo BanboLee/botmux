@@ -2941,8 +2941,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // 旧卡片没有 mode 字段：按 continue 处理（fail-safe —— 宁可让模型先看
       // 现场，也不要在可能已执行过的轮次上闷头重发一遍）。
       const continueMode = value?.mode !== 'resend';
+      // 续跑不带原任务文本：这个 fork 走 resume（下面 ds.hasHistory），CLI 自己
+      // 就能读到原任务和它已经做过的事，重复一遍纯属浪费 token。
       const submittedContent = continueMode
-        ? buildTurnContinuePrompt(failedTurn.userPrompt || failedTurn.cliInput)
+        ? buildTurnContinuePrompt()
         : failedTurn.cliInput;
       const retryInput = {
         content: submittedContent,
