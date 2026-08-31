@@ -402,9 +402,14 @@ describe.runIf(false)('describe.runIf(false) skips the whole block', () => {
 //
 // WHY THIS IS HERE: a BARE `[]` row (`it.each([null, [], 'x'])`) spreads to zero
 // arguments under `bun test`, so a callback declaring a parameter reads as wanting a
-// `done` callback — the runner waits for one and the case dies at the timeout. Two real
-// files hit it (`bot-description-schema`, `budget-tracker`) and each burned the full
-// 180s ceiling on a synchronous body, which presents as a hang rather than as bad data.
+// `done` callback — the runner waits for one and the case dies at the timeout. Three
+// real files hit it (`bot-description-schema`, `budget-tracker`, `model-pricing`) and
+// each burned the full 180s ceiling on a synchronous body, which presents as a hang
+// rather than as bad data.
+//
+// This guard pins the DELIVERY SEMANTICS for the rows below; it cannot see a new
+// offender in another file (its rows are its own). Repo-wide recurrence is caught by
+// the AST scan in `test/bun-runner-selectors.test.ts`.
 //
 // The guard asserts the SUPPORTED form rather than the broken one: a test that expects
 // a timeout would take the timeout to pass. `[[]]` is unambiguous under both runners,

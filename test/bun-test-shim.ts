@@ -30,10 +30,17 @@ import { vi } from 'vitest';
  *     looks like it wants a `done` callback, so the runner waits for one and the case
  *     dies at the timeout — measured: 180s on a body that is fully synchronous and
  *     cannot hang, which makes it read as a hang rather than as bad data. vitest
- *     passes the empty array through as the single argument instead. Cannot be shimmed:
- *     `it.each` is the runner's own, and the arity check happens before any of our code.
- *     WRITE `[[]]` — a tuple-wrapped row is unambiguous under both runners. Guarded by
- *     `test/bun-shim-parity.test.ts` so the divergence cannot come back unnoticed.
+ *     passes the empty array through as the single argument instead.
+ *     NOT shimmed by CHOICE, not by impossibility: wrapping `.each` to rewrite a bare
+ *     `[]` row into `[[]]` before the runner sees it does work (measured: the hang goes
+ *     away and multi-element, tuple-wrapped and bare-value rows all still arrive
+ *     unchanged). It is rejected because it would also rewrite a table whose rows are
+ *     ALL bare `[]` — vitest calls those with ZERO arguments (measured), and a wrap that
+ *     silently changed that would be exactly the kind of quiet mismatch this file
+ *     refuses below. WRITE `[[]]` instead — unambiguous under both runners, and visible
+ *     to the reader. Repo-wide recurrence is caught by the AST scan in
+ *     `test/bun-runner-selectors.test.ts` (`test/bun-shim-parity.test.ts` pins the
+ *     delivery semantics, but only for its own rows).
  *
  * DELIBERATELY NOT SHIMMED — these are module-system semantics, not missing
  * functions, and any fake would silently not-mock while reporting success:

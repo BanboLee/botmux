@@ -134,6 +134,11 @@ describe('no test file may use a bare empty-array each row', () => {
     // Scanned with the TypeScript AST, not a regex: a text pattern for this missed
     // `test/model-pricing.test.ts` (the row sat among other bare values), and a
     // silently-incomplete scan is exactly how the third instance survived the first fix.
+    //
+    // NOT COVERED, by nature: rows passed as an identifier or a call
+    // (`it.each(ALL_CLI_IDS)`, `it.each(PLAIN_ADAPTERS.filter(...))` — 28 sites) hide the
+    // row shape behind a value this scan cannot resolve without a type checker. Those are
+    // out of reach here, not overlooked. Everything expressible as a literal IS covered.
     const ts = await import('typescript');
     const { readdirSync, readFileSync } = await import('node:fs');
     const { join } = await import('node:path');
@@ -157,6 +162,22 @@ describe('no test file may use a bare empty-array each row', () => {
     expect(files.length).toBeGreaterThan(500);
 
     const offenders: string[] = [];
+    // Type-only wrappers (`as const`, `satisfies T`, `(…)`, `!`) leave the array
+    // untouched at runtime, so the defect fires through them identically — but each
+    // hides the literal behind a different node and would slip past a bare
+    // `isArrayLiteralExpression` check. Measured: `as const` alone wraps 87 of the 231
+    // `.each` sites here (51 files), so skipping them would blind this scan to most of
+    // the repo while still reporting green.
+    const unwrap = (node: import('typescript').Node): import('typescript').Node => {
+      let current = node;
+      while (ts.isAsExpression(current)
+        || ts.isSatisfiesExpression(current)
+        || ts.isParenthesizedExpression(current)
+        || ts.isNonNullExpression(current)) {
+        current = current.expression;
+      }
+      return current;
+    };
     for (const file of files) {
       const source = readFileSync(file, 'utf8');
       const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -164,11 +185,15 @@ describe('no test file may use a bare empty-array each row', () => {
         if (ts.isCallExpression(node)
           && ts.isPropertyAccessExpression(node.expression)
           && node.expression.name.text === 'each') {
-          for (const arg of node.arguments) {
+          for (const rawArg of node.arguments) {
+            const arg = unwrap(rawArg);
             if (!ts.isArrayLiteralExpression(arg)) continue;
-            for (const el of arg.elements) {
+            for (const rawEl of arg.elements) {
+              const el = unwrap(rawEl);
               if (ts.isArrayLiteralExpression(el) && el.elements.length === 0) {
-                const { line } = sf.getLineAndCharacterOfPosition(el.getStart(sf));
+                // Report the row as WRITTEN, so the line points at the source text a
+                // reader has to edit rather than at the unwrapped inner node.
+                const { line } = sf.getLineAndCharacterOfPosition(rawEl.getStart(sf));
                 offenders.push(`${file}:${line + 1}`);
               }
             }
