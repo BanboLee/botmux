@@ -30,6 +30,8 @@ export const messages: Record<string, string> = {
   'card.btn.half_page_down': '⇟ 下半屏',
   'card.btn.send_custom': '📝 发送自定义回复',
   'card.btn.retry_last_task': '🔁 重发上一条任务',
+  'card.btn.retry_turn': '🔁 重试这一轮',
+  'card.btn.continue_turn': '▶️ 继续这一轮',
   'card.btn.stop': '⏹ 停止',
   'card.btn.compact': '🗜️ 压缩',
 
@@ -915,6 +917,28 @@ export const messages: Record<string, string> = {
   'worker.ordinary_recovery_dispatch_interrupted': '⚠️ Botmux 在自动续跑交接期间重启，当前执行状态无法确认。为避免重复外部操作，Botmux 没有重放本次续跑；请检查 Web 终端后，再发送一条消息继续。',
   'worker.ordinary_recovery_non_retryable': '⚠️ Claude 本轮执行失败，且当前错误不能安全自动续跑。为避免重复外部操作，Botmux 已停止自动处理；请检查 Web 终端和模型服务状态后，再发送一条消息继续。',
   'worker.claude_terminal_failure_unrecovered': '⚠️ Claude 本轮因模型服务错误中断（{errorCode}），当前投递通道未启动自动续跑。请检查 Web 终端后重试，或发送一条消息继续。',
+
+  // ─── Turn-failure card (通用失败卡：@人 + 重试按钮) ────────────────────────
+  'card.turn_failed.title': '⚠️ {cliName} 本轮执行失败',
+  'card.turn_failed.title_ambiguous': '⚠️ {cliName} 本轮异常中断',
+  'card.turn_failed.field_error': '**错误码**：{errorCode}',
+  'card.turn_failed.field_when': '**失败时刻**：{when}',
+  'card.turn_failed.field_task': '**任务**：{task}',
+  'card.turn_failed.field_continuations': '**已自动续跑**：{count} 次（仍未恢复）',
+  'card.turn_failed.reason': '**原因**：{reason}',
+  // 「没跑就挂了」——重发无副作用风险，可以放心点。
+  'card.turn_failed.retry_safe': '这一轮的输入没有送达 CLI，**没有任何已执行的操作**，可以安全重试。',
+  // 「跑到一半挂了」——重发会重跑，必须让用户自己判断。
+  'card.turn_failed.retry_caveated': '⚠️ 这一轮**可能已经执行了一部分**（改文件 / 提交 / 发消息等）。点「继续」不会原样重跑：会让 CLI **先读取当前现场**，判断做到哪一步，再从上次的进度接着做；判断不了会停下来交回你决定。仍建议先看一眼 Web 终端。',
+  'card.turn_failed.no_retry': '当前错误重发同样的输入也无法成功，请检查后发送新的消息。',
+  'card.turn_failed.no_input': '这一轮没有可重发的输入记录（任务在提交前就中断了），请直接发送新的消息。',
+
+  'card.action.retry_turn_missing': '⚠️ 找不到这一轮的输入记录，无法重试。请直接发送新的消息。',
+  'card.action.retry_turn_stale': '⚠️ 这张卡片已过期（会话后来又失败过或已重试）。请用最新那张卡片，或直接发送新的消息。',
+  'card.action.retry_turn_cooldown': '⏳ 重试冷却中，请在 {seconds} 秒后再试。',
+  'card.action.retry_turn_submit_failed': '⚠️ 重试提交失败：worker 当前不接受输入，请稍后再试。',
+  'card.action.retry_turn_success': '🔁 已重新提交这一轮任务，请等待执行。',
+  'card.action.continue_turn_success': '▶️ 已请 CLI 读取现场后从上次的进度继续，请等待执行。',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': '请先在飞书开放平台创建应用: https://open.feishu.cn/app',
