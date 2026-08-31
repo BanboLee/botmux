@@ -87,5 +87,13 @@ describe('worker submit-failure lifecycle wiring', () => {
     const schedule = functionSlice('scheduleSubmitFailureNotify', 'detectBareShellLaunch');
     expect(schedule).toContain('runDeferredRecheck,');
     expect(schedule).not.toContain('() => { void runDeferredRecheck(); }');
+    expect(schedule).toContain('if (!chainIsCurrent()) return;');
+  });
+
+  it('scopes strong activity evidence to the exact turn and dispatch attempt', () => {
+    const schedule = functionSlice('scheduleSubmitFailureNotify', 'detectBareShellLaunch');
+    expect(schedule).toContain('submitActivityEvidenceSince(activityBaselineMs, turnIdentity)');
+    expect(source).toContain('selectSubmitActivityEvidence({');
+    expect(source).toContain('target: identity');
   });
 });

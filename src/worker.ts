@@ -365,6 +365,7 @@ import { uploadImageBuffer } from './utils/lark-upload.js';
 import { applySessionOwnerEnv, redactChildEnv, scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import {
   decideSubmitConfirmationAction,
+  selectSubmitActivityEvidence,
   settleDeferredSubmitConfirmation,
   settleStaleWriteContinuation,
   type SubmitActivityEvidence,
@@ -4608,11 +4609,22 @@ function deliverMojoTurnFinal(text: string): void {
   log(`Mojo final bridge delivered ${postContent.length} chars for turn ${turnId.substring(0, 12)}`);
 }
 
-function submitActivityEvidenceSince(sinceMs: number): SubmitActivityEvidence | undefined {
-  if (lastPtyActivityAtMs > sinceMs) return 'pty-output';
-  if (lastStructuredBridgeActivityAtMs > sinceMs) return 'structured-transcript';
-  if (readSendMarkers().some(m => m.sentAtMs >= sinceMs)) return 'botmux-send';
-  return undefined;
+function submitActivityEvidenceSince(
+  sinceMs: number,
+  identity: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt'> | undefined,
+): SubmitActivityEvidence | undefined {
+  const structuredTurns = [
+    ...bridgeQueue.peek(),
+    ...codexBridgeQueue.peek(),
+  ].filter(turn => turn.started);
+  return selectSubmitActivityEvidence({
+    target: identity,
+    // Session-global structured activity cannot prove which turn advanced.
+    // Keep it weak/bounded, together with PTY output.
+    ptyActive: lastPtyActivityAtMs > sinceMs || lastStructuredBridgeActivityAtMs > sinceMs,
+    structuredTurns,
+    sendMarkers: readSendMarkers().filter(marker => marker.sentAtMs >= sinceMs),
+  });
 }
 
 function clearSendMarkers(): void {
@@ -10714,16 +10726,19 @@ function scheduleSubmitFailureNotify(
   };
   let deferredRecheckAttempts = 0;
   log(`writeInput: submit not confirmed after retries — deferred ${SUBMIT_DEFERRED_RECHECK_MS}ms recheck queued. preview="${preview}"`);
-  const runDeferredRecheck = async (): Promise<void> => {
+  const runDeferredRecheck = async (chainIsCurrent: () => boolean): Promise<void> => {
     const settlement = await settleDeferredSubmitConfirmation(codexBridgeQueue, {
       turnId: bridgeTurnId,
       dispatchAttempt: turnIdentity?.dispatchAttempt,
       structuredTarget,
       recheck,
       usageLimitDetected: () => usageLimitTracker.detectedThisTurn(turnSeq),
-      activityEvidence: () => submitActivityEvidenceSince(activityBaselineMs),
+      activityEvidence: () => submitActivityEvidenceSince(activityBaselineMs, turnIdentity),
       isCurrent: deferredAttemptIsCurrent,
     });
+    // Replacing a same-key timer invalidates an already-running callback. The
+    // old settlement may finish, but it cannot rearm, warn, or emit terminals.
+    if (!chainIsCurrent()) return;
     // Restart/exit or exact-attempt expiry can happen during either the 20s
     // delay or the awaited adapter recheck. A stale callback must perform no
     // side effects at all: no old cliSessionId persistence, ready redrive,

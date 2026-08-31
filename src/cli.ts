@@ -8571,7 +8571,12 @@ async function cmdSend(rest: string[]): Promise<void> {
         try {
           const markerDir = join(resolveDataDir(), 'turn-sends');
           if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
-          const marker: Record<string, unknown> = { sentAtMs, messageId };
+          const marker: Record<string, unknown> = {
+            sentAtMs,
+            messageId,
+            ...(originTurnId ? { turnId: originTurnId } : {}),
+            ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
+          };
           const previewText = buildBridgeSendPreviewText(content);
           if (previewText) marker.previewText = previewText;
           appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify(marker) + '\n');
@@ -8645,6 +8650,8 @@ async function cmdSend(rest: string[]): Promise<void> {
         const marker: Record<string, unknown> = {
           sentAtMs: Date.now(),
           messageId: `doc:${exactDocTarget.commentId}`,
+          ...(originTurnId ? { turnId: originTurnId } : {}),
+          ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
           contentLength: content.length,
         };
         const previewText = buildBridgeSendPreviewText(content);
@@ -9000,7 +9007,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     try {
       const markerDir = join(resolveDataDir(), 'turn-sends');
       if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
-      const marker: Record<string, unknown> = { sentAtMs, messageId };
+      const marker: Record<string, unknown> = {
+        sentAtMs,
+        messageId,
+        ...(originTurnId ? { turnId: originTurnId } : {}),
+        ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
+      };
       Object.assign(marker, buildBridgeSendMarkerContent(sentContent));
       const line = JSON.stringify(marker) + '\n';
       appendFileSync(join(markerDir, `${sid}.jsonl`), line);

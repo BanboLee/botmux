@@ -31,7 +31,7 @@ export interface SubmitFailureChainController {
   schedule(
     key: SubmitFailureChainKey,
     delayMs: number,
-    fn: () => void | Promise<void>,
+    fn: (isCurrent: () => boolean) => void | Promise<void>,
   ): { armed: boolean; replaced: boolean };
   /** Cancel and forget any live chain for the key. Returns true when one was
    *  cancelled. */
@@ -58,7 +58,8 @@ export function createSubmitFailureChainController(): SubmitFailureChainControll
       if (existing !== undefined) clearTimeout(existing.timer);
       const token = Symbol(encoded);
       const timer = setTimeout(() => {
-        void Promise.resolve(fn()).finally(() => {
+        const isCurrent = (): boolean => chains.get(encoded)?.token === token;
+        void Promise.resolve(fn(isCurrent)).finally(() => {
           if (chains.get(encoded)?.token === token) chains.delete(encoded);
         });
       }, delayMs);

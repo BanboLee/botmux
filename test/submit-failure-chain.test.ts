@@ -51,8 +51,12 @@ describe('createSubmitFailureChainController', () => {
   it('tracks an in-flight callback and preserves a replacement scheduled before it settles', async () => {
     const controller = createSubmitFailureChainController();
     let finishFirst: (() => void) | undefined;
-    const first = vi.fn(() => new Promise<void>((resolve) => {
-      finishFirst = resolve;
+    let firstWasCurrentAfterReplacement: boolean | undefined;
+    const first = vi.fn((isCurrent: () => boolean) => new Promise<void>((resolve) => {
+      finishFirst = () => {
+        firstWasCurrentAfterReplacement = isCurrent();
+        resolve();
+      };
     }));
     const second = vi.fn();
 
@@ -64,6 +68,7 @@ describe('createSubmitFailureChainController', () => {
     expect(controller.schedule(key(), 20_000, second)).toEqual({ armed: false, replaced: true });
     finishFirst?.();
     await Promise.resolve();
+    expect(firstWasCurrentAfterReplacement).toBe(false);
     expect(controller.has(key())).toBe(true);
 
     await vi.advanceTimersByTimeAsync(20_000);
@@ -102,6 +107,23 @@ describe('createSubmitFailureChainController', () => {
     controller.clear();
     vi.advanceTimersByTime(20_000);
     expect(fn).not.toHaveBeenCalled();
+    expect(controller.size()).toBe(0);
+  });
+
+  it('keeps an identity-less warning chain bounded to one replacement and one warning', async () => {
+    const controller = createSubmitFailureChainController();
+    const unscoped = key({ turnId: 'unscoped-1', dispatchAttempt: undefined });
+    let warnings = 0;
+    const warn = () => {
+      warnings++;
+    };
+
+    controller.schedule(unscoped, 20_000, warn);
+    controller.schedule(unscoped, 20_000, warn);
+    expect(controller.size()).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(warnings).toBe(1);
     expect(controller.size()).toBe(0);
   });
 });

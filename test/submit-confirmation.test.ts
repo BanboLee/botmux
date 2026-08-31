@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   decideSubmitConfirmationAction,
+  selectSubmitActivityEvidence,
   settleDeferredSubmitConfirmation,
   settleStaleWriteContinuation,
 } from '../src/services/submit-confirmation.js';
@@ -203,6 +204,85 @@ describe('decideSubmitConfirmationAction', () => {
       submitVerificationStartedAtMs: 110,
     });
     expect(queue.peek()[0]?.submitConfirmedAtMs).toBeUndefined();
+  });
+});
+
+describe('selectSubmitActivityEvidence', () => {
+  const target = { turnId: 'turn-a', dispatchAttempt: 2 };
+
+  it('prefers exact strong evidence when the same turn also has PTY output', () => {
+    expect(selectSubmitActivityEvidence({
+      target,
+      ptyActive: true,
+      structuredTurns: [{ turnId: 'turn-a', dispatchAttempt: 2 }],
+      sendMarkers: [],
+    })).toBe('structured-transcript');
+  });
+
+  it('settles without warning or weak rearm when exact strong evidence accompanies PTY output', async () => {
+    const queue = new CodexBridgeQueue();
+    queue.mark('turn-a', 'payload', 100, 2);
+    queue.beginSubmitVerification('turn-a', 110, 2);
+    const evidence = selectSubmitActivityEvidence({
+      target,
+      ptyActive: true,
+      structuredTurns: [{ turnId: 'turn-a', dispatchAttempt: 2 }],
+      sendMarkers: [],
+    });
+
+    const settlement = await settleDeferredSubmitConfirmation(queue, {
+      turnId: 'turn-a',
+      dispatchAttempt: 2,
+      structuredTarget: true,
+      recheck: async () => false,
+      usageLimitDetected: () => false,
+      activityEvidence: () => evidence,
+    });
+
+    expect(settlement).toMatchObject({
+      stale: false,
+      action: { kind: 'suppress-active', evidence: 'structured-transcript' },
+      lifecycle: 'confirmed',
+    });
+  });
+
+  it('does not use a later turn transcript or send marker as strong evidence for the target', () => {
+    expect(selectSubmitActivityEvidence({
+      target,
+      ptyActive: false,
+      structuredTurns: [{ turnId: 'turn-b', dispatchAttempt: 1 }],
+      sendMarkers: [{ turnId: 'turn-b', dispatchAttempt: 1 }],
+    })).toBeUndefined();
+  });
+
+  it('does not let durable attempt N evidence suppress attempt N+1 or vice versa', () => {
+    expect(selectSubmitActivityEvidence({
+      target,
+      ptyActive: false,
+      structuredTurns: [{ turnId: 'turn-a', dispatchAttempt: 1 }],
+      sendMarkers: [{ turnId: 'turn-a', dispatchAttempt: 1 }],
+    })).toBeUndefined();
+    expect(selectSubmitActivityEvidence({
+      target: { turnId: 'turn-a', dispatchAttempt: 1 },
+      ptyActive: false,
+      structuredTurns: [{ turnId: 'turn-a', dispatchAttempt: 2 }],
+      sendMarkers: [{ turnId: 'turn-a', dispatchAttempt: 2 }],
+    })).toBeUndefined();
+  });
+
+  it('downgrades legacy unscoped strong signals to bounded PTY-style activity', () => {
+    expect(selectSubmitActivityEvidence({
+      target,
+      ptyActive: false,
+      structuredTurns: [{ turnId: 'turn-a' }],
+      sendMarkers: [{}],
+    })).toBeUndefined();
+    expect(selectSubmitActivityEvidence({
+      target: undefined,
+      ptyActive: true,
+      structuredTurns: [{ turnId: 'turn-a', dispatchAttempt: 2 }],
+      sendMarkers: [{ turnId: 'turn-a', dispatchAttempt: 2 }],
+    })).toBe('pty-output');
   });
 });
 
