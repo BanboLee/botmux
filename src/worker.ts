@@ -370,6 +370,11 @@ import {
   type SubmitActivityEvidence,
 } from './services/submit-confirmation.js';
 import {
+  createSubmitFailureChainController,
+  submitFailureChainKeyOf,
+  type SubmitFailureChainKey,
+} from './services/submit-failure-chain.js';
+import {
   runAdoptQueuedWriteSequence,
   runAdoptRawInputSequence,
   runAdoptSessionRenameSequence,
@@ -10587,6 +10592,12 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
  *  both without being so long that a true failure goes unsurfaced. */
 const SUBMIT_DEFERRED_RECHECK_MS = 20_000;
 
+/** One live deferred submit-failure recheck chain per (turnId, dispatchAttempt,
+ *  cliGeneration). Scheduling the same key again replaces the existing timer
+ *  instead of stacking a second one, so a logical submission/attempt can never
+ *  produce two overlapping chains (and thus two submit_unconfirmed warnings). */
+const submitFailureChains = createSubmitFailureChainController();
+
 /**
  * A recovery fence failure means the prompt may already be running. Keep its
  * bridge mark and durable turn open so a real later final can still resolve it;
@@ -10692,8 +10703,17 @@ function scheduleSubmitFailureNotify(
     && backend === backendAtSchedule
     && !cliRestartInProgress
   );
+  // Chain identity: only dedupe/cancel when the attempt has a stable turnId so
+  // unrelated CLI submit paths (no identity) are never merged into one chain.
+  const chainKey: SubmitFailureChainKey | undefined = turnIdentity?.turnId
+    ? {
+        turnId: turnIdentity.turnId,
+        dispatchAttempt: turnIdentity.dispatchAttempt,
+        cliGeneration: cliGenerationAtSchedule,
+      }
+    : undefined;
   log(`writeInput: submit not confirmed after retries — deferred ${SUBMIT_DEFERRED_RECHECK_MS}ms recheck queued. preview="${preview}"`);
-  setTimeout(async () => {
+  const runDeferredRecheck = async (): Promise<void> => {
     const settlement = await settleDeferredSubmitConfirmation(codexBridgeQueue, {
       turnId: bridgeTurnId,
       dispatchAttempt: turnIdentity?.dispatchAttempt,
@@ -10708,6 +10728,7 @@ function scheduleSubmitFailureNotify(
     // side effects at all: no old cliSessionId persistence, ready redrive,
     // recursive timer, terminal, warning, or mutation of replay attempt N+1.
     if (settlement.stale) {
+      if (chainKey) submitFailureChains.cancel(chainKey);
       log(`Discarded stale deferred submit recheck (${settlement.staleReason}) turn=${bridgeTurnId ?? '-'} attempt=${turnIdentity?.dispatchAttempt ?? '-'}`);
       return;
     }
@@ -10719,6 +10740,7 @@ function scheduleSubmitFailureNotify(
 
     switch (action.kind) {
       case 'suppress-confirmed':
+        if (chainKey) submitFailureChains.cancel(chainKey);
         if (cliSessionId) {
           persistCliSessionId(cliSessionId);
           if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
@@ -10728,6 +10750,7 @@ function scheduleSubmitFailureNotify(
         redriveRejectedStructuredReady();
         return;
       case 'suppress-usage-limit':
+        if (chainKey) submitFailureChains.cancel(chainKey);
         dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt);
         redriveRejectedStructuredReady();
         log(`Deferred recheck missing but usage limit was detected for this turn — suppressing submit warning. preview="${preview}"`);
@@ -10735,9 +10758,18 @@ function scheduleSubmitFailureNotify(
         return;
       case 'suppress-active':
         redriveRejectedStructuredReady();
+        // Strong success evidence — a structured transcript entry or a botmux
+        // send marker — proves the turn actually progressed, so the chain is
+        // cancelled here and now: no more timers, no unconfirmed warning.
+        if (action.evidence === 'structured-transcript' || action.evidence === 'botmux-send') {
+          if (chainKey) submitFailureChains.cancel(chainKey);
+          log(`Deferred recheck saw ${action.evidence} success evidence — cancelling chain, no warning. preview="${preview}"`);
+          return;
+        }
         log(`Deferred recheck missing but later ${action.evidence} shows ${cliName()} is active — suppressing submit warning. preview="${preview}"`);
-        // activity 证据只能说明 CLI 仍在动，不能证明本次输入已提交
-        // 普通 IM 和 durable turn 都继续重查，直到 transcript 命中或安静窗口落到 submit_unconfirmed
+        // activity 证据只能说明 CLI 仍在动，不能证明本次输入已提交。弱 pty-output
+        // 才继续重查；重查通过 submitFailureChains 复用/替换同一条 live 链，
+        // 不再无限叠加新定时器。
         scheduleSubmitFailureNotify(
           msg,
           recheck,
@@ -10752,11 +10784,13 @@ function scheduleSubmitFailureNotify(
         return;
       case 'notify-hard-failure':
         // failureReason is handled synchronously above.
+        if (chainKey) submitFailureChains.cancel(chainKey);
         return;
       case 'notify-stuck':
         break;
     }
 
+    if (chainKey) submitFailureChains.cancel(chainKey);
     dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt);
     redriveRejectedStructuredReady();
     log(`Deferred recheck still missing — notifying user. preview="${preview}"`);
@@ -10778,7 +10812,19 @@ function scheduleSubmitFailureNotify(
         ),
       });
     }
-  }, SUBMIT_DEFERRED_RECHECK_MS);
+  };
+  if (chainKey) {
+    const { replaced } = submitFailureChains.schedule(
+      chainKey,
+      SUBMIT_DEFERRED_RECHECK_MS,
+      () => { void runDeferredRecheck(); },
+    );
+    if (replaced) {
+      log(`Deferred recheck already live for this attempt — replaced timer instead of stacking. preview="${preview}"`);
+    }
+  } else {
+    setTimeout(() => { void runDeferredRecheck(); }, SUBMIT_DEFERRED_RECHECK_MS);
+  }
 }
 
 /**
@@ -11586,7 +11632,7 @@ async function flushPending(): Promise<void> {
             scheduleSubmitFailureNotify(
               logicalMsg,
               undefined,
-              '会话 JSONL',
+              '会话存储',
               bridgeTurnId,
               undefined,
               turnSeq,
@@ -11692,7 +11738,7 @@ async function flushPending(): Promise<void> {
           scheduleSubmitFailureNotify(
             logicalMsg,
             result.recheck,
-            '会话 JSONL',
+            '会话存储',
             bridgeTurnId,
             result.failureReason,
             turnSeq,
@@ -12369,6 +12415,9 @@ async function spawnCli(
   opts: { pluginGenerationPrepared?: boolean } = {},
 ): Promise<void> {
   const spawnGeneration = ++cliSpawnGeneration;
+  // Deferred submit-failure chains are generation-keyed; a fresh generation
+  // invalidates every live chain before any old timer can touch new state.
+  submitFailureChains.clear();
   // Experimental external App Server attachment: BotMux owns only this TUI
   // client, never the server or its JSON-RPC input stream. Re-establish the
   // remote argv state on EVERY spawn because killCli() deliberately clears the
@@ -16289,6 +16338,9 @@ async function restartCliProcess(
   // until killCli/spawnCli would leave a window where an old timer can mutate
   // the next durable attempt while destroySession is still awaiting.
   cliSpawnGeneration += 1;
+  // Old-generation deferred submit rechecks are stale by definition: cancel
+  // them now so no lingering timer warns or mutates the replacement attempt.
+  submitFailureChains.clear();
   // Set before touching destroySession(): remote teardown can await for many
   // seconds while the old backend object is still non-null and still capable
   // of firing idle/task-done callbacks. Inputs accepted in that interval must

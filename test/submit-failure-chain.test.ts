@@ -1,0 +1,84 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  createSubmitFailureChainController,
+  submitFailureChainKeyOf,
+  type SubmitFailureChainKey,
+} from '../src/services/submit-failure-chain.js';
+
+const key = (over: Partial<SubmitFailureChainKey> = {}): SubmitFailureChainKey => ({
+  turnId: 'turn-1',
+  dispatchAttempt: 1,
+  cliGeneration: 3,
+  ...over,
+});
+
+describe('submitFailureChainKeyOf', () => {
+  it('distinguishes turnId, dispatchAttempt and cliGeneration', () => {
+    const base = key();
+    expect(submitFailureChainKeyOf(base)).toBe(submitFailureChainKeyOf({ ...base }));
+    expect(submitFailureChainKeyOf({ ...base, turnId: 'turn-2' })).not.toBe(submitFailureChainKeyOf(base));
+    expect(submitFailureChainKeyOf({ ...base, dispatchAttempt: 2 })).not.toBe(submitFailureChainKeyOf(base));
+    expect(submitFailureChainKeyOf({ ...base, cliGeneration: 4 })).not.toBe(submitFailureChainKeyOf(base));
+  });
+});
+
+describe('createSubmitFailureChainController', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('arms a chain that fires after the delay and forgets the key', () => {
+    const controller = createSubmitFailureChainController();
+    const fn = vi.fn();
+    expect(controller.schedule(key(), 20_000, fn)).toEqual({ armed: true, replaced: false });
+    expect(controller.has(key())).toBe(true);
+    vi.advanceTimersByTime(20_000);
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(controller.has(key())).toBe(false);
+  });
+
+  it('replaces a live chain for the same key instead of stacking a second timer', () => {
+    const controller = createSubmitFailureChainController();
+    const first = vi.fn();
+    const second = vi.fn();
+    expect(controller.schedule(key(), 20_000, first)).toEqual({ armed: true, replaced: false });
+    expect(controller.schedule(key(), 20_000, second)).toEqual({ armed: false, replaced: true });
+    expect(controller.size()).toBe(1);
+    vi.advanceTimersByTime(20_000);
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps independent chains for distinct keys', () => {
+    const controller = createSubmitFailureChainController();
+    const fnA = vi.fn();
+    const fnB = vi.fn();
+    controller.schedule(key(), 20_000, fnA);
+    controller.schedule(key({ turnId: 'turn-2' }), 20_000, fnB);
+    expect(controller.size()).toBe(2);
+    vi.advanceTimersByTime(20_000);
+    expect(fnA).toHaveBeenCalledTimes(1);
+    expect(fnB).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancel clears a live chain before it fires', () => {
+    const controller = createSubmitFailureChainController();
+    const fn = vi.fn();
+    controller.schedule(key(), 20_000, fn);
+    expect(controller.cancel(key())).toBe(true);
+    expect(controller.has(key())).toBe(false);
+    vi.advanceTimersByTime(20_000);
+    expect(fn).not.toHaveBeenCalled();
+    expect(controller.cancel(key())).toBe(false);
+  });
+
+  it('clear cancels every live chain', () => {
+    const controller = createSubmitFailureChainController();
+    const fn = vi.fn();
+    controller.schedule(key(), 20_000, fn);
+    controller.schedule(key({ turnId: 'turn-2' }), 20_000, fn);
+    controller.clear();
+    vi.advanceTimersByTime(20_000);
+    expect(fn).not.toHaveBeenCalled();
+    expect(controller.size()).toBe(0);
+  });
+});
