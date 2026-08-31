@@ -24,7 +24,6 @@ describe('worker submit-failure lifecycle wiring', () => {
   it('routes the deferred recheck through a per-attempt chain controller', () => {
     const schedule = functionSlice('scheduleSubmitFailureNotify', 'detectBareShellLaunch');
     expect(schedule).toContain('submitFailureChains.schedule(');
-    expect(schedule).toContain('submitFailureChains.cancel(');
     expect(schedule).toContain('turnIdentity?.turnId');
     expect(schedule).toContain('turnIdentity?.dispatchAttempt');
     expect(schedule).toContain('cliGenerationAtSchedule');
@@ -38,6 +37,26 @@ describe('worker submit-failure lifecycle wiring', () => {
     expect(schedule).toContain('replaced');
   });
 
+  it('keeps identity-less retries inside the controller and does not recurse', () => {
+    const schedule = functionSlice('scheduleSubmitFailureNotify', 'detectBareShellLaunch');
+    const activeStart = schedule.indexOf("case 'suppress-active':");
+    const activeEnd = schedule.indexOf("case 'notify-hard-failure':", activeStart);
+    const active = schedule.slice(activeStart, activeEnd);
+    expect(schedule).not.toContain('setTimeout(() => { void runDeferredRecheck(); }');
+    expect(active).not.toContain('scheduleSubmitFailureNotify(');
+    expect(active).toContain('armDeferredRecheck()');
+  });
+
+  it('bounds weak-activity rechecks before emitting the single warning', () => {
+    const schedule = functionSlice('scheduleSubmitFailureNotify', 'detectBareShellLaunch');
+    const activeStart = schedule.indexOf("case 'suppress-active':");
+    const activeEnd = schedule.indexOf("case 'notify-hard-failure':", activeStart);
+    const active = schedule.slice(activeStart, activeEnd);
+    expect(schedule).toContain('SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS');
+    expect(active).toContain('deferredRecheckAttempts < SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS');
+    expect(active).toContain('break;');
+  });
+
   it('cancels the chain on strong success evidence instead of re-arming', () => {
     const schedule = functionSlice('scheduleSubmitFailureNotify', 'detectBareShellLaunch');
     const activeStart = schedule.indexOf("case 'suppress-active':");
@@ -47,22 +66,20 @@ describe('worker submit-failure lifecycle wiring', () => {
     const active = schedule.slice(activeStart, activeEnd);
     expect(active).toContain('structured-transcript');
     expect(active).toContain('botmux-send');
-    expect(active).toContain('submitFailureChains.cancel(');
-    // 强证据分支必须发生在递归重查之前
-    const cancelIdx = active.indexOf('submitFailureChains.cancel(');
+    // 强证据分支必须在重查之前 return，已触发的 timer 由控制器忘记，
+    // 不能按 key 取消并发替换 timer。
+    const returnIdx = active.indexOf('return;');
     const rearmIdx = active.indexOf('scheduleSubmitFailureNotify(');
-    expect(cancelIdx).toBeGreaterThanOrEqual(0);
-    expect(rearmIdx).toBeGreaterThan(cancelIdx);
+    expect(returnIdx).toBeGreaterThanOrEqual(0);
+    expect(rearmIdx).toBe(-1);
   });
 
-  it('clears the chain on stale, confirm, usage-limit and notify-stuck terminals', () => {
+  it('does not let a completed callback cancel a replacement timer for the same key', () => {
     const schedule = functionSlice('scheduleSubmitFailureNotify', 'detectBareShellLaunch');
-    const staleGuard = schedule.indexOf('if (settlement.stale)');
-    expect(staleGuard).toBeGreaterThanOrEqual(0);
-    const afterStale = schedule.slice(staleGuard);
-    expect(afterStale).toContain('submitFailureChains.cancel(');
-    expect(afterStale).toContain('persistCliSessionId(cliSessionId)');
-    expect(afterStale).toContain("emitDurableTerminal('submit_usage_limit')");
-    expect(afterStale).toContain("emitDurableTerminal('submit_unconfirmed')");
+    const callbackStart = schedule.indexOf('const runDeferredRecheck');
+    const armStart = schedule.indexOf('const armDeferredRecheck', callbackStart);
+    expect(callbackStart).toBeGreaterThanOrEqual(0);
+    expect(armStart).toBeGreaterThan(callbackStart);
+    expect(schedule.slice(callbackStart, armStart)).not.toContain('submitFailureChains.cancel(');
   });
 });

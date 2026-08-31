@@ -8,10 +8,10 @@
  *
  * This controller keeps at most ONE live chain per (turnId, dispatchAttempt,
  * cliGeneration): scheduling again for the same key REPLACES the existing
- * timer instead of stacking a second one. The worker cancels the chain on
- * confirmation, stale generation/attempt, terminal, strong success evidence
- * (structured transcript / botmux send), or warning — so a logical attempt
- * can never warn twice.
+ * timer instead of stacking a second one. A fired timer is forgotten before
+ * its callback runs, so terminal/success/stale callbacks cannot cancel a newer
+ * replacement for the same key. Weak activity explicitly re-arms that key;
+ * every other outcome leaves no live timer behind.
  */
 
 export interface SubmitFailureChainKey {
