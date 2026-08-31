@@ -53,6 +53,66 @@ describe('package.json — lockfile safety and packaging', () => {
     }
   });
 
+  /**
+   * THE PUBLISHED TARBALL MUST NOT CARRY THE NODE FORM.
+   *
+   * #1047 removed the Node fallback by deleting `bin` and demoting node-pty to a
+   * devDependency — but `files` still shipped `dist/` (4221 files, 48 MB unpacked)
+   * plus an `ecosystem.config.cjs` whose `script` is `dist/index-daemon.js`. That
+   * left a complete, executable, `#!/usr/bin/env node`-shebanged CLI in the tarball
+   * whose module graph imports a package the manifest does not depend on.
+   *
+   * MEASURED on the real published botmux@3.18.8 — extracted, deps installed the way
+   * a global install does (`--omit=dev`, so node-pty is absent):
+   *   node dist/index-daemon.js
+   *   → Fatal error: ERR_MODULE_NOT_FOUND: Cannot find package 'node-pty'
+   *     imported from .../dist/adapters/backend/tmux-backend.js
+   * which is verbatim the error users reported on 3.18.7/3.18.8. The compiled
+   * binary in the platform subpackage embeds pty.node and is unaffected; only this
+   * shipped-but-unrunnable second copy of the CLI can produce it.
+   *
+   * ⚠️ ASSERTED AGAINST REAL `npm pack` OUTPUT, not against the `files` array.
+   * `files` is an input to a globbing/ignore-file algorithm, not the artifact: a
+   * modelled reading of it can be green while the tarball differs. So this asks npm
+   * itself what it would publish.
+   */
+  it('the PUBLISHED tarball ships no runnable Node form (the node-pty crash users hit)', () => {
+    const packed = spawnSync('npm', ['pack', '--dry-run', '--json'], {
+      encoding: 'utf-8',
+      cwd: resolve('.'),
+      timeout: 120_000,
+    });
+    // Never let an npm hiccup pass as "no dist/ in the tarball" — that is the
+    // vacuous-green direction for a test whose whole job is an absence claim.
+    expect(packed.error, `npm pack failed to run: ${packed.error?.message}`).toBeUndefined();
+    expect(packed.status, `npm pack exited ${packed.status}: ${packed.stderr}`).toBe(0);
+    const paths: string[] = JSON.parse(packed.stdout)[0].files.map((f: { path: string }) => f.path);
+    // Proof the probe saw a real file list, so the absence assertions below have
+    // something to be absent FROM.
+    expect(paths).toContain('package.json');
+    expect(paths).toContain('scripts/postinstall-bin.mjs');
+
+    // No second CLI. These three are the entry points a stale `exec node <path>`
+    // launcher, a systemd unit, or a hand-run `pm2 start` would land on.
+    for (const entry of ['dist/cli.js', 'dist/index-daemon.js', 'dist/worker.js']) {
+      expect(paths, `${entry} must not ship: it imports node-pty, which is not a dependency`).not.toContain(entry);
+    }
+    expect(paths.filter(p => p.startsWith('dist/'))).toEqual([]);
+    // The pm2 ecosystem file names dist/index-daemon.js as its `script`. Nothing in
+    // the source tree reads it (the supervisor replaced pm2), so its only remaining
+    // effect is telling a human to start the broken form by hand.
+    expect(paths).not.toContain('ecosystem.config.cjs');
+  });
+
+  it('declares no entry point that the tarball does not contain', () => {
+    // `main`/`bin` pointing into a dist/ that no longer ships would be a manifest
+    // that lies about itself: `require('botmux')` would resolve and then fail on a
+    // missing file. The package is a CLI delivered as a compiled binary, so it has
+    // no library entry point at all.
+    expect(manifest.bin).toBeUndefined();
+    expect(manifest.main).toBeUndefined();
+  });
+
   it('ships the postinstall script in `files` (otherwise npm i -g fails hard)', () => {
     expect(manifest.scripts.postinstall).toBe('node scripts/postinstall-bin.mjs');
     // Verified by packing+installing a probe: a missing postinstall target is not
@@ -332,6 +392,12 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     // Removing the runtime deps while leaving `bin` wired is the worst combination:
     // the fallback still resolves and then dies on `require('node-pty')`. Pin the
     // absence so a well-meaning re-add is caught here.
+    //
+    // ⚠️ `bin` was never the only way in. The tarball also shipped `dist/` itself,
+    // so a stale `exec node "<root>/dist/cli.js"` launcher left behind by a
+    // pre-#1047 install reached the same unrunnable CLI with no `bin` involved —
+    // that is the crash users hit on 3.18.7/3.18.8. `dist/` is out of `files` now
+    // (asserted against real `npm pack` output above); keep BOTH pins.
     const manifest = JSON.parse(readFileSync(resolve(import.meta.dirname, '../package.json'), 'utf-8')) as {
       bin?: unknown;
       dependencies?: Record<string, string>;
