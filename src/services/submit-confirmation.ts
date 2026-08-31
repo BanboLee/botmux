@@ -38,6 +38,12 @@ export function selectSubmitActivityEvidence(
   return input.ptyActive ? 'pty-output' : undefined;
 }
 
+export function combineSubmitCurrentFences(
+  ...fences: readonly (() => boolean)[]
+): () => boolean {
+  return () => fences.every(fence => fence());
+}
+
 export type SubmitConfirmationAction =
   | { kind: 'notify-hard-failure'; reason: string }
   | { kind: 'suppress-confirmed' }

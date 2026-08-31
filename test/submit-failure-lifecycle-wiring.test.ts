@@ -88,6 +88,9 @@ describe('worker submit-failure lifecycle wiring', () => {
     expect(schedule).toContain('runDeferredRecheck,');
     expect(schedule).not.toContain('() => { void runDeferredRecheck(); }');
     expect(schedule).toContain('if (!chainIsCurrent()) return;');
+    expect(schedule).toContain(
+      'isCurrent: combineSubmitCurrentFences(chainIsCurrent, deferredAttemptIsCurrent)',
+    );
   });
 
   it('scopes strong activity evidence to the exact turn and dispatch attempt', () => {

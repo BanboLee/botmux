@@ -364,6 +364,7 @@ import { bridgeTurnOutcome, createUsageLimitTracker } from './utils/usage-limit-
 import { uploadImageBuffer } from './utils/lark-upload.js';
 import { applySessionOwnerEnv, redactChildEnv, scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import {
+  combineSubmitCurrentFences,
   decideSubmitConfirmationAction,
   selectSubmitActivityEvidence,
   settleDeferredSubmitConfirmation,
@@ -10734,7 +10735,7 @@ function scheduleSubmitFailureNotify(
       recheck,
       usageLimitDetected: () => usageLimitTracker.detectedThisTurn(turnSeq),
       activityEvidence: () => submitActivityEvidenceSince(activityBaselineMs, turnIdentity),
-      isCurrent: deferredAttemptIsCurrent,
+      isCurrent: combineSubmitCurrentFences(chainIsCurrent, deferredAttemptIsCurrent),
     });
     // Replacing a same-key timer invalidates an already-running callback. The
     // old settlement may finish, but it cannot rearm, warn, or emit terminals.

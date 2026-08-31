@@ -143,7 +143,9 @@ describe('worker structured-turn status wiring', () => {
     expect(schedule).toContain('backend === backendAtSchedule');
     expect(schedule).toContain('dispatchAttempt: turnIdentity?.dispatchAttempt');
     expect(schedule).toContain('structuredTarget,');
-    expect(schedule).toContain('isCurrent: deferredAttemptIsCurrent');
+    expect(schedule).toContain(
+      'isCurrent: combineSubmitCurrentFences(chainIsCurrent, deferredAttemptIsCurrent)',
+    );
     const staleGuard = schedule.indexOf('if (settlement.stale)');
     expect(staleGuard).toBeGreaterThanOrEqual(0);
     expect(schedule.indexOf('persistCliSessionId(cliSessionId)', staleGuard)).toBeGreaterThan(staleGuard);

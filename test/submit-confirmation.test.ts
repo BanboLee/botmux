@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  combineSubmitCurrentFences,
   decideSubmitConfirmationAction,
   selectSubmitActivityEvidence,
   settleDeferredSubmitConfirmation,
@@ -283,6 +284,42 @@ describe('selectSubmitActivityEvidence', () => {
       structuredTurns: [{ turnId: 'turn-a', dispatchAttempt: 2 }],
       sendMarkers: [{ turnId: 'turn-a', dispatchAttempt: 2 }],
     })).toBe('pty-output');
+  });
+});
+
+describe('combineSubmitCurrentFences', () => {
+  it('prevents a superseded in-flight callback from mutating replacement lifecycle state', async () => {
+    let chainCurrent = true;
+    let release!: (value: false) => void;
+    const recheck = new Promise<false>(resolve => { release = resolve; });
+    const queue = new CodexBridgeQueue(() => 500);
+    queue.mark('turn-a', 'payload', 100, 2);
+    queue.beginSubmitVerification('turn-a', 110, 2);
+
+    const pending = settleDeferredSubmitConfirmation(queue, {
+      turnId: 'turn-a',
+      dispatchAttempt: 2,
+      structuredTarget: true,
+      recheck: () => recheck,
+      usageLimitDetected: () => false,
+      activityEvidence: () => 'structured-transcript',
+      isCurrent: combineSubmitCurrentFences(
+        () => chainCurrent,
+        () => true,
+      ),
+    });
+    await Promise.resolve();
+    chainCurrent = false;
+    release(false);
+    await pending;
+
+    expect(queue.peek()[0]).toMatchObject({
+      turnId: 'turn-a',
+      dispatchAttempt: 2,
+      submitVerificationStartedAtMs: 110,
+      unconfirmedAttributionStartedAtMs: 100,
+    });
+    expect(queue.peek()[0]?.submitConfirmedAtMs).toBeUndefined();
   });
 });
 
