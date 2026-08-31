@@ -1419,4 +1419,5 @@ export const messages: Record<string, string> = {
   'cot.tool.search': '搜索',
   'cot.tool.task': '任务管理',
   'cot.tool.default': '调用 {name}',
+  'cot.interrupted': '⚠️ 服务重启，本轮思考已中断',
 };

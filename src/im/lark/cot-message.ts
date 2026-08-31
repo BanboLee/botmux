@@ -125,6 +125,34 @@ export async function sweepOrphanCotMessages(selfLarkAppId: string): Promise<voi
       if (rec.larkAppId && rec.cotId && rec.messageId) {
         if (rec.larkAppId !== selfLarkAppId) continue; // sibling daemon's marker — leave it
         const c = getBotClient(rec.larkAppId);
+        // Annotate BEFORE terminating. Order is forced by the API, not a
+        // preference: once a CoT is completed every later append is rejected
+        // with "COT already in terminal state" (verified against the live
+        // endpoint), so a note added after the complete would silently never
+        // render. Best-effort — a failed note must still fall through to the
+        // complete below, since an un-terminated bubble spins on「执行中」
+        // forever, which is strictly worse than an unannotated one.
+        //
+        // The note ends in RUN_FINISHED, which already auto-completes the CoT
+        // server-side (verified: a later append is refused as terminal), so
+        // the complete below is redundant on the happy path. It is kept
+        // deliberately: it is idempotent, it is the ONLY terminator when the
+        // note fails, and dropping it would rewrite pre-existing assertions
+        // for a saving on a fire-and-forget startup path that blocks nothing.
+        try {
+          await c.request({
+            method: 'PUT',
+            url: '/open-apis/im/v1/message_cot',
+            data: {
+              cot_id: rec.cotId,
+              message_id: rec.messageId,
+              events: interruptedNoticeEvents(rec.larkAppId),
+            },
+            timeout: COT_REQUEST_TIMEOUT_MS,
+          } as any);
+        } catch (err) {
+          logger.warn(`[cot] orphan notice ${rec.cotId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
         await c.request({
           method: 'POST',
           url: `/open-apis/im/v1/message_cot/complete/${encodeURIComponent(rec.cotId)}`,
@@ -166,6 +194,29 @@ export function cotEnabled(ds: DaemonSession): boolean {
 
 function ev(eventType: string, content: unknown): CotEvent {
   return { event_type: eventType, content: JSON.stringify(content), timestamp: Date.now() };
+}
+
+/**
+ * Terminal batch for a bubble the daemon is abandoning mid-turn: a visible
+ *「因重启中断」node followed by RUN_FINISHED(interrupted).
+ *
+ * Shared by both abandonment paths so they render identically:
+ *   - graceful shutdown (still holds the in-memory state), and
+ *   - the next generation's orphan sweep (only has the marker file).
+ *
+ * Callers MUST send this BEFORE terminating the CoT. Completing first is
+ * irreversible: a later append is rejected with "COT already in terminal
+ * state" (verified against the live endpoint), so the note would silently
+ * never appear.
+ */
+function interruptedNoticeEvents(larkAppId: string, lastReasoningId?: string): CotEvent[] {
+  const mid = `reasoning-interrupted-${lastReasoningId ?? 'orphan'}`;
+  return [
+    ev('REASONING_MESSAGE_START', { messageId: mid, role: 'reasoning' }),
+    ev('REASONING_MESSAGE_CONTENT', { messageId: mid, delta: t('cot.interrupted', {}, localeForBot(larkAppId)) }),
+    ev('REASONING_MESSAGE_END', { messageId: mid }),
+    ev('RUN_FINISHED', { threadId: 'cot-interrupted', runId: mid, status: 'interrupted' }),
+  ];
 }
 
 /**
@@ -420,6 +471,49 @@ export function handleCotThinkingUpdate(
   state.pendingEntries = msg.entries;
   void pump(ds, state);
   return true;
+}
+
+/**
+ * Settle this session's live bubble as「因重启中断」during a GRACEFUL daemon
+ * shutdown. Awaitable on purpose: shutdown must be able to hold its budget
+ * open until the note is actually delivered, unlike {@link abortCotMessage}
+ * (fire-and-forget, used on the worker-exit path where nothing awaits).
+ *
+ * Why this exists on top of the orphan sweep: the sweep is the NEXT
+ * generation's fallback and can only reach bubbles whose marker survived. It
+ * cannot annotate anything the current process still owns in memory before
+ * the marker is consumed, and it is skipped entirely when the daemon is
+ * SIGKILLed after this point. Annotating here covers the common path; the
+ * sweep covers SIGKILL / power loss.
+ *
+ * Clears the orphan marker on success so the next generation does not
+ * annotate the same bubble twice.
+ */
+export async function settleCotMessageForShutdown(ds: DaemonSession): Promise<void> {
+  const state = states.get(ds);
+  if (!state || state.settled || !state.cotId) return;
+  // A turn that is already finishing owns its own terminal batch: `pump` may be
+  // parked on an await with its `!state.settled` check already passed, so
+  // claiming the turn here would put a SECOND RUN_FINISHED on the wire (caught
+  // by the shutdown-vs-finalize race test). The pump also clears the orphan
+  // marker, so nothing is left spinning — leave it alone.
+  if (state.finishStatus) return;
+  state.settled = true; // claim it: a concurrent abort/finalize must not double-send
+  try {
+    if (!state.disabled) {
+      await apiAppend(ds, state, interruptedNoticeEvents(ds.larkAppId, state.lastReasoningId));
+    } else {
+      // A mid-turn failure already disabled pushes for this turn; appending
+      // would fail too. Just terminate so it stops spinning.
+      await apiComplete(ds, state, 'error');
+    }
+  } catch {
+    // Notice failed — still terminate, for the same reason the sweep does:
+    // an unannotated closed bubble beats one that spins forever.
+    try { await apiComplete(ds, state, 'error'); } catch { /* best-effort */ }
+  } finally {
+    clearCotOrphanMarker(state);
+  }
 }
 
 /**

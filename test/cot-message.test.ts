@@ -19,7 +19,7 @@ vi.mock('../src/bot-registry.js', () => ({
 import { mkdtempSync, existsSync, readdirSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage, sweepOrphanCotMessages } from '../src/im/lark/cot-message.js';
+import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage, sweepOrphanCotMessages, settleCotMessageForShutdown } from '../src/im/lark/cot-message.js';
 import { getBot } from '../src/bot-registry.js';
 
 // Orphan markers land under config.session.dataDir — point it at a tmp dir so
@@ -383,6 +383,100 @@ describe('orphan markers & sweep (daemon restart mid-turn)', () => {
   it('sweep is a no-op without a marker directory', async () => {
     await expect(sweepOrphanCotMessages('app1')).resolves.toBeUndefined();
     expect(request).not.toHaveBeenCalled();
+  });
+
+  it('sweep annotates the bubble as interrupted BEFORE completing it', async () => {
+    mkdirSync(orphanDir, { recursive: true });
+    writeFileSync(join(orphanDir, 'cot_prev.json'), JSON.stringify({ larkAppId: 'app1', cotId: 'cot_prev', messageId: 'om_prev' }));
+    await sweepOrphanCotMessages('app1');
+    // Order is forced by the API, not cosmetic preference: appending after a
+    // complete is rejected with "COT already in terminal state", so a note
+    // pushed afterwards would silently never render.
+    const kinds = request.mock.calls.map(([req]) => req.method === 'PUT' ? 'note' : 'complete');
+    expect(kinds).toEqual(['note', 'complete']);
+    const note = pushedEvents();
+    expect(note.some(e => e.type === 'REASONING_MESSAGE_CONTENT' && /重启/.test(e.content.delta))).toBe(true);
+    expect(note.at(-1)!.type).toBe('RUN_FINISHED');
+    expect(note.at(-1)!.content.status).toBe('interrupted');
+  });
+
+  it('sweep still completes the bubble when the interrupted note fails', async () => {
+    mkdirSync(orphanDir, { recursive: true });
+    writeFileSync(join(orphanDir, 'cot_prev.json'), JSON.stringify({ larkAppId: 'app1', cotId: 'cot_prev', messageId: 'om_prev' }));
+    request.mockImplementation(async (req: any) => {
+      if (req.method === 'PUT') throw new Error('append boom');
+      return { code: 0, data: {} };
+    });
+    await sweepOrphanCotMessages('app1');
+    // A failed note must never strand the bubble: an unannotated closed bubble
+    // beats one spinning on「执行中」forever.
+    expect(request.mock.calls.some(([req]) => String(req.url).includes('/message_cot/complete/cot_prev'))).toBe(true);
+    expect(readdirSync(orphanDir)).toEqual([]);
+  });
+});
+
+describe('settleCotMessageForShutdown (graceful daemon restart)', () => {
+  it('annotates the live bubble as interrupted and clears its marker', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('step 1')]));
+    await flush();
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(true);
+    await settleCotMessageForShutdown(ds);
+    const evs = pushedEvents();
+    expect(evs.some(e => e.type === 'REASONING_MESSAGE_CONTENT' && /重启/.test(e.content.delta))).toBe(true);
+    expect(evs.at(-1)!.type).toBe('RUN_FINISHED');
+    expect(evs.at(-1)!.content.status).toBe('interrupted');
+    // Marker cleared → the next generation's sweep must not annotate it twice.
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
+  });
+
+  it('is idempotent and never double-settles against abort/finalize', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('step 1')]));
+    await flush();
+    await settleCotMessageForShutdown(ds);
+    const calls = request.mock.calls.length;
+    await settleCotMessageForShutdown(ds);
+    abortCotMessage(ds);
+    finalizeCotMessage(ds, 'om_turn1', 'completed');
+    await flush();
+    expect(request.mock.calls.length).toBe(calls);
+  });
+
+  it('no-ops when the session never created a bubble', async () => {
+    const ds = makeDs();
+    await settleCotMessageForShutdown(ds);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('leaves an already-finishing turn to its own pump (no second RUN_FINISHED)', async () => {
+    // The pump may be parked on an await with its `!state.settled` check
+    // already passed. Claiming the turn here would put a SECOND terminal batch
+    // on the wire — the bubble would show two "finished" events.
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('step 1')]));
+    await flush();
+    finalizeCotMessage(ds, 'om_turn1', 'completed'); // sets finishStatus; pump in flight
+    await settleCotMessageForShutdown(ds);           // shutdown fires into that window
+    await flush();
+    const terminal = request.mock.calls.filter(([req]) =>
+      req.method === 'PUT' && req.data.events.some((e: any) => e.event_type === 'RUN_FINISHED'));
+    expect(terminal.length).toBe(1);
+    // The pump still owns cleanup, so nothing is left spinning.
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
+  });
+
+  it('terminates a disabled bubble instead of appending to it', async () => {
+    const ds = makeDs();
+    request.mockImplementationOnce(async () => ({ code: 0, data: { cot_id: 'cot1', message_id: 'om_cot_msg1' } }))
+      .mockImplementationOnce(async () => { throw new Error('prologue boom'); });
+    handleCotThinkingUpdate(ds, upd([think('step 1')]));
+    await flush();
+    request.mockClear().mockImplementation(async () => ({ code: 0, data: {} }));
+    await settleCotMessageForShutdown(ds);
+    // Pushes are already failing for this turn — go straight to complete.
+    expect(request.mock.calls.every(([req]) => req.method === 'POST')).toBe(true);
+    expect(request.mock.calls.some(([req]) => String(req.url).includes('/message_cot/complete/'))).toBe(true);
   });
 });
 
