@@ -164,7 +164,8 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     sourceCheckout?: boolean;
     /** Omit scripts/install-path-entry.mjs, to prove the import is fail-soft. */
     withoutPathHelper?: boolean;
-    /** Pretend binDir is already on PATH, so the PATH-writing branch is skipped. */
+    /** Pretend binDir is already on the INSTALLING process's PATH. Note this must
+     *  NOT suppress the startup-file write — see the test that pins it. */
     binDirOnPath?: boolean;
     /** $SHELL for the child, which decides WHICH startup file gets the PATH line. */
     shell?: string;
@@ -172,9 +173,13 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     brokenBinary?: boolean;
     /** Existing shared launcher that a rejected update must preserve byte-for-byte. */
     existingLauncher?: string;
+    /** Run against an EXISTING home from a previous call, the way an upgrade does.
+     *  Needed to exercise idempotence across two installs (the startup file has to
+     *  survive between them, which a fresh tmp home cannot show). */
+    reuseHome?: string;
   }) {
     const base = tmp();
-    const home = join(base, 'home');
+    const home = opts.reuseHome ?? join(base, 'home');
     const pkg = join(base, 'pkg');
     mkdirSync(home, { recursive: true });
     mkdirSync(join(pkg, 'scripts'), { recursive: true });
@@ -262,13 +267,71 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     expect(`${r.stdout}${r.stderr}`).toContain('PATH');
   });
 
-  it('touches no startup file when binDir is already on PATH', () => {
-    // An upgrade on a machine that was set up long ago must not keep appending
-    // to (or even creating) rc files it has nothing to add to.
+  /**
+   * WRITES THE STARTUP FILE EVEN WHEN binDir IS ALREADY ON THE INSTALLING SHELL'S
+   * PATH — this replaces a test that asserted the opposite and thereby pinned a bug.
+   *
+   * The old contract ("touches no startup file when binDir is already on PATH") was
+   * reasoned from upgrade noise: "an upgrade on a machine set up long ago must not
+   * keep appending to rc files". The goal is right; the SIGNAL was wrong. It gated
+   * on `process.env.PATH`, i.e. the PATH of the process running the install, while
+   * what actually decides whether `botmux` works is whether the user's FUTURE shells
+   * get it — a property of the startup FILE.
+   *
+   * Those come apart, and botmux itself pulls them apart: the daemon prepends
+   * `~/.botmux/bin` to every CLI session's PATH (five `prependBotmuxBin` call sites
+   * in worker.ts / worker-pool.ts). So `npm i -g botmux` run from inside a botmux
+   * session hit the gate, wrote NOTHING, printed NOTHING, exited 0 — and since there
+   * is no `bin` field to fall back on, the user's next terminal had no `botmux` at
+   * all. That is the reported "3.18.8 更新之后找不到 botmux 命令", still reproducing
+   * after `exec zsh -l` because the file the login shell reads was never written.
+   *
+   * Idempotence is still required — it is just enforced where the real answer lives:
+   * `ensurePathEntry` consults `fileAlreadyHasEntry` per file (which also recognises
+   * a line the user wrote by hand) and reports those as `skipped`. The next test
+   * pins that, so "does not append twice" survives without the wrong gate.
+   */
+  it('writes the startup file even when the INSTALLING shell already has binDir on PATH', () => {
     const r = runPostinstall({ global: 'true', shell: '/usr/bin/zsh', binDirOnPath: true });
     expect(r.status).toBe(0);
     expect(r.wrote).toBe(true);                        // launcher still written
-    expect(existsSync(join(r.home, '.zshenv'))).toBe(false);
+    // The whole point: a transiently-correct PATH must not suppress the file that
+    // makes it permanent.
+    const zshenv = join(r.home, '.zshenv');
+    expect(existsSync(zshenv), 'binDir on the installer PATH must not suppress the startup file').toBe(true);
+    expect(readFileSync(zshenv, 'utf-8')).toContain(join(r.home, '.botmux', 'bin'));
+    // And the user is told, so they know to open a new terminal.
+    expect(r.stdout).toContain('open a new terminal');
+  });
+
+  it('does not append twice when the startup file already carries the entry', () => {
+    // The idempotence the old PATH gate was reaching for, asserted on the signal
+    // that actually governs it. Two installs in the SAME home: the second must
+    // report `skipped` and leave exactly one marker line.
+    const first = runPostinstall({ global: 'true', shell: '/usr/bin/zsh' });
+    expect(first.status).toBe(0);
+    const zshenv = join(first.home, '.zshenv');
+    expect(existsSync(zshenv)).toBe(true);
+    const markers = (text: string) => text.split('\n').filter(l => l.includes('# added by botmux installer')).length;
+    expect(markers(readFileSync(zshenv, 'utf-8'))).toBe(1);
+
+    // Re-run against the very same HOME (reuseHome), as an upgrade would.
+    const second = runPostinstall({ global: 'true', shell: '/usr/bin/zsh', reuseHome: first.home });
+    expect(second.status).toBe(0);
+    expect(markers(readFileSync(zshenv, 'utf-8')), 'a re-install must not append a second PATH line').toBe(1);
+    expect(second.stdout).toContain('already puts');
+  });
+
+  it('SOURCE PIN: the PATH step is not gated on the installing process\'s own PATH', () => {
+    // Behavioural coverage above needs the fixture to stage binDir on PATH; this
+    // pins the absence of the wrong predicate directly, so a re-add is caught even
+    // if someone reshapes the fixture. `process.env.PATH` may legitimately appear
+    // elsewhere in the file (it is passed through to the probe spawn), so match the
+    // specific gate shape that caused the bug: a membership test of binDir in it.
+    const src = readFileSync(POSTINSTALL, 'utf-8');
+    const code = src.split('\n').filter(l => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n');
+    expect(code).not.toMatch(/process\.env\.PATH[^\n]*\.includes\(\s*binDir\s*\)/);
+    expect(code).not.toMatch(/if\s*\(\s*!\s*\(?\s*process\.env\.PATH/);
   });
 
   it('the written launcher actually runs and preserves argument boundaries', () => {
