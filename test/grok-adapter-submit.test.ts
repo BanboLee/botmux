@@ -15,13 +15,18 @@ import type { PtyHandle } from '../src/adapters/cli/types.js';
 // body each time; a later manual Enter submitted one giant prompt with the
 // message stacked N times.
 //
-// The fix under test: (1) deliver via bracketed pasteText so the body lands
-// atomically; (2) when the composer already holds this exact body from an
-// unconfirmed attempt on the same handle, retry with Enter ONLY — never stack
-// another copy. The mock composer below mirrors the real failure: a
-// "swallowed" Enter appends a soft newline instead of submitting, and a
-// committing Enter appends the composer content to prompt_history.jsonl the
-// way grok records real submits.
+// The fix under test: deliver via bracketed pasteText so the body lands
+// atomically (idle 12/12 and mid-turn 6/6 on real 1.0.5, zero swallowed
+// Enters). There is deliberately NO Enter-only retry path: `submitted:false`
+// does not prove the body is parked in the composer — every mid-turn submit
+// parks in grok's OWN queue and appends prompt_history only at dequeue, so
+// an Enter-only retry would fire a bare Enter at an empty composer. On real
+// 1.0.5 a bare Enter with a queued follow-up is send-now (cancels the
+// running turn), and an Enter-only "retry" for an identical resend would
+// swallow the new message entirely. The mock composer below is honest about
+// both: mid-turn submits queue and append only on flushQueue(), and a bare
+// Enter on an empty composer with a non-empty queue counts a send-now
+// cancellation instead of pretending to be a no-op.
 
 const SID = '00000000-0000-7000-8000-00000000aaaa';
 const CWD = '/fake/grok-project';
@@ -43,21 +48,33 @@ function appendPrompt(sid: string, prompt: string): void {
 }
 
 /** A pty whose composer behaves like grok 1.0.5: pasted text accumulates; a
- *  "swallowed" Enter becomes a soft newline in the composer (the mid-ingest
- *  failure mode); a committing Enter records the WHOLE composer content in
- *  prompt_history.jsonl and clears it. */
-function makePty(opts: { cwd?: string; sid?: string; swallowEnters?: number } = {}): PtyHandle & {
+ *  "swallowed" Enter becomes a soft newline in the composer (the legacy
+ *  send-keys failure mode); a committing Enter either records the WHOLE
+ *  composer content in prompt_history.jsonl (idle) or — with `midTurn` —
+ *  parks it in grok's own queue, appending only when flushQueue() models the
+ *  previous turn completing (dequeue-time append, measured on 1.0.5). A bare
+ *  Enter on an empty composer while the queue is non-empty is send-now: it
+ *  cancels the running turn (measured; NOT a no-op). */
+function makePty(opts: { cwd?: string; sid?: string; swallowEnters?: number; midTurn?: boolean } = {}): PtyHandle & {
   pasteText: ReturnType<typeof vi.fn>;
   sendText: ReturnType<typeof vi.fn>;
   sendSpecialKeys: ReturnType<typeof vi.fn>;
   composer(): string;
+  sendNowCancels(): number;
+  flushQueue(): void;
 } {
   let composer = '';
   let swallowLeft = opts.swallowEnters ?? 0;
+  const queued: string[] = [];
+  let sendNowCancels = 0;
   return {
     write: vi.fn(),
     cliCwd: opts.cwd ?? CWD,
     composer: () => composer,
+    sendNowCancels: () => sendNowCancels,
+    flushQueue: () => {
+      for (const body of queued.splice(0)) appendPrompt(opts.sid ?? SID, body);
+    },
     pasteText: vi.fn((text: string) => { composer += text; }),
     sendText: vi.fn(),
     sendSpecialKeys: vi.fn((key: string) => {
@@ -67,7 +84,17 @@ function makePty(opts: { cwd?: string; sid?: string; swallowEnters?: number } = 
         composer += '\n'; // the swallowed Enter lands as a soft newline
         return;
       }
-      if (!composer) return; // Enter on an empty idle composer is a no-op
+      if (!composer) {
+        // Real 1.0.5: with a queued follow-up the bottom bar reads
+        // `Enter:send now` — a bare Enter CANCELS the running turn.
+        if (queued.length > 0) sendNowCancels += 1;
+        return;
+      }
+      if (opts.midTurn) {
+        queued.push(composer); // Enter:queue — appends only at dequeue
+        composer = '';
+        return;
+      }
       appendPrompt(opts.sid ?? SID, composer);
       composer = '';
     }),
@@ -128,52 +155,45 @@ describe.sequential('grok adapter submit delivery (prompt_history.jsonl)', () =>
     expect(await (result as any).recheck()).toEqual({ submitted: true, cliSessionId: SID });
   });
 
-  it('REGRESSION: an identical flush retry sends Enter only — it never stacks a second copy', async () => {
-    // Enter #1 is swallowed mid-ingest (soft newline); Enter #2 commits. If the
-    // retry re-pasted, the committed prompt would be the body doubled and the
-    // verify below could never match — this is exactly the incident where a
-    // Lark alert card was submitted tripled after 3 flush retries.
+  it('REGRESSION: a resend after a mid-turn verify miss re-pastes the body — never a bare Enter (send-now cancel)', async () => {
+    // Mid-turn a submit parks in grok's own queue: the composer is EMPTY and
+    // prompt_history appends only at dequeue, so verify misses (measured 6/6
+    // on 1.0.5) and the caller is told「提交未确认」. If the adapter kept an
+    // Enter-only memory for the "unconfirmed" body, the user's manual resend
+    // of the same text would fire a bare Enter at `Enter:send now` — grok
+    // cancels the running turn AND the resent message is never delivered.
     const adapter = createGrokAdapter('/bin/grok');
-    const pty = makePty({ swallowEnters: 1 });
+    const pty = makePty({ midTurn: true });
     const body = '[卡片: critical 报警]\n多行正文 padding';
 
     const first = await adapter.writeInput(pty, body);
     expect(first).toMatchObject({ submitted: false });
-    expect(pty.composer()).toBe(`${body}\n`); // parked, one copy + swallowed-Enter newline
+    expect(pty.composer()).toBe(''); // body left the composer — it is queued in grok
 
-    const retry = await adapter.writeInput(pty, body);
+    const resend = await adapter.writeInput(pty, body);
+    expect(resend).toMatchObject({ submitted: false });
+    expect(pty.pasteText).toHaveBeenCalledTimes(2); // full re-paste, no Enter-only shortcut
+    expect(pty.sendNowCancels()).toBe(0); // and no bare Enter cancelled the running turn
 
-    expect(retry).toEqual({ submitted: true, cliSessionId: SID });
-    expect(pty.pasteText).toHaveBeenCalledTimes(1); // body pasted exactly once across both calls
+    // Previous turn completes → queued submits dequeue and append; the
+    // deferred recheck (worker's 20s path) then confirms.
+    pty.flushQueue();
+    expect(await (first as any).recheck()).toEqual({ submitted: true, cliSessionId: SID });
   });
 
-  it('re-pastes on a fresh backend handle (restart cleared the composer)', async () => {
+  it('an identical new message always re-pastes — no Enter-only shortcut on the confirmed path either', async () => {
     const adapter = createGrokAdapter('/bin/grok');
-    const stuck = makePty({ swallowEnters: Infinity as unknown as number });
-    await adapter.writeInput(stuck, 'same body');
-
-    const fresh = makePty();
-    const result = await adapter.writeInput(fresh, 'same body');
-
-    expect(result).toMatchObject({ submitted: true });
-    expect(fresh.pasteText).toHaveBeenCalledTimes(1);
-  });
-
-  it('a recheck confirmation clears the composer memory so an identical NEW message pastes again', async () => {
-    const adapter = createGrokAdapter('/bin/grok');
-    const pty = makePty({ swallowEnters: 1 });
+    const pty = makePty();
 
     const first = await adapter.writeInput(pty, '合并部署');
-    expect(first).toMatchObject({ submitted: false });
-    // A flush retry's Enter submits the parked text; the deferred recheck sees it.
-    (pty.sendSpecialKeys as any)('Enter');
-    expect(await (first as any).recheck()).toEqual({ submitted: true, cliSessionId: SID });
+    expect(first).toMatchObject({ submitted: true });
 
-    // The user sends the exact same text again tomorrow: the composer is empty,
-    // so this MUST paste — an Enter-only shortcut here would silently no-op.
+    // The user sends the exact same text again tomorrow: the composer is
+    // empty, so this MUST paste — an Enter-only shortcut would silently no-op.
     const again = await adapter.writeInput(pty, '合并部署');
     expect(again).toMatchObject({ submitted: true });
     expect(pty.pasteText).toHaveBeenCalledTimes(2);
+    expect(pty.sendNowCancels()).toBe(0);
   });
 
   it('fails closed without cliCwd but still delivers via bracketed paste', async () => {

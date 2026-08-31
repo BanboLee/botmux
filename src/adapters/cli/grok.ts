@@ -56,7 +56,7 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
  *  type-ahead on both sides by the worker's queue policy, so an exact receipt
  *  can never be merged away.
  *
- *  ## Input delivery: bracketed paste, Enter-only retry
+ *  ## Input delivery: bracketed paste
  *  The body is delivered via BRACKETED PASTE (tmux load-buffer +
  *  paste-buffer -p), NOT per-byte `send-keys -l`. Verified on grok 1.0.5:
  *  the TUI needs seconds to ingest a multi-KB `send-keys -l` burst, and an
@@ -65,21 +65,32 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
  *  full un-submitted text until a human presses Enter (a ~4KB Lark alert
  *  card reproduced this deterministically; worker flush retries then stack
  *  more copies into the composer). With bracketed paste the same payload
- *  lands atomically and 200ms + Enter submits reliably. Literal `\n` stays a
- *  soft newline either way, so multi-line bodies never self-submit.
- *  When a paste DID land but its submit was never confirmed, a repeat
- *  writeInput with the identical body on the same backend handle sends the
- *  Enter ONLY (composer already holds the text; re-pasting would stack a
- *  duplicate copy that a later Enter submits as one giant repeated prompt).
+ *  lands atomically and 200ms + Enter submits reliably (measured on 1.0.5:
+ *  8KB multi-line payloads, idle 12/12 and mid-turn 6/6, zero swallowed
+ *  Enters). Literal `\n` stays a soft newline either way, so multi-line
+ *  bodies never self-submit.
+ *  There is deliberately NO Enter-only retry for an unconfirmed submit:
+ *  `submitted:false` does not prove the body is parked in the composer.
+ *  Every mid-turn submit verifies late by design (grok queues it and
+ *  appends prompt_history only at dequeue — see below), so an Enter-only
+ *  path would routinely fire a bare Enter at an EMPTY composer, which with
+ *  a queued follow-up is send-now (cancels the running turn — the exact
+ *  hazard #865 removed the second Enter for), and would swallow a genuine
+ *  identical resend (Enter without ever pasting the new message). An
+ *  unconfirmed submit is re-delivered by a full re-paste, whose swallow
+ *  hazard bracketed paste already removed.
  *
  *  ## Status / bridge
  *  Bridge source of truth: per-session `updates.jsonl`
  *  (`user_message_chunk` / `agent_message_chunk` + `turn_completed`),
  *  drained via `drainGrokUpdates`. Submit VERIFY uses the bucket-level
- *  `prompt_history.jsonl` instead: it is appended AT SUBMIT TIME even while
- *  a turn is running, whereas updates.jsonl records a parked type-ahead
- *  message only at DEQUEUE time — polling it would spuriously fail every
- *  busy-turn submit (codex's history.jsonl plays the same role there).
+ *  `prompt_history.jsonl`: an idle-composer submit appends at submit time
+ *  (0.5–1s on 1.0.5). KNOWN LIMIT (1.0.5, measured): a mid-turn submit
+ *  parks in grok's own queue and appends only at DEQUEUE — the instant the
+ *  previous turn completes — so busy-turn verify misses regardless of the
+ *  poll window (the bound is the running turn's duration, unbounded) and
+ *  the caller sees a spurious「提交未确认」. Pre-existing on master; the
+ *  verify-semantics fix (dequeue-independent evidence) is a separate PR.
  *  Ready gate: global `$GROK_HOME/hooks/botmux-session-ready.json`
  *  SessionStart → `botmux session-ready` (`injectsReadyHook`).
  *
@@ -112,13 +123,6 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
   // modelChoices and must not shell out (see resolveCommand).
   const rawBin = pathOverride ?? 'grok';
   let cachedBin: string | undefined;
-  // Body of the last paste on a backend handle whose submit was never
-  // confirmed — it is still sitting in the composer. A repeat writeInput with
-  // the identical body must send Enter ONLY (see header). Keyed by the pty
-  // handle so a CLI restart (fresh handle → empty composer) re-pastes, and
-  // cleared the moment any probe/recheck confirms the submit so a genuinely
-  // new message with identical text pastes normally.
-  const unconfirmedComposerBody = new WeakMap<PtyHandle, string>();
   return {
     id: 'grok',
     // Absolute runtime paths (not `~/…` literals): GROK_HOME can override the
@@ -244,8 +248,9 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
 
     async writeInput(pty: PtyHandle, content: string) {
       // Submit verify against the bucket-level prompt_history.jsonl (one
-      // {timestamp, session_id, prompt} line per submit, written at submit
-      // time even while a turn runs — see header). Requires cliCwd: without
+      // {timestamp, session_id, prompt} line per submit; idle-composer
+      // submits append at submit time, mid-turn queued submits only at
+      // dequeue — see header). Requires cliCwd: without
       // it we cannot safely pick a bucket (scanning every cwd's history
       // would risk cross-session false matches + persist wrong cliSessionId).
       // Production always sets cliCwd (spawn + adopt); missing cwd → fail
@@ -289,20 +294,10 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
         }
       };
 
-      // Enter-only retry: the composer still holds this exact body from a
-      // previous unconfirmed attempt on this handle — do not stack another
-      // copy, just send the Enter that was swallowed. This is also what makes
-      // the worker's flush retry safe for grok: retry #2 fires after the TUI
-      // finished ingesting, so its lone Enter submits the parked text.
-      const composerHoldsBody = unconfirmedComposerBody.get(pty) === content;
-
       const cwd = pty.cliCwd;
       if (!cwd) {
-        if (!composerHoldsBody) {
-          if (!deliverBody()) return { submitted: false };
-          unconfirmedComposerBody.set(pty, content);
-          await delay(scaleMs(200));
-        }
+        if (!deliverBody()) return { submitted: false };
+        await delay(scaleMs(200));
         trySendEnter();
         return { submitted: false };
       }
@@ -310,18 +305,15 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       const historyPath = grokPromptHistoryPath(cwd);
       const baseByte = grokFileSize(historyPath);
 
-      if (!composerHoldsBody) {
-        if (!deliverBody()) return { submitted: false };
-        // Mark BEFORE the Enter: if the Enter write fails (tmux gone /
-        // timeout) the paste may still be parked in the composer, and the
-        // retry path must not double it.
-        unconfirmedComposerBody.set(pty, content);
-        await delay(scaleMs(200));
-      }
-      // Single Enter per writeInput call. Do not loop Enter in-band: while a
-      // turn is running, an empty composer plus a queued follow-up makes Grok
-      // treat the next Enter as send-now (cancel-and-send), and slow
-      // prompt_history is not proof the first Enter dropped.
+      if (!deliverBody()) return { submitted: false };
+      await delay(scaleMs(200));
+      // One paste + one Enter per call, and NEVER an Enter without a paste
+      // in the same call: `submitted:false` is not proof the body is parked
+      // in the composer (every mid-turn submit verifies late — see header),
+      // and a bare Enter on an empty composer with a queued follow-up is
+      // send-now (cancels the running turn). An unconfirmed submit is
+      // recovered by the worker's flush retry (full re-paste) and the
+      // deferred recheck, never by extra in-band Enters.
       if (!trySendEnter()) return { submitted: false };
 
       // First submit in a fresh bucket creates the file after our snapshot —
@@ -335,16 +327,13 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
         return matchGrokPromptAppend(historyPath, base, content, { preferSessionId });
       };
 
-      // Keep polling for a late history append. A swallowed Enter is
-      // recovered by the worker's flush retry (Enter-only, above) and the
-      // deferred recheck — never by a second in-band Enter.
-      const confirm = (hit: { found: boolean; cliSessionId?: string }) => {
-        // The body left the composer — a future identical message must paste.
-        unconfirmedComposerBody.delete(pty);
-        return hit.cliSessionId
+      // Keep polling for a late history append. An unconfirmed submit is
+      // recovered by the worker's flush retry and the deferred recheck —
+      // never by a second in-band Enter.
+      const confirm = (hit: { found: boolean; cliSessionId?: string }) =>
+        hit.cliSessionId
           ? { submitted: true, cliSessionId: hit.cliSessionId }
           : { submitted: true };
-      };
       const deadline = Date.now() + scaleMs(4_000);
       while (Date.now() < deadline) {
         const hit = probe();
@@ -358,7 +347,6 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       const recheck = () => {
         const hit = probe();
         if (!hit.found) return false;
-        unconfirmedComposerBody.delete(pty);
         return hit.cliSessionId
           ? { submitted: true as const, cliSessionId: hit.cliSessionId }
           : true;
