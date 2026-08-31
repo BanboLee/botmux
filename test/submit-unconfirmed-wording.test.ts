@@ -6,7 +6,7 @@ import { messages as zhMessages } from '../src/i18n/zh.js';
 /**
  * submit_unconfirmed 文案只钉「机器消费」的接缝：
  *   - key 在 zh/en 两份字典都存在；
- *   - worker 传给 t() 的插值参数（{cliName}/{secs}/{transcriptLabel}/{preview}）
+ *   - worker 传给 t() 的插值参数（{cliName}/{transcriptLabel}/{preview}）
  *     在模板里必须仍然存在——参数被抽掉会在渲染时泄漏出裸 {param}；
  *   - 文案不再断言「没有到达模型的证据」（自动确认失败 ≠ 一定没执行）；
  *   - 文案与 worker 传入的 transcriptLabel 不再声称 JSONL 存储（OpenCode 查的是 SQLite）。
@@ -15,7 +15,7 @@ import { messages as zhMessages } from '../src/i18n/zh.js';
 
 const UNCONFIRMED_KEYS = ['worker.submit_unconfirmed', 'worker.submit_unconfirmed_zmx'] as const;
 
-const WORKER_PASSED_PARAMS = ['{cliName}', '{secs}', '{transcriptLabel}', '{preview}'] as const;
+const WORKER_PASSED_PARAMS = ['{cliName}', '{transcriptLabel}', '{preview}'] as const;
 
 const OVERCLAIM_PHRASES = [
   '尚无请求到达模型的证据',
@@ -54,6 +54,13 @@ describe('submit_unconfirmed wording seam', () => {
     expect(zhMessages[key]).not.toContain('jsonl');
     expect(enMessages[key]).not.toContain('JSONL');
     expect(enMessages[key]).not.toContain('jsonl');
+  });
+
+  it.each(UNCONFIRMED_KEYS)('%s does not assert elapsed time or a specific retry action', (key) => {
+    expect(zhMessages[key]).not.toContain('{secs}');
+    expect(enMessages[key]).not.toContain('{secs}');
+    expect(zhMessages[key]).not.toContain('重试 Enter');
+    expect(enMessages[key]).not.toContain('retried Enter');
   });
 
   it('worker passes a storage-agnostic transcriptLabel instead of 会话 JSONL', () => {
