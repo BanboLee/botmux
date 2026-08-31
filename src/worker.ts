@@ -12227,6 +12227,13 @@ function busyProbeRegion(content: string): string {
 }
 
 function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean {
+  const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+  if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({ sessionId, cliSessionId: currentCliSid })) {
+    log(`${source}: session state indicates active work (db busy); deferring prompt ready`);
+    idleDetector?.reset();
+    scheduleBusyPatternIdleProbe(source);
+    return true;
+  }
   if (!backendScreenEvidenceIsAuthoritativeForMutation() || !cliAdapter?.busyPattern) return false;
   try {
     const content = captureBackendScreen(be);
@@ -12245,14 +12252,18 @@ function probeBusyPatternIdle(
   source: string,
   be: SessionBackend,
 ): boolean {
-  if (!backendScreenEvidenceIsAuthoritativeForMutation()) {
-    log(`${source} idle probe skipped: backend screen geometry is not authoritative`);
+  const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+  if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({ sessionId, cliSessionId: currentCliSid })) {
     return false;
   }
-  try {
-    const content = captureBackendScreen(be);
-    if (!content) return false;
-    if (cliAdapter?.busyPattern) {
+  if (cliAdapter?.busyPattern) {
+    if (!backendScreenEvidenceIsAuthoritativeForMutation()) {
+      log(`${source} idle probe skipped: backend screen geometry is not authoritative`);
+      return false;
+    }
+    try {
+      const content = captureBackendScreen(be);
+      if (!content) return false;
       if (cliAdapter.busyPattern.test(busyProbeRegion(content))) return false;
       if (!be.settleCurrentScreen) {
         log(`${source} idle probe: busy marker absent, marking prompt ready`);
@@ -12279,16 +12290,36 @@ function probeBusyPatternIdle(
         markPromptReady();
       });
       return true;
+    } catch (err: any) {
+      log(`${source} idle probe captureCurrentScreen failed: ${err.message}`);
     }
-  } catch (err: any) {
-    log(`${source} idle probe captureCurrentScreen failed: ${err.message}`);
+  } else if (cliAdapter?.isSessionBusy) {
+    if (!be.settleCurrentScreen) {
+      log(`${source} idle probe: session state store no longer busy, marking prompt ready`);
+      markPromptReady();
+      return true;
+    }
+    const revisionBeforeSettle = backendScreenRevision;
+    log(`${source} idle probe: session state store no longer busy, settling authoritative screen before prompt ready`);
+    void settleBackendScreenBeforeIdle(be, revisionBeforeSettle).then((settle) => {
+      if (!settle.proceed || backend !== be || isPromptReady) return;
+      if (backendScreenRevision !== revisionBeforeSettle) {
+        log(`${source} idle probe: authoritative screen changed during settle; deferring completion`);
+        return;
+      }
+      if (settle.degraded) {
+        log(`${source} idle probe: screen settle degraded; finalizing from the last successful snapshot`);
+      }
+      markPromptReady();
+    });
+    return true;
   }
   return false;
 }
 
 function scheduleReattachIdleProbe(source: string, be: SessionBackend): void {
   stopReattachIdleProbe();
-  if (!cliAdapter?.busyPattern || (!be.captureCurrentScreen && !be.captureViewport)) return;
+  if ((!cliAdapter?.busyPattern && !cliAdapter?.isSessionBusy) || (!be.captureCurrentScreen && !be.captureViewport && !cliAdapter?.isSessionBusy)) return;
   reattachIdleProbeTimer = setTimeout(() => {
     reattachIdleProbeTimer = null;
     if (backend !== be || !awaitingFirstPrompt || isPromptReady) return;
@@ -12313,19 +12344,11 @@ function stopBusyPatternIdleProbe(): void {
 
 function scheduleBusyPatternIdleProbe(source: string): void {
   stopBusyPatternIdleProbe();
-  if (!cliAdapter?.busyPattern || !backend || !canCaptureBusyPatternScreen(backend)) return;
-  // Don't arm on a backend whose screen geometry is not authoritative for
-  // mutation (ZMX): probeBusyPatternIdle() bails at that same gate every tick
-  // and can never mark ready, so — with the attempt cap now removed — the timer
-  // would re-arm on `!isPromptReady` forever. On ZMX an alt-screen CLI's
-  // busy→idle redraw arrives as a screen-resync (reset-only, deliberately not
-  // fed to IdleDetector — see onBackendScreenResync), so screen quiescence never
-  // flips isPromptReady either; a Pi turn ending via a `terminate:true` custom
-  // tool (no assistant_final → no fireIdle) would then leave a live worker
-  // logging a skip line every IDLE_PROBE_INTERVAL_MS with no terminator. The
-  // authoritative screen-idle path (settle + drainBridgesThenMarkReady) already
-  // owns completion for these backends.
-  if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;
+  if ((!cliAdapter?.busyPattern && !cliAdapter?.isSessionBusy) || !backend) return;
+  if (!cliAdapter?.isSessionBusy) {
+    if (!canCaptureBusyPatternScreen(backend)) return;
+    if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;
+  }
 
   const tick = () => {
     busyPatternIdleProbeTimer = null;
