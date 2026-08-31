@@ -148,7 +148,7 @@ describe('worker structured-turn status wiring', () => {
     expect(staleGuard).toBeGreaterThanOrEqual(0);
     expect(schedule.indexOf('persistCliSessionId(cliSessionId)', staleGuard)).toBeGreaterThan(staleGuard);
     expect(schedule.indexOf('redriveRejectedStructuredReady()', staleGuard)).toBeGreaterThan(staleGuard);
-    expect(schedule.indexOf('scheduleSubmitFailureNotify(', staleGuard)).toBeGreaterThan(staleGuard);
+    expect(schedule.indexOf('armDeferredRecheck()', staleGuard)).toBeGreaterThan(staleGuard);
     expect(schedule.indexOf('emitDurableTerminal(', staleGuard)).toBeGreaterThan(staleGuard);
 
     const restart = functionSlice('restartCliProcess', 'startWebServer');
