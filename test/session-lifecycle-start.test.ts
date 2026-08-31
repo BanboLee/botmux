@@ -700,8 +700,12 @@ describe('ordinary Claude semantic recovery', () => {
   });
 
   it('stays silent when the user aborted the turn themselves', async () => {
-    // Esc → `*_turn_aborted`. The user already knows; a card here would be the
-    // very alert noise this feature exists to reduce.
+    // Esc, or the card's own ⏹ stop button (which sends ^C). The user already
+    // knows; a card here would be the very alert noise this feature reduces.
+    //
+    // The code is the one a REAL codex session produces — reason-suffixed, per
+    // codex-transcript.ts. A fixed code from another adapter would pass while
+    // this session's actual abort code sailed through to a card.
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex' }));
     const sessionReply = vi.fn(async () => 'om_x');
     initWorkerPool({
@@ -719,7 +723,7 @@ describe('ordinary Claude semantic recovery', () => {
       sessionId: ds.session.sessionId,
       turnId: 'om_codex3',
       status: 'ambiguous',
-      errorCode: 'rpc_turn_aborted',
+      errorCode: 'codex_turn_aborted:user_interrupt',
     });
     await new Promise(r => setTimeout(r, 50));
 
@@ -1057,9 +1061,10 @@ describe('ordinary Claude semantic recovery', () => {
         && message?.turnId?.startsWith('bmx-recovery-'));
     expect(recoverySends).toHaveLength(2);
     expect(sessionReply).toHaveBeenCalledTimes(1);
-    // Now an interactive failure card. `recovery_delivery_failed` is a
-    // pre-execution code (the continuation never reached the worker), so this
-    // card offers retry as provably safe.
+    // Now an interactive failure card. `recovery_delivery_failed` describes the
+    // CONTINUATION's fate, not the original turn's — and the button re-injects
+    // `lastFailedTurn`, which still points at the original turn (this path
+    // emits no turn_terminal). So the card must NOT advertise a safe resend.
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
       expect.stringContaining('recovery_delivery_failed'),
@@ -1067,6 +1072,13 @@ describe('ordinary Claude semantic recovery', () => {
       'app_test',
       'om_original',
     );
+    // The builder is stubbed in this suite, so assert on the policy decision it
+    // was handed: `caveated`, never `safe`. A safe offer here would render a
+    // verbatim-resend button for a turn whose progress is unknown.
+    const recoveryCard = JSON.parse(
+      vi.mocked(sessionReply).mock.calls.find(c => c[2] === 'interactive')![1] as string,
+    );
+    expect(recoveryCard.retryOffer).toBe('caveated');
     expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
       status: 'attention_required',
       lastErrorCode: 'recovery_delivery_failed',

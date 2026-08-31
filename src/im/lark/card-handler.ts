@@ -2887,11 +2887,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
     // 失败卡的重试按钮。刻意不复用上面的 `retry_last_task`：那颗按钮的
     // `ds.usageLimit` 条件同时充当它的一次性安全阀（成功后 clearUsageLimitState
-    // 消费掉，所以连点第二次自然失效）。失败场景没有那个状态，于是这里用
-    // `lastFailedTurn.turnId` 做等价的一次性校验：
-    //   - 卡上的 turn_id 必须与当前记录的失败轮次逐字相同 ⟹ 历史失败卡点不动；
-    //   - 成功后 markRetryAttempt 起 10s cooldown ⟹ 同一张卡连点被挡住。
-    // 两条都 fail-closed：宁可让用户多发一条消息，也不重复提交可能带外部副作用
+    // 消费掉，所以连点第二次自然失效）。失败场景没有那个状态，于是这里换成两道
+    // 独立的门——注意**两道都不是一次性的**，`lastFailedTurn` 只写不删：
+    //   - turnId pin：卡上的 turn_id 必须与当前记录的失败轮次逐字相同。它挡的是
+    //     **历史卡片**——会话后来又失败过、记录被新的覆盖，旧卡就永久失效；同一
+    //     张卡在记录没被覆盖前，pin 一直是满足的。
+    //   - 10s cooldown（markRetryAttempt 盖 lastRetryAt）：挡的是**连点**。
+    //     冷却过后同一张卡可以再次提交，这是刻意的（与 `/retry` 同款，
+    //     failed-turn-retry.test 有用例钉住），因为一次重试也可能再失败。
+    // 两道都 fail-closed：宁可让用户多发一条消息，也不重复提交可能带外部副作用
     // 的任务。
     if (actionType === 'retry_turn' && ds) {
       const locDs = localeForBot(ds.larkAppId);
@@ -2907,8 +2911,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (!failedTurn) {
         return { toast: { type: 'warning', content: t('card.action.retry_turn_missing', undefined, locDs) } };
       }
-      // 一次性校验：卡片只对它自己那一轮有效。会话后来又失败过（记录被新的
-      // 覆盖）或这张卡已经重试过，都会在这里被拒。
+      // 轮次校验：卡片只对它自己那一轮有效。会话后来又失败过、记录被新的覆盖，
+      // 这张旧卡就永久失效。（「刚点过」不在这里挡，由下面的 cooldown 负责。）
       const clickedTurnId = value?.turn_id;
       if (!clickedTurnId || clickedTurnId !== failedTurn.turnId) {
         logger.info(
@@ -2968,9 +2972,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (!accepted) {
         return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
       }
-      // Consume the one-shot only after acceptance: a rejected click must not
-      // burn the cooldown or the turnId pin (same post-acceptance ordering as
-      // /retry and retry_last_task).
+      // Start the cooldown only after acceptance: a rejected click must not
+      // burn it (same post-acceptance ordering as /retry and retry_last_task).
       markRetryAttempt(ds.session);
       rememberLastCliInput(ds, failedTurn.userPrompt, retryInput);
       sessionStore.updateSession(ds.session);

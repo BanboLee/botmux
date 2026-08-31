@@ -6,10 +6,12 @@
  *
  * 1. **Should we notify at all?** A `failed` terminal always warrants a notice.
  *    An `ambiguous` one does NOT: that bucket mixes genuine breakage the user
- *    cannot see (the CLI process died, an input write threw) with interruptions
- *    the user performed themselves (Esc → `*_turn_aborted`). Notifying on a
- *    user's own Esc would manufacture exactly the alert noise this feature
- *    exists to reduce, so proven user aborts stay silent.
+ *    cannot see (the CLI process died, an input write threw) with endings the
+ *    user already knows about — an interruption they performed themselves
+ *    (Esc, or the card's ⏹ stop button, which sends `^C`), or a turn their own
+ *    newer message superseded. Notifying on those would manufacture exactly the
+ *    alert noise this feature exists to reduce, so they stay silent. An abort
+ *    that cannot be attributed to the user still surfaces.
  *
  * 2. **May we offer retry, and with what warning?** `retryable === true` is
  *    single-sourced today (the Claude transcript classifier is its only
@@ -44,10 +46,12 @@ export type FailureNoticeStatus = 'failed' | 'ambiguous' | 'completed' | 'cancel
  *
  * Membership requires direct evidence that the code is user-initiated: each of
  * these is documented as an Esc/interrupt in its transcript adapter (see
- * `pi-transcript.ts` "user interrupt (Esc)"). Codes that merely *sound*
- * cancel-like are deliberately excluded — `provider_cancelled`, for instance,
- * can be a server-side cancellation rather than a human keypress, and today it
- * does produce a notice. Suppressing it on a guess would delete a real alert.
+ * `pi-transcript.ts` "user interrupt (Esc)").
+ *
+ * Note the deliberate ABSENCE of `structured_turn_aborted`: that is the `??`
+ * fallback in `codex-bridge-queue.ts` for an abort carrying no code of its own,
+ * so it means "unattributable", not "the user did it". Unattributable aborts
+ * must surface — that is the same rule this module applies to a missing code.
  */
 const USER_ABORT_ERROR_CODES: ReadonlySet<string> = new Set([
   'pi_turn_aborted',
@@ -56,8 +60,60 @@ const USER_ABORT_ERROR_CODES: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Adapters that encode the abort REASON into the code itself
+ * (`codex_turn_aborted:user_interrupt`, `traex_turn_aborted:interrupted_by_user_unsafe`),
+ * so the code is not a fixed string and cannot be matched by set membership.
+ *
+ * These are compared against the segment BEFORE the first `:` — not with
+ * `startsWith`, which would also swallow a hypothetical sibling like
+ * `codex_turn_aborted_by_policy`. The reason suffix is deliberately ignored:
+ * every `turn_aborted` record from these two adapters is a cancellation the
+ * user drove (via Esc, or the card's own ⏹ stop button, which sends `^C`),
+ * and the suffix only names which flavour.
+ */
+const USER_ABORT_ERROR_CODE_PREFIXES: readonly string[] = [
+  'codex_turn_aborted',
+  'traex_turn_aborted',
+];
+
+/**
+ * Codes proving a NEWER input replaced this turn — not a user abort, but not
+ * something to alarm about either: the user just sent the follow-up that
+ * superseded it, and the new turn owns delivery from here.
+ *
+ * Kept apart from `USER_ABORT_ERROR_CODES` because the cause differs: nobody
+ * pressed stop. `grok-transcript.ts` states the intent directly — a `send_now`
+ * cancel maps to `ambiguous` "instead of a user-visible failed card".
+ *
+ * Only the `ambiguous` arm is affected: Grok reuses `grok_turn_cancelled` for
+ * OTHER cancellations with status `failed`, and a `failed` terminal always
+ * notifies (see below), so those keep their card.
+ */
+const SUPERSEDED_BY_NEWER_INPUT_ERROR_CODES: ReadonlySet<string> = new Set([
+  'grok_turn_cancelled',
+]);
+
+/** Whether this code marks a cancellation the user themselves caused. */
+function isUserAbortErrorCode(errorCode: string): boolean {
+  if (USER_ABORT_ERROR_CODES.has(errorCode)) return true;
+  const head = errorCode.split(':')[0];
+  return USER_ABORT_ERROR_CODE_PREFIXES.includes(head);
+}
+
+/**
  * Error codes proving the turn's input never reached the CLI. Nothing executed,
  * so re-sending duplicates no external side effect.
+ *
+ * ⚠️ The three `recovery_*` codes are deliberately NOT here. They describe the
+ * fate of an automatic CONTINUATION, but the retry button re-injects whatever
+ * `lastFailedTurn` holds — and that record is only written from `turn_terminal`,
+ * which the recovery-handoff failures never emit (`failOrdinaryImDelivery`
+ * returns straight after `requireOrdinaryTurnRecoveryAttention`; the enqueue
+ * failure only commits state and warns). So the record still points at the
+ * ORIGINAL turn, whose progress these codes say nothing about. Worse, the
+ * ladder only dispatches a continuation for `failed && retryable === true`, so
+ * the original turn is by construction a transient fault mid-work — exactly the
+ * case that must stay `caveated`.
  */
 const PRE_EXECUTION_ERROR_CODES: ReadonlySet<string> = new Set([
   'write_input_threw',
@@ -65,13 +121,6 @@ const PRE_EXECUTION_ERROR_CODES: ReadonlySet<string> = new Set([
   'raw_input_write_failed',
   'zmx_recovery_blocked_before_write',
   'terminal_bridge_unavailable',
-  // Both recovery-handoff failures are pre-execution by construction: the
-  // continuation was never accepted (enqueue) or never reached the worker
-  // (delivery, see failOrdinaryImDelivery). Note the deliberate ABSENCE of
-  // `recovery_dispatch_interrupted` — the daemon restarted mid-handoff, so the
-  // turn's execution state is genuinely unknown and must stay caveated.
-  'recovery_enqueue_failed',
-  'recovery_delivery_failed',
 ]);
 
 export interface TurnFailureNoticeInput {
@@ -82,17 +131,20 @@ export interface TurnFailureNoticeInput {
 /**
  * Whether this terminal deserves a user-visible failure notice.
  *
- * `failed` always qualifies. `ambiguous` qualifies unless it is a proven user
- * abort: `cli_exit`, `write_input_threw` and friends are invisible today (the
- * card silently returns to idle, indistinguishable from success), which is the
- * gap this predicate closes.
+ * `failed` always qualifies. `ambiguous` qualifies unless the turn ended for a
+ * reason the user already knows about: they stopped it themselves, or their own
+ * newer message superseded it. `cli_exit`, `write_input_threw` and friends are
+ * invisible today (the card silently returns to idle, indistinguishable from
+ * success), which is the gap this predicate closes.
  */
 export function shouldNotifyTurnFailure(turn: TurnFailureNoticeInput): boolean {
   if (turn.status === 'failed') return true;
   if (turn.status !== 'ambiguous') return false;
   // An abort with no code cannot be attributed to the user; surface the
   // unattributable case rather than swallowing it.
-  return turn.errorCode === undefined || !USER_ABORT_ERROR_CODES.has(turn.errorCode);
+  if (turn.errorCode === undefined) return true;
+  if (isUserAbortErrorCode(turn.errorCode)) return false;
+  return !SUPERSEDED_BY_NEWER_INPUT_ERROR_CODES.has(turn.errorCode);
 }
 
 /**
@@ -141,12 +193,16 @@ export function mayOfferTurnRetry(
  * re-teaching the model what it can already read. Verified in practice: a bare
  * "继续" is enough to get a CLI to pick up where it stopped.
  *
- * So this carries exactly the two things the transcript does NOT tell it:
+ * So this carries exactly the three things the transcript does NOT tell it:
  *  1. that the previous turn was cut off mid-flight (the transcript just ends —
- *     it cannot distinguish "interrupted" from "finished"), and
+ *     it cannot distinguish "interrupted" from "finished"),
  *  2. that work may already have landed, so completed side effects must not be
  *     repeated. This is the one instruction worth the tokens: it is the whole
- *     reason this is a continue rather than a replay.
+ *     reason this is a continue rather than a replay, and
+ *  3. that stopping to ask a human is the correct move when the checkpoint
+ *     cannot be established safely. Without this the model's only options are
+ *     to guess or to redo, and both can duplicate an external side effect —
+ *     which is the exact risk this prompt exists to bound.
  *
  * Also NOT reusing `ORDINARY_TURN_RECOVERY_PROMPT`: its first line asserts a
  * transient provider fault, which is false for the codes that land here
@@ -155,12 +211,26 @@ export function mayOfferTurnRetry(
  */
 export function buildTurnContinuePrompt(): string {
   return '[BOTMUX_CONTINUE] 上一轮被异常中断，可能已完成了一部分。'
-    + '请确认现场后从中断处继续，不要重复已完成的操作。';
+    + '请确认现场后从中断处继续，不要重复已完成的操作；'
+    + '无法安全判断则停下并请求人工决策。';
 }
 
-/** Test/introspection helpers. Copies, so callers cannot mutate the policy. */
+/** Test/introspection helpers. Copies, so callers cannot mutate the policy.
+ *
+ *  A test that iterates one of these is asserting "the members are handled
+ *  consistently" — NOT that the set is complete. Completeness has to be pinned
+ *  with literal codes taken from the producing adapter's own tests; iterating
+ *  the set under test cannot fail when a code is missing from it. */
 export function userAbortErrorCodes(): string[] {
   return [...USER_ABORT_ERROR_CODES];
+}
+
+export function userAbortErrorCodePrefixes(): string[] {
+  return [...USER_ABORT_ERROR_CODE_PREFIXES];
+}
+
+export function supersededByNewerInputErrorCodes(): string[] {
+  return [...SUPERSEDED_BY_NEWER_INPUT_ERROR_CODES];
 }
 
 export function preExecutionErrorCodes(): string[] {

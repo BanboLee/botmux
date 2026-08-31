@@ -23,6 +23,8 @@ import {
   turnRetryOffer,
   mayOfferTurnRetry,
   userAbortErrorCodes,
+  userAbortErrorCodePrefixes,
+  supersededByNewerInputErrorCodes,
   preExecutionErrorCodes,
   buildTurnContinuePrompt,
 } from '../src/services/turn-failure-notice.js';
@@ -60,11 +62,64 @@ describe('shouldNotifyTurnFailure', () => {
   });
 
   it('stays silent on a user-initiated abort', () => {
-    // The user pressed Esc. They know. A card here would be pure noise — and
-    // noise is the thing this feature is meant to reduce.
-    for (const errorCode of userAbortErrorCodes()) {
+    // The user pressed Esc (or the card's ⏹ stop button, which sends ^C). They
+    // know. A card here would be pure noise — the thing this feature reduces.
+    //
+    // LITERALS, not `userAbortErrorCodes()`. Iterating the set under test only
+    // proves its members are handled consistently; it cannot fail when a code
+    // is MISSING from it. Each literal below is copied from the producing
+    // adapter's own test, so this goes red if an adapter's real code stops
+    // being matched. That is exactly the gap that shipped: the two `:`-suffixed
+    // codes could never match an exact-match Set.
+    for (const errorCode of [
+      'pi_turn_aborted',                              // pi-transcript.test.ts
+      'omp_turn_aborted',                             // omp-transcript.test.ts
+      'rpc_turn_aborted',                             // vc-meeting-delivery-receiver.test.ts
+      'codex_turn_aborted:user_interrupt',            // codex-transcript.test.ts:677
+      'traex_turn_aborted:interrupted_by_user_unsafe', // traex-transcript.test.ts:430
+    ]) {
       expect(shouldNotifyTurnFailure({ status: 'ambiguous', errorCode })).toBe(false);
+      expect(turnRetryOffer({ status: 'ambiguous', errorCode })).toBe('none');
     }
+  });
+
+  it('matches a reason-suffixed abort on its prefix, not by startsWith', () => {
+    // The reason is free text normalised into the code, so the suffix cannot be
+    // enumerated — only the segment before `:` is stable. `startsWith` would be
+    // too loose: it would also swallow a sibling code that merely shares the
+    // stem, which is a different terminal we have no evidence about.
+    for (const prefix of userAbortErrorCodePrefixes()) {
+      expect(shouldNotifyTurnFailure({ status: 'ambiguous', errorCode: `${prefix}:anything` }))
+        .toBe(false);
+      expect(shouldNotifyTurnFailure({ status: 'ambiguous', errorCode: prefix })).toBe(false);
+      // Same stem, different code ⟹ must still surface.
+      expect(shouldNotifyTurnFailure({ status: 'ambiguous', errorCode: `${prefix}_by_policy` }))
+        .toBe(true);
+    }
+  });
+
+  it('stays silent when a newer input superseded the turn', () => {
+    // grok `send_now`: the user's own follow-up aborted the previous turn and
+    // the new turn owns delivery. grok-transcript.ts states the intent — this
+    // maps to ambiguous "instead of a user-visible failed card".
+    expect(shouldNotifyTurnFailure({ status: 'ambiguous', errorCode: 'grok_turn_cancelled' }))
+      .toBe(false);
+    // But Grok reuses the SAME code for other cancellations as `failed`, and a
+    // failed terminal always notifies. Suppressing that would delete a real
+    // alert, so the two arms must not collapse.
+    expect(shouldNotifyTurnFailure({ status: 'failed', errorCode: 'grok_turn_cancelled' }))
+      .toBe(true);
+  });
+
+  it('surfaces an unattributable abort rather than guessing', () => {
+    // `structured_turn_aborted` is codex-bridge-queue's `??` fallback for an
+    // abort carrying no code of its own ⟹ it means "cannot attribute", not
+    // "the user did it". Same rule as a missing code: surface, do not swallow.
+    expect(shouldNotifyTurnFailure({ status: 'ambiguous', errorCode: 'structured_turn_aborted' }))
+      .toBe(true);
+    // And it must not have been quietly filed under either silent bucket.
+    expect(userAbortErrorCodes()).not.toContain('structured_turn_aborted');
+    expect(supersededByNewerInputErrorCodes()).not.toContain('structured_turn_aborted');
   });
 
   it('notifies on an ambiguous terminal with no error code', () => {
@@ -110,19 +165,40 @@ describe('turnRetryOffer', () => {
     expect(turnRetryOffer({ status: 'failed', errorCode: 'pi_turn_error' })).toBe('caveated');
   });
 
-  it('treats both recovery-handoff failures as safe but a mid-handoff restart as caveated', () => {
-    // enqueue/delivery failures prove the continuation never ran. A daemon
-    // restart DURING the handoff proves nothing — the turn may have been
-    // executing — so it must not be advertised as safe.
-    expect(turnRetryOffer({ status: 'failed', errorCode: 'recovery_enqueue_failed' })).toBe('safe');
-    expect(turnRetryOffer({ status: 'failed', errorCode: 'recovery_delivery_failed' })).toBe('safe');
-    expect(turnRetryOffer({ status: 'failed', errorCode: 'recovery_dispatch_interrupted' }))
-      .toBe('caveated');
+  it('keeps all three recovery-handoff failures caveated', () => {
+    // None of these can be advertised as safe. They describe the fate of the
+    // automatic CONTINUATION, but the button re-injects `lastFailedTurn`, and
+    // that record is only written from `turn_terminal` — which the enqueue and
+    // delivery failures never emit. So it still points at the ORIGINAL turn,
+    // whose progress these codes say nothing about. The ladder only dispatches
+    // a continuation for `failed && retryable === true`, so that original turn
+    // is by construction a transient fault MID-WORK.
+    for (const errorCode of [
+      'recovery_enqueue_failed',
+      'recovery_delivery_failed',
+      'recovery_dispatch_interrupted',
+    ]) {
+      expect(turnRetryOffer({ status: 'failed', errorCode })).toBe('caveated');
+    }
+    // Belt and braces: none of them may sit in the pre-execution whitelist,
+    // which is what made two of them `safe`.
+    for (const errorCode of preExecutionErrorCodes()) {
+      expect(errorCode.startsWith('recovery_')).toBe(false);
+    }
   });
 
   it('never offers retry for something it would not even notify about', () => {
     expect(turnRetryOffer({ status: 'completed' })).toBe('none');
-    for (const errorCode of userAbortErrorCodes()) {
+    // Literals again — see the abort test above for why iterating the set is
+    // not enough on its own.
+    for (const errorCode of [
+      'pi_turn_aborted',
+      'omp_turn_aborted',
+      'rpc_turn_aborted',
+      'codex_turn_aborted:user_interrupt',
+      'traex_turn_aborted:interrupted_by_user_unsafe',
+      'grok_turn_cancelled',
+    ]) {
       expect(turnRetryOffer({ status: 'ambiguous', errorCode })).toBe('none');
     }
   });
@@ -147,11 +223,19 @@ describe('turnRetryOffer', () => {
     }
   });
 
-  it('the two policy whitelists do not overlap', () => {
-    // An abort code that also counted as pre-execution would make a silenced
-    // failure sprout a retry button — contradictory. Pin the disjointness.
-    const aborts = new Set(userAbortErrorCodes());
-    for (const code of preExecutionErrorCodes()) expect(aborts.has(code)).toBe(false);
+  it('the policy whitelists do not overlap', () => {
+    // A silenced code that also counted as pre-execution would make a silenced
+    // failure sprout a retry button — contradictory. Pin the disjointness
+    // across BOTH silent buckets, and across the prefix form too.
+    const silent = new Set([...userAbortErrorCodes(), ...supersededByNewerInputErrorCodes()]);
+    for (const code of preExecutionErrorCodes()) {
+      expect(silent.has(code)).toBe(false);
+      expect(userAbortErrorCodePrefixes()).not.toContain(code.split(':')[0]);
+    }
+    // The two silent buckets describe different causes and must stay distinct.
+    for (const code of supersededByNewerInputErrorCodes()) {
+      expect(userAbortErrorCodes()).not.toContain(code);
+    }
   });
 });
 
@@ -184,6 +268,17 @@ describe('buildTurnContinuePrompt', () => {
     // The other thing resume does not convey — and the entire reason this is a
     // continue rather than a verbatim replay. Worth its tokens.
     expect(buildTurnContinuePrompt()).toContain('不要重复已完成的操作');
+  });
+
+  it('tells the model to stop and ask a human when it cannot judge safely', () => {
+    // The third thing resume cannot convey, and the one that bounds the risk:
+    // without it the model's only options are to guess or to redo, and both can
+    // duplicate an external side effect. This assertion exists because the
+    // handler comment promised this clause while the prompt did not carry it —
+    // a promise in a comment that nothing pins is not a behaviour.
+    const p = buildTurnContinuePrompt();
+    expect(p).toContain('人工决策');
+    expect(p).toContain('无法安全判断');
   });
 
   it('does not claim a provider fault', () => {
