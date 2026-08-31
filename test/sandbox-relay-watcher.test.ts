@@ -81,6 +81,33 @@ describe('sandbox relay watcher host handoff', () => {
     }
   });
 
+  it('rejects a hand-written dispatch --into request at the watcher boundary', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-dispatch-into-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+    const fixture = join(root, 'should-not-run.mjs');
+    writeFileSync(fixture, `process.stdout.write('ran');`);
+    const id = 'dispatch-into-reject';
+    writeFileSync(join(outbox, `${id}.content`), 'task');
+    writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
+      command: 'dispatch',
+      contentFile: `${id}.content`,
+      flags: ['--bot-app', 'cli_target', '--into', 'om_other'],
+    }));
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-source', { cliPath: fixture });
+    try {
+      const responsePath = join(outbox, `${id}.res.json`);
+      await vi.waitFor(() => expect(existsSync(responsePath)).toBe(true), { timeout: 5_000 });
+      const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
+      expect(response.code).toBe(1);
+      expect(response.stdout).toBe('');
+      expect(response.stderr).toContain('dispatch flag not allowed: --into');
+    } finally {
+      stop();
+    }
+  });
+
   it('materializes prepared card bytes and passes only the private path to the host child', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-relay-watcher-'));
     roots.push(root);
