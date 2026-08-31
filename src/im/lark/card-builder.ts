@@ -6,6 +6,7 @@ import type { ZellijAdoptableSession } from '../../core/zellij-adopt-discovery.j
 import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js';
 import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
+import type { TurnRetryOffer } from '../../services/turn-failure-notice.js';
 import { t, type Locale } from '../../i18n/index.js';
 import { cardUsageFooterSegment, cardUsageRuntimeSegment, type CardUsageSnapshot } from './md-card.js';
 import { readGlobalConfig } from '../../global-config.js';
@@ -21,6 +22,18 @@ import {
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
+
+/** 流式卡片上下文占用百分比变色/高亮的缺省阈值（dashboard.contextCompactThreshold
+ *  缺省或非法时使用）。readGlobalConfig 自带 2s TTL 缓存，每次卡片构建调用成本极低。 */
+export const DEFAULT_CONTEXT_COMPACT_THRESHOLD = 80;
+
+/** 上下文占用百分比阈值：读 global-config 的 dashboard.contextCompactThreshold，
+ *  校验 finite 且 1..100，否则回退默认 80（与 readDashboard 的 lenient 读法一致）。 */
+export function contextCompactThreshold(): number {
+  const v = readGlobalConfig().dashboard?.contextCompactThreshold;
+  if (typeof v === 'number' && Number.isFinite(v) && v >= 1 && v <= 100) return Math.round(v);
+  return DEFAULT_CONTEXT_COMPACT_THRESHOLD;
+}
 
 /** 布尔字段按配置页的逻辑分组（与 dashboard 的 Bot Profiles 区块对应）。 */
 const CONFIG_CARD_BOOLEAN_GROUPS: ReadonlyArray<{ sec: string; keys: readonly string[] }> = [
@@ -285,6 +298,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'pi': 'Pi',
   'copilot': 'Copilot',
   'oh-my-pi': 'Oh My Pi',
+  'ebsd': 'ebsd',
   'kimi': 'Kimi',
   'grok': 'Grok Build',
   'kiro-cli': 'Kiro',
@@ -834,7 +848,7 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
 const PRIVATE_SNAPSHOT_TEXT_MAX = 50_000;
 
 const STREAM_TEMPLATE_MAP = {
-  starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', stalled: 'red', limited: 'red', retry_ready: 'green',
+  starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', stalled: 'red', limited: 'red', retry_ready: 'green', interrupted: 'orange',
 } as const;
 
 /** Header status label for a streaming/snapshot card. Shared by the live card
@@ -852,6 +866,7 @@ function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState 
     case 'limited': return usageLimit?.retryReady
       ? t('card.status.retry_ready', undefined, locale)
       : t('card.status.limited', undefined, locale);
+    case 'interrupted': return t('card.status.interrupted', undefined, locale);
   }
 }
 
@@ -947,6 +962,22 @@ export function buildStreamingCard(
   // ── Output body (shared with the private snapshot card) ──────────────────
   pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage });
 
+  // ── 上下文余量指示（header 之下、控制行之上的显著位置）────────────────────
+  // 数据来自 usage.context.percentUsed（worker-pool 的 getDaemonStreamingCardUsageSnapshot
+  // 算好传入）；无 contextWindow 数据（percentUsed 非有限数）时不渲染——优雅降级。
+  const contextPct = usage?.context?.percentUsed;
+  const hasContextPct = typeof contextPct === 'number' && Number.isFinite(contextPct);
+  if (hasContextPct) {
+    const pct = Math.min(100, Math.round(contextPct));
+    const overThreshold = pct >= contextCompactThreshold();
+    elements.push({
+      tag: 'markdown',
+      content: overThreshold
+        ? `<font color='red'>⚠️ ${t('card.context.over_threshold', { pct }, locale)}</font>`
+        : `<font color='grey'>📊 ${t('card.context.indicator', { pct }, locale)}</font>`,
+    });
+  }
+
   // ── Main control row: display toggle, mode toggle, terminal, manage ─────
   const headerActions: any[] = [];
 
@@ -996,6 +1027,31 @@ export function buildStreamingCard(
       text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
       type: 'default',
       value: { action: 'get_write_link', ...actionBase },
+    });
+  }
+  // 「🗜️ 压缩」：仅在有上下文占用数据时出现（无 contextWindow 的 CLI 优雅降级为不渲染）。
+  // 点击走 card-handler 的 compact_session → daemon 的 deliverPassthroughToExistingSession
+  // （raw_input 透传 /compact，含完整 turn 生命周期），不新造压缩逻辑。
+  if (hasContextPct) {
+    headerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.compact', undefined, locale) },
+      type: 'default' as const,
+      value: { action: 'compact_session', ...actionBase },
+    });
+  }
+  // 「⏹ 停止」：常驻主控制行（不再受 displayMode==='hidden' 折叠态限制——折叠态是 turn
+  // 跑飞时用户唯一可见的一行，此前只能 /close 杀整个会话丢上下文）。点击走已有的
+  // term_action ctrlc IPC 链路（与展开态 ^C 快捷键完全同款），中断当前 turn 但保留会话。
+  // 仅在有 turn 可停的状态显示：idle 无 turn 可停；starting CLI 未起；limited turn 已失败。
+  // remote CLI（riff/mojo）无终端可驱动、codex-app 无 PTY 输入通道，均隐藏。
+  if (!isRemoteCliId(cliId) && effectiveCliId !== 'codex-app'
+    && (status === 'working' || status === 'analyzing' || status === 'stalled')) {
+    headerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.stop', undefined, locale) },
+      type: 'default' as const,
+      value: { action: 'stop_turn', ...actionBase },
     });
   }
   if (adoptMode) {
@@ -1695,6 +1751,150 @@ export function buildAdoptBlockedCard(rootId: string, sessionId: string, cliId: 
     ],
   };
   return JSON.stringify(card);
+}
+
+export interface TurnFailedCardOpts {
+  rootId: string;
+  sessionId: string;
+  cliId: CliId | undefined;
+  cliName: string;
+  /** `ambiguous` softens the title: the turn may have run, we just can't tell. */
+  status: 'failed' | 'ambiguous';
+  errorCode?: string;
+  /** Human-safe failure summary from the CLI, when it provided one. */
+  reason?: string;
+  failedAt?: Date;
+  /** The user's own prompt, for "which task was this". Truncated + escaped. */
+  task?: string;
+  /** Auto-continuation count, when a recovery ladder ran and gave up. */
+  continuations?: number;
+  /** Retry affordance, decided by `turnRetryOffer` — the handler enforces the
+   *  same policy, so `none` must not render a button. */
+  retryOffer: TurnRetryOffer;
+  /** Pins the button to one specific failed turn; a stale card fails closed. */
+  retryTurnId?: string;
+  /** Human to @-mention in the body. Omitted → no mention (never @ a bot). */
+  mentionOpenId?: string;
+  terminalUrl?: string;
+  locale?: Locale;
+}
+
+/** 通用失败卡：一条失败通知同时承载「现在什么情况」与「可以怎么办」。
+ *
+ *  取代原先的纯文本通知（`worker.ordinary_recovery_*` / `claude_terminal_failure_unrecovered`），
+ *  并覆盖此前**完全静默**的 `ambiguous` 终态（CLI 崩溃 / 写入失败）——那类失败过去与
+ *  「正常干完」在用户眼里同形。
+ *
+ *  三条刻意的设计约束：
+ *  1. **errorCode 原样打出**。`ordinary_recovery_non_retryable` 是无条件兜底分支，
+ *     daemon 重启这类非模型错误也会落到那句「不能安全自动续跑」；把码摊开才能让
+ *     这种混淆可见，而不是继续被文案糊住。
+ *  2. **重试的副作用风险必须写在卡上**。`caveated` 时明说「可能已执行了一部分」——
+ *     `/retry` 是原样重发，不像自动续跑会带 checkpoint 提示。
+ *  3. **@人只在正文**（`lark_md`）。`plain_text` 标题会被 {@link plainTitle} 剥掉
+ *     `<at>`，放那儿等于不 @。 */
+export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
+  const { locale } = o;
+  const actionBase = {
+    root_id: o.rootId,
+    session_id: o.sessionId,
+    cli_id: o.cliId ?? 'claude-code',
+  };
+  const titleKey = o.status === 'ambiguous'
+    ? 'card.turn_failed.title_ambiguous'
+    : 'card.turn_failed.title';
+
+  const lines: string[] = [];
+  // 先 @ 人再讲事：飞书的通知摘要只取前一段，@ 放最后会被截掉。
+  if (o.mentionOpenId) lines.push(`<at id=${o.mentionOpenId}></at>`);
+  // errorCode 是闭集常量（`cli_exit` / `provider_*` / `codexTaskFailureCode` 的
+  // 固定返回值），从不携带 provider 原文，所以用反引号包成行内代码而不是
+  // escapeMd —— 后者会把 `a_b_c` 里的下划线转义成可见的反斜杠，正是这类码最常
+  // 见的形态。仍然剥掉反引号与尖括号，避免任何一天码变成动态值时逃出代码段。
+  lines.push(t('card.turn_failed.field_error', {
+    errorCode: `\`${(o.errorCode ?? o.status).replace(/[`<>]/g, '')}\``,
+  }, locale));
+  if (o.reason) {
+    lines.push(t('card.turn_failed.reason', { reason: escapeMd(o.reason) }, locale));
+  }
+  if (o.failedAt) {
+    lines.push(t('card.turn_failed.field_when', {
+      when: o.failedAt.toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { hour12: false }),
+    }, locale));
+  }
+  if (o.task) {
+    const trimmed = o.task.length > 80 ? `${o.task.slice(0, 80)}…` : o.task;
+    lines.push(t('card.turn_failed.field_task', { task: escapeMd(trimmed) }, locale));
+  }
+  if (o.continuations !== undefined && o.continuations > 0) {
+    lines.push(t('card.turn_failed.field_continuations', {
+      count: String(o.continuations),
+    }, locale));
+  }
+
+  const elements: any[] = [
+    { tag: 'markdown', content: lines.join('\n') },
+    { tag: 'hr' },
+  ];
+
+  // 重试建议与按钮由同一个 retryOffer 决定，避免「卡上说能重试但按钮不给」。
+  const canRetry = o.retryOffer !== 'none' && !!o.retryTurnId;
+  const adviceKey = o.retryOffer === 'none'
+    ? 'card.turn_failed.no_retry'
+    : !o.retryTurnId
+      ? 'card.turn_failed.no_input'
+      : o.retryOffer === 'safe'
+        ? 'card.turn_failed.retry_safe'
+        : 'card.turn_failed.retry_caveated';
+  elements.push({ tag: 'markdown', content: t(adviceKey, undefined, locale) });
+
+  const actions: any[] = [];
+  if (canRetry) {
+    actions.push({
+      tag: 'button',
+      text: {
+        tag: 'plain_text',
+        // 语义跟着动作走：没跑过 = 重试（重发原话）；跑过一半 = 继续（读现场后
+        // 从 checkpoint 接着做）。文案说错会让用户对副作用风险判断错。
+        content: t(
+          o.retryOffer === 'safe' ? 'card.btn.retry_turn' : 'card.btn.continue_turn',
+          undefined,
+          locale,
+        ),
+      },
+      // caveated 用 default 而不是 primary：可能重复副作用的操作不该是视觉默认项。
+      type: o.retryOffer === 'safe' ? 'primary' : 'default',
+      value: {
+        action: 'retry_turn',
+        turn_id: o.retryTurnId,
+        // handler 据此决定提交「原话」还是「续跑指令」。渲染与执行读同一个
+        // retryOffer，卡上写的语义就是真正会发生的事。
+        mode: o.retryOffer === 'safe' ? 'resend' : 'continue',
+        ...actionBase,
+      },
+    });
+  }
+  if (o.terminalUrl) {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
+      type: 'default',
+      multi_url: terminalMultiUrl(o.terminalUrl),
+    });
+  }
+  if (actions.length > 0) elements.push({ tag: 'action', actions });
+
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: {
+      title: {
+        tag: 'plain_text',
+        content: t(titleKey, { cliName: plainTitle(o.cliName) }, locale),
+      },
+      template: 'red',
+    },
+    elements,
+  });
 }
 
 /** 授权处置后的终态卡（无按钮，防重复点击）。 */

@@ -3,7 +3,7 @@
  * Extracted from daemon.ts for modularity.
  */
 import { execSync, type ChildProcess } from 'node:child_process';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -26,11 +26,11 @@ import {
   markMessageListenerRunPreviewRunning,
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
-import { spawnWorker } from './self-spawn.js';
+import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel } from './session-model.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
-import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
@@ -100,6 +100,7 @@ import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
+import { resolvePricingConfig, type ResolvedModelPricing } from '../services/model-pricing.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
@@ -112,6 +113,12 @@ const DAEMON_BOOT_ID = randomUUID();
 const restartCoordinator = new RestartCoordinator();
 const lifecycleRetiringWorkers = new WeakMap<DaemonSession, Set<ChildProcess>>();
 const transferRetiringWorkers = new WeakSet<ChildProcess>();
+
+/** 从 bot 配置解析定价（bots.json pricing 块 → 内置表）。未配置时返回 undefined。 */
+function resolvePricingForBot(larkAppId?: string): ResolvedModelPricing | undefined {
+  if (!larkAppId) return undefined;
+  return resolvePricingConfig(getBot(larkAppId)?.config?.pricing);
+}
 
 /** 在完整 Worker 模块加载前接住首条 IPC，避免冷启动耗时被误判为投递失败。 */
 function workerForkExecArgv(): string[] {
@@ -280,6 +287,8 @@ export function getDaemonSessionUsageSnapshot(
       // card refreshes on every status tick and rides the reader's reparse
       // throttle instead (fresh:false) to stay off the disk.
       fresh: opts?.fresh ?? true,
+      // 定价覆盖：从 bot 配置解析，未配置时 undefined（costCny 缺省）。
+      pricing: resolvePricingForBot(ds.larkAppId ?? ds.session.larkAppId),
     });
   } catch (error) {
     logger.warn(
@@ -378,6 +387,7 @@ import {
   requireOrdinaryTurnRecoveryAttention,
   type OrdinaryTurnRecoveryDispatch,
 } from '../services/ordinary-turn-recovery.js';
+import { turnRetryOffer, shouldNotifyTurnFailure } from '../services/turn-failure-notice.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
@@ -1250,6 +1260,54 @@ function ordinaryTurnRecoveryWarning(
   return tr('worker.ordinary_recovery_non_retryable', undefined, locale);
 }
 
+/** 构造一张通用失败卡。两条通知路径（recovery warn / claude 终态兜底）共用它，
+ *  以免同一件事在两处长得不一样。
+ *
+ *  重试按钮只在 `lastFailedTurn` 与本次失败**同一轮**时出现：那条记录是按钮的
+ *  一次性凭据（handler 用 turnId 逐字比对），没有它就只剩「去看 Web 终端」。
+ *  记录缺失是正常情况——turn 在 prompt 被 wrap 前就死掉时 buildFailedTurnRecord
+ *  返回 undefined。 */
+function buildSessionTurnFailedCard(
+  ds: DaemonSession,
+  opts: {
+    status: 'failed' | 'ambiguous';
+    errorCode?: string;
+    reason?: string;
+    continuations?: number;
+    retryable?: boolean;
+  },
+): string {
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const failedTurn = ds.session.lastFailedTurn;
+  const offer = turnRetryOffer({
+    status: opts.status,
+    ...(opts.errorCode !== undefined ? { errorCode: opts.errorCode } : {}),
+    ...(opts.retryable !== undefined ? { retryable: opts.retryable } : {}),
+  });
+  // 没有真人 footer 收件人时才回退 @ bot 管理员（与失败兜底通知同口径，且
+  // 绝不 @ bot——那会触发对方新一轮）。
+  const mentionOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId)
+    ?? failureNoticeFallbackMentionOpenId(ds);
+  return buildTurnFailedCard({
+    rootId: sessionAnchorId(ds),
+    sessionId: ds.session.sessionId,
+    cliId: effectiveCliId,
+    cliName: sessionRuntimeDisplayName(ds) ?? getCliDisplayName(effectiveCliId),
+    status: opts.status,
+    ...(opts.errorCode !== undefined ? { errorCode: opts.errorCode } : {}),
+    ...(opts.reason !== undefined ? { reason: opts.reason } : {}),
+    failedAt: new Date(),
+    ...(failedTurn?.userPrompt !== undefined ? { task: failedTurn.userPrompt } : {}),
+    ...(opts.continuations !== undefined ? { continuations: opts.continuations } : {}),
+    retryOffer: offer,
+    ...(failedTurn ? { retryTurnId: failedTurn.turnId } : {}),
+    ...(mentionOpenId ? { mentionOpenId } : {}),
+    terminalUrl: readableTerminalUrlFor(ds),
+    locale: localeForBot(ds.larkAppId),
+  });
+}
+
 /** Attach the crash-safe timer owner for one eligible ordinary Claude/Lark
  * session. Session state is persisted; this runtime registry only owns timers. */
 export function ensureOrdinaryTurnRecoveryAttached(
@@ -1301,8 +1359,16 @@ export function ensureOrdinaryTurnRecoveryAttached(
       });
       void requireCallbacks().sessionReply(
         sessionAnchorId(ds),
-        warning,
-        'text',
+        buildSessionTurnFailedCard(ds, {
+          status: 'failed',
+          ...(state.lastErrorCode !== undefined ? { errorCode: state.lastErrorCode } : {}),
+          // recovery 走到 warn 一定是「自动续跑救不回来」，把已试次数摊给用户，
+          // 免得他以为系统什么都没做。
+          continuations: state.continuationsStarted,
+          // 这条路径的 retryable 已经在 coordinator 里判过并否掉了（否则不会
+          // warn），所以按钮的安全性交给 errorCode 白名单判断，不再谎称 safe。
+        }),
+        'interactive',
         ds.larkAppId,
         state.logicalTurnId,
       ).catch(err => logger.error(
@@ -6292,7 +6358,11 @@ const transferInputGates = new WeakMap<DaemonSession, TransferInputGate>();
 // cannot forge an option that bypasses the transfer gate.
 const transferReplacementForkBypass = new WeakSet<DaemonSession>();
 
-const ORDINARY_IM_RECEIPT_TIMEOUT_MS = 2_000;
+// IPC transport and worker acknowledgement are separate stages. A transport
+// timeout may retry because the parent never confirmed enqueue; an ACK timeout
+// is only a delayed/ambiguous state because the child may still execute later.
+const ORDINARY_IM_TRANSPORT_TIMEOUT_MS = 2_000;
+const ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS = 2_000;
 const ORDINARY_IM_MAX_ATTEMPTS = 2;
 
 type OrdinaryImDelivery = {
@@ -6303,6 +6373,9 @@ type OrdinaryImDelivery = {
   message: Extract<DaemonToWorker, { type: 'message' | 'init' }>;
   turnId: string;
   attempt: number;
+  received: boolean;
+  transportConfirmed: boolean;
+  delayNotified: boolean;
   timer?: ReturnType<typeof setTimeout>;
 };
 
@@ -6328,7 +6401,12 @@ function clearOrdinaryImDeliveryTimer(record: OrdinaryImDelivery): void {
   record.timer = undefined;
 }
 
-function failOrdinaryImDelivery(record: OrdinaryImDelivery, reason: string): void {
+function failOrdinaryImDelivery(
+  record: OrdinaryImDelivery,
+  reason: string,
+  messageKey: 'worker.input_delivery_failed' | 'worker.input_retired_unconfirmed'
+    = 'worker.input_delivery_failed',
+): void {
   if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
   clearOrdinaryImDelivery(record);
   logger.error(
@@ -6355,12 +6433,47 @@ function failOrdinaryImDelivery(record: OrdinaryImDelivery, reason: string): voi
   const loc = botLocale(getBot(record.ds.larkAppId).config);
   void requireCallbacks().sessionReply(
     sessionAnchorId(record.ds),
-    tr('worker.input_delivery_failed', { turnId: record.turnId.substring(0, 16) }, loc),
+    tr(messageKey, { turnId: record.turnId.substring(0, 16) }, loc),
     'text',
     record.ds.larkAppId,
     record.turnId,
   ).catch(err => logger.error(
     `[${tag(record.ds)}] Failed to report ordinary IM worker delivery failure: `
+    + `${err instanceof Error ? err.message : String(err)}`,
+  ));
+}
+
+function delayOrdinaryImDelivery(record: OrdinaryImDelivery): void {
+  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
+  // A delayed notice is only an intermediate status. Keep the delivery record
+  // so a later explicit rejection or worker exit can still produce the real
+  // terminal outcome instead of silently dropping the turn after telling the
+  // user not to resend it.
+  clearOrdinaryImDeliveryTimer(record);
+  if (record.delayNotified) return;
+  record.delayNotified = true;
+  logger.warn(
+    `[${tag(record.ds)}] Ordinary IM input is still waiting for the worker after IPC enqueue `
+    + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} `
+    + `attempt=${record.attempt}`,
+  );
+  if (
+    record.turnId.startsWith('bmx-recovery-')
+    || isMeetingDrivenTurn(record.ds, record.turnId)
+    || isSilentScheduledTurn(record.ds, record.turnId)
+  ) return;
+  const loc = botLocale(getBot(record.ds.larkAppId).config);
+  const messageKey = record.received
+    ? 'worker.input_commit_delayed'
+    : 'worker.input_delivery_delayed';
+  void requireCallbacks().sessionReply(
+    sessionAnchorId(record.ds),
+    tr(messageKey, { turnId: record.turnId.substring(0, 16) }, loc),
+    'text',
+    record.ds.larkAppId,
+    record.turnId,
+  ).catch(err => logger.error(
+    `[${tag(record.ds)}] Failed to report delayed ordinary IM worker delivery: `
     + `${err instanceof Error ? err.message : String(err)}`,
   ));
 }
@@ -6399,18 +6512,31 @@ function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
 
   if (record.timer) clearTimeout(record.timer);
   record.timer = undefined;
+  record.received = false;
+  record.transportConfirmed = false;
   const attempt = ++record.attempt;
+  record.timer = setTimeout(() => {
+    retryOrFailOrdinaryImDelivery(record, 'ipc_callback_timeout');
+  }, ORDINARY_IM_TRANSPORT_TIMEOUT_MS);
+  record.timer.unref?.();
   try {
     record.worker.send(record.message, (err) => {
       if (pendingOrdinaryImDeliveries.get(record.key) !== record || record.attempt !== attempt) return;
+      if (record.received) return;
       if (err) {
         retryOrFailOrdinaryImDelivery(record, `ipc_callback:${err.message}`);
         return;
       }
+      record.transportConfirmed = true;
+      clearOrdinaryImDeliveryTimer(record);
       logger.info(
         `[${tag(record.ds)}] Ordinary IM input enqueued to worker IPC `
         + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} attempt=${attempt}`,
       );
+      record.timer = setTimeout(() => {
+        delayOrdinaryImDelivery(record);
+      }, ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS);
+      record.timer.unref?.();
     });
   } catch (err) {
     queueMicrotask(() => retryOrFailOrdinaryImDelivery(
@@ -6418,16 +6544,6 @@ function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
       `ipc_throw:${err instanceof Error ? err.message : String(err)}`,
     ));
     return true;
-  }
-
-  // The worker ACKs synchronously when its IPC handler claims the exact turn.
-  // Slow CLI startup/processing therefore does not extend this transport-only
-  // timeout; the later committed ACK retains input-queue semantics.
-  if (pendingOrdinaryImDeliveries.get(record.key) === record) {
-    record.timer = setTimeout(() => {
-      retryOrFailOrdinaryImDelivery(record, 'receipt_timeout');
-    }, ORDINARY_IM_RECEIPT_TIMEOUT_MS);
-    record.timer.unref?.();
   }
   return true;
 }
@@ -6452,6 +6568,9 @@ function sendOrdinaryImDeliveryTracked(
     message,
     turnId,
     attempt: 0,
+    received: false,
+    transportConfirmed: false,
+    delayNotified: false,
   };
   pendingOrdinaryImDeliveries.set(key, record);
   return sendOrdinaryImDeliveryAttempt(record);
@@ -6485,7 +6604,14 @@ function acknowledgeOrdinaryImDeliveryReceipt(
   const key = ordinaryImDeliveryKey(ds, turnId, workerGeneration);
   const record = pendingOrdinaryImDeliveries.get(key);
   if (!record) return;
-  clearOrdinaryImDeliveryTimer(record);
+  if (!record.received) {
+    record.received = true;
+    clearOrdinaryImDeliveryTimer(record);
+    record.timer = setTimeout(() => {
+      delayOrdinaryImDelivery(record);
+    }, ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS);
+    record.timer.unref?.();
+  }
   logger.info(
     `[${tag(ds)}] Ordinary IM input received by worker `
     + `turn=${turnId.substring(0, 16)} generation=${workerGeneration} attempt=${record.attempt}`,
@@ -6502,6 +6628,21 @@ function completeOrdinaryImDelivery(
   if (record) clearOrdinaryImDelivery(record);
 }
 
+/** A retiring worker's late COMMIT ACK settles only the deliveries tracked
+ * against that exact worker object. The record's own worker identity is the
+ * authority here — deliberately NOT ds.worker/ds.workerGeneration, which have
+ * already moved on (suspend nulls the worker; a replacement fork advances the
+ * generation) by the time the ACK drains from the old child. Receipt ACKs are
+ * deliberately excluded: a stale receipt is not settlement-grade — the turn
+ * can still die unexecuted with the old worker, and swallowing the pending
+ * timers on it would silence the original generation's visible failure. */
+function completeStaleWorkerOrdinaryImDelivery(worker: ChildProcess, turnId: string): void {
+  for (const record of pendingOrdinaryImDeliveries.values()) {
+    if (record.worker !== worker || record.turnId !== turnId) continue;
+    clearOrdinaryImDelivery(record);
+  }
+}
+
 function rejectOrdinaryImDelivery(
   ds: DaemonSession,
   turnId: string,
@@ -6514,9 +6655,38 @@ function rejectOrdinaryImDelivery(
   retryOrFailOrdinaryImDelivery(record, `worker_rejected:${reason}`);
 }
 
-function abandonOrdinaryImDeliveriesForWorker(worker: ChildProcess): void {
+function settleOrdinaryImDeliveriesForWorker(
+  worker: ChildProcess,
+  options: {
+    suppressAllFailures: boolean;
+    startupOwnedTurnId?: string;
+    retiredBeforeCommit?: boolean;
+  },
+): void {
   for (const record of pendingOrdinaryImDeliveries.values()) {
-    if (record.worker === worker) clearOrdinaryImDelivery(record);
+    if (record.worker !== worker) continue;
+    if (options.suppressAllFailures || record.turnId === options.startupOwnedTurnId) {
+      // A record still pending here means the daemon never observed the
+      // commit ACK — but a fire-and-forget ACK can also be lost when the old
+      // child exits right after sending it, so this does NOT prove the turn
+      // never entered the CLI. A deliberate lifecycle retirement (suspend /
+      // worker replacement) must not turn that into silence, and must not
+      // claim certainty either: report an honest unconfirmed outcome that
+      // asks the user to check the session before resending. Transfer, close
+      // and plain kill keep silent settling.
+      if (options.retiredBeforeCommit) {
+        failOrdinaryImDelivery(record, 'worker_retired_before_commit', 'worker.input_retired_unconfirmed');
+        continue;
+      }
+      clearOrdinaryImDelivery(record);
+      continue;
+    }
+    const reason = record.received
+      ? 'worker_exited_after_receipt'
+      : record.transportConfirmed
+        ? 'worker_exited_after_ipc_enqueue'
+        : 'worker_exited_before_ipc_enqueue';
+    failOrdinaryImDelivery(record, reason);
   }
 }
 
@@ -10246,6 +10416,17 @@ function setupWorkerHandlers(
     // installed; never let those stale events mutate the replacement's cards,
     // tokens, readiness, transcript metadata, or durable turn state.
     if (ds.worker !== worker) {
+      // A retiring worker's own COMMIT ACK still settles the ordinary
+      // deliveries tracked against THAT worker object: suspend detaches
+      // ds.worker and a replacement advances the generation BEFORE the old
+      // child's fire-and-forget ACKs drain, so without this the exit
+      // settlement would report an already-committed turn as unconfirmed.
+      // Only the commit ACK is settlement-grade; a stale receipt proves
+      // nothing about execution and must keep the visible-failure timers
+      // running. Stale workers gain no other authority.
+      if (msg.type === 'turn_input_committed') {
+        completeStaleWorkerOrdinaryImDelivery(worker, msg.turnId);
+      }
       logger.debug(`[${t}] Ignored stale worker message: ${msg.type}`);
       return;
     }
@@ -12142,11 +12323,28 @@ function setupWorkerHandlers(
           }
         }
 
-        if (isClaudeProviderFailure
+        // 失败通知的 Lark 出口。原先只覆盖 claude 的 `provider_*` 终态，导致两个
+        // 缺口：
+        //  1. 结构化 CLI（codex/pi/…）的 `ambiguous` 终态——CLI 进程挂了、输入没
+        //     写进去——**一条消息都不发**（Channel B 的 gate 只放 `failed`），
+        //     卡片悄悄回到「等待输入」，与「正常干完」在用户眼里完全同形。
+        //  2. claude 的通知是纯文本，没有可操作入口。
+        // 现在统一走失败卡。仍然刻意**不**碰已经有可见卡片的路径：`failed` 的
+        // 结构化终态由 Channel B 的 final_output 卡承载（还带半截答案），在这里
+        // 再发一张就是重复通知。
+        const structuredFailedOwnsNotice = !isClaudeProviderFailure && msg.status === 'failed';
+        const shouldPostFailureCard = shouldNotifyTurnFailure({
+          status: msg.status,
+          ...(msg.errorCode !== undefined ? { errorCode: msg.errorCode } : {}),
+        })
+          && !structuredFailedOwnsNotice
           && !nonLarkFailureHandled
           && !recoveryHandled
-          && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
+        if (shouldPostFailureCard) {
           const failureCode = msg.errorCode ?? msg.status;
+          // agentAttention / dashboard「需要你」仍用纯文本摘要：那一列渲染的是
+          // 文本，不是卡片。
           const warning = tr(
             'worker.claude_terminal_failure_unrecovered',
             { errorCode: failureCode },
@@ -12160,10 +12358,18 @@ function setupWorkerHandlers(
             turnId: msg.turnId,
           });
           try {
-            await scopedReply(warning, 'text', msg.turnId);
+            await scopedReply(
+              buildSessionTurnFailedCard(ds, {
+                status: msg.status === 'ambiguous' ? 'ambiguous' : 'failed',
+                ...(msg.errorCode !== undefined ? { errorCode: msg.errorCode } : {}),
+                ...(msg.retryable !== undefined ? { retryable: msg.retryable } : {}),
+              }),
+              'interactive',
+              msg.turnId,
+            );
           } catch (err) {
             logger.error(
-              `[${t}] Failed to deliver Claude terminal failure warning: `
+              `[${t}] Failed to deliver turn failure card: `
               + `${err instanceof Error ? err.message : String(err)}`,
             );
           }
@@ -12748,8 +12954,28 @@ function setupWorkerHandlers(
   });
 
   worker.on('exit', (code, signal) => {
-    abandonOrdinaryImDeliveriesForWorker(worker);
     const transferRetirement = transferRetiringWorkers.has(worker);
+    const lifecycleRetirement = lifecycleRetiringWorkers.get(ds)?.has(worker) === true;
+    const preReadyExit = !startupState.ready;
+    const suppressDeliveryFailure = transferRetirement
+      || lifecycleRetirement
+      || worker.killed
+      || ds.session.status === 'closed';
+    settleOrdinaryImDeliveriesForWorker(worker, {
+      suppressAllFailures: suppressDeliveryFailure,
+      // The startup failure path owns only the initial cold-start turn. Any
+      // concurrent follow-up has its own user-visible delivery contract and
+      // must not disappear behind the init turn's single failure notice.
+      startupOwnedTurnId: !suppressDeliveryFailure && preReadyExit
+        ? startupState.initTurnId
+        : undefined,
+      // A deliberate retirement suppresses the misleading crash/ambiguity
+      // notices, but a tracked turn that never committed still owes the user
+      // a terminal outcome: it will never run and nothing redelivers it.
+      retiredBeforeCommit: lifecycleRetirement
+        && !transferRetirement
+        && ds.session.status !== 'closed',
+    });
     transferRetiringWorkers.delete(worker);
     clearLifecycleRetirement(ds, worker);
     logger.info(`[${t}] Worker process exited (code: ${code})`);
@@ -12757,7 +12983,14 @@ function setupWorkerHandlers(
     // happen before the worker sends either ready or a structured error.  Do
     // not leave the originating Lark message unanswered. Intentional close /
     // replacement kills are excluded to avoid noisy false alarms.
-    if (!transferRetirement && !startupState.ready && !startupState.failureNotified && !worker.killed && ds.session.status !== 'closed') {
+    if (
+      !transferRetirement
+      && !lifecycleRetirement
+      && preReadyExit
+      && !startupState.failureNotified
+      && !worker.killed
+      && ds.session.status !== 'closed'
+    ) {
       const reason = tr('worker.start_exited_early', { code: code ?? 'null' }, loc);
       // Carry the frozen init attribution so an abrupt pre-ready exit of a
       // durable VC delivery is fenced to the receipt/lease chain, not replied
@@ -13272,7 +13505,24 @@ function deliverFinalOutput(
           }
         : undefined;
       let visibleAssistantText = msg.content;
-      if (!imOrigin
+      // A listener-chat @mention is a direct human IM turn. Its normal sink is
+      // already plain text, but an existing receiver context may have taught
+      // the model the automatic delivery's decision envelope. Do not expose
+      // that internal protocol to the human; recover its user-visible content
+      // when the stale envelope is valid. (The trusted per-turn instruction
+      // added by the daemon prevents new turns from producing it.)
+      if (imOrigin) {
+        const directImControlledOutput = parseVcMeetingListenerOutput(msg.content);
+        if (directImControlledOutput.ok) {
+          visibleAssistantText = directImControlledOutput.decision === 'publish'
+            ? directImControlledOutput.content
+            : '本次没有生成可展示的答复，请重新提问。';
+          logger.warn(
+            `[${t}] VC listener IM reply recovered stale control envelope `
+            + `turn=${msg.turnId.substring(0, 8)} decision=${directImControlledOutput.decision}`,
+          );
+        }
+      } else if (!imOrigin
         && listenerOutputOwner
         && msg.dispatchAttempt !== undefined
         && listenerOutputProtocol === 'decision_v1') {
@@ -13975,6 +14225,20 @@ export function listProcesses(): ProcSnapshot[] {
 }
 
 /**
+ * This executable's absolute, symlink-resolved path.
+ *
+ * `process.execPath` is already absolute and kernel-resolved, so this is normally
+ * a no-op; realpath is applied anyway so a comparison against a `/proc` argv[0]
+ * cannot be defeated by the daemon having been started through a symlink (a
+ * released install commonly sits behind `~/.botmux/bin/botmux`). Falls back to the
+ * raw value when the path cannot be resolved — a failed realpath must not turn the
+ * reaper into a no-op.
+ */
+function canonicalExecPath(): string {
+  try { return realpathSync(process.execPath); } catch { return process.execPath; }
+}
+
+/**
  * Reap worker processes orphaned by a previous daemon that died WITHOUT running
  * its graceful shutdown — SIGKILL, OOM, or an uncaught crash. The shutdown()
  * path in daemon.ts already SIGKILLs stragglers on SIGTERM, but a hard kill
@@ -14004,12 +14268,59 @@ export function reapOrphanWorkers(opts: {
   if (process.platform === 'win32') return 0;
   const procs = opts.procs ?? listProcesses();
   const kill = opts.kill ?? ((pid, signal) => { process.kill(pid, signal); });
-  const workerPath = opts.workerPath ?? join(__dirname, '..', 'worker.js');
+  // How THIS install's workers appear in a command line.
+  //
+  // Node: `<node> <dist>/worker.js` — the script path identifies the install.
+  //
+  // ⚠️ Compiled single-file binary: there IS no worker.js on disk. spawnWorker()
+  // launches `<binary> __worker` (see src/core/self-spawn.ts), while
+  // `join(__dirname,'..','worker.js')` evaluates to `/$bunfs/worker.js` — a
+  // process-private virtual path that appears in NO command line. MEASURED: a real
+  // compiled worker's cmdline is `<binary> __worker`, so the old predicate matched
+  // nothing and orphans were NEVER reaped in the compiled form. That is the failure
+  // this function exists to prevent: each orphan leaks ~0.5 GB and they accumulate
+  // across restarts (daemon.ts records an 841-orphan / ~65 GB incident).
+  //
+  // The compiled predicate must keep the SAME conservatism the worker.js path had:
+  // it identified this install by an ABSOLUTE path, so another botmux install's
+  // orphans could never match. A basename-only check loses that — every released
+  // install names its binary `botmux`, so install A would reap install B's
+  // orphans (verified: with a same-named binary at a different absolute path, a
+  // basename check reaps it).
+  //
+  // So match on the absolute path when the command line carries one. That is the
+  // normal case for OUR workers: spawnWorker launches them via
+  // `resolveEntrySpawn` → `process.execPath`, which the kernel has already
+  // resolved to an absolute path (MEASURED in /proc/<pid>/cmdline:
+  // `/…/botmux-linux-x64 __worker`). Only a RELATIVE argv[0] — a binary started
+  // by a bare PATH lookup, which our own spawns never produce — falls back to the
+  // basename, where cross-install ambiguity is unavoidable but the process was
+  // also not started the way we start ours.
+  const standalone = isStandaloneBinary();
+  const workerPath = opts.workerPath ?? (standalone ? undefined : join(__dirname, '..', 'worker.js'));
+  const selfBinary = standalone ? canonicalExecPath() : '';
+  const selfBinaryName = standalone ? basename(selfBinary) : '';
+
+  /** Does this command line belong to a worker of THIS install? */
+  const isOurWorker = (cmd: string): boolean => {
+    if (workerPath !== undefined) return cmd.includes(workerPath);
+    // Compiled form: `<binary> __worker`. The token alone is not enough — a
+    // process merely mentioning `__worker` (a grep, another install) must be
+    // spared.
+    if (!cmd.includes(WORKER_ENTRY_SUBCOMMAND)) return false;
+    const argv0 = cmd.split(/\s+/, 1)[0] ?? '';
+    // Absolute argv[0] → require the exact executable, so a same-named binary
+    // from a different install is not ours.
+    if (argv0.startsWith('/')) return argv0 === selfBinary;
+    // Relative argv[0] (never produced by our own spawns) → basename is all
+    // there is to compare.
+    return basename(argv0) === selfBinaryName;
+  };
 
   let reaped = 0;
   for (const p of procs) {
-    if (p.ppid !== 1) continue;                 // parent still alive → not an orphan
-    if (!p.cmd.includes(workerPath)) continue;  // not OUR worker script
+    if (p.ppid !== 1) continue;         // parent still alive → not an orphan
+    if (!isOurWorker(p.cmd)) continue;  // not OUR worker
     try {
       // SIGKILL, not SIGTERM: an orphan can be wedged in a sync code path (the
       // very failure mode that produced it) where SIGTERM is lost. It holds no

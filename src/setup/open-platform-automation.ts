@@ -12,6 +12,7 @@ import { basename, join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import qrcode from 'qrcode-terminal';
+import bundledScopeManifest from './lark-scopes.json' with { type: 'json' };
 import { registerBotmuxRedirectUrlCollector, VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
 import { readGlobalConfig } from '../global-config.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
@@ -125,6 +126,41 @@ export interface MappedScopeIds {
   missingUserScopes: string[];
 }
 
+/** console 的 `schemaType` 枚举：只有 SelectionExpression 这档有「数据范围」表单。 */
+export const PRIVILEGE_SCHEMA_TYPE_SELECTION_EXPRESSION = 1;
+/** console 的 `organizationType` 枚举：跨组织(B2B/B2C)那两档不在本机制内。 */
+export const PRIVILEGE_ORG_TYPE_INTERNAL = 1;
+
+/** 数据范围表单里的一个字段（只保留判定与拼 content 需要的部分）。 */
+export interface OpenPlatformPrivilegeField {
+  id: string;
+  name: string;
+  /** `data_source.type === 'select_staff'`，即「选人」控件。 */
+  selectStaff: boolean;
+  /** 支持 `in`（「包含」）操作符。 */
+  supportsIn: boolean;
+}
+
+/** `privilege/all` 里的一条「权限可访问的数据范围」。 */
+export interface OpenPlatformPrivilege {
+  /** 原始条目，写回时浅拷贝改 content 用（服务端还会读其它字段）。 */
+  raw: Record<string, unknown>;
+  bizId: string;
+  resource: string;
+  name: string;
+  /** 所属业务分类的显示名（来自同一响应的 `scopeBiz`），只用于 description。 */
+  bizName: string;
+  isRequired: boolean;
+  content: string;
+  schemaType?: number;
+  organizationType?: number;
+  fields: OpenPlatformPrivilegeField[];
+}
+
+export interface OpenPlatformPrivilegeState {
+  privileges: OpenPlatformPrivilege[];
+}
+
 export type OpenPlatformAutomationResult =
   | {
       ok: true;
@@ -134,6 +170,14 @@ export type OpenPlatformAutomationResult =
       scopeCount: number;
       skippedScopeCount: number;
       scopeWarning?: string;
+      /**
+       * 自动填好的「权限可访问的数据范围」条数（填成「与应用的可用范围一致」）。
+       * 0 有两种成因：本来就没有待填的（常态），或写入失败（看
+       * {@link privilegeRangeWarning}）——两者必须靠 warning 区分，别照 count 报「已配齐」。
+       */
+      privilegeRangeCount: number;
+      /** 数据范围读取/写入失败的原因（非致命，仅影响后续审批快慢）。 */
+      privilegeRangeWarning?: string;
       subscribedEventCount: number;
       eventWarning?: string;
       /** 回读后仍缺失的 VC 会议事件。普通建 bot 不阻断,VC listener 保存前必须为空。 */
@@ -153,6 +197,30 @@ export type OpenPlatformAutomationResult =
       /** Managed onboarding only: exact baseline event + callback count read back before session cleanup. */
       verifiedEventCount?: number;
       versionId?: string;
+      /**
+       * 本次因「无任何配置变更」而**跳过了 create+publish**。区别于「发了版但没解析到
+       * versionId」：前者根本没建版（下游别去后台找不存在的草稿、也别把它当 warning）。
+       */
+      publishSkipped?: boolean;
+      /**
+       * 本次发布**复用了已存在的未提交草稿**（而不是新建版本）。撞上
+       * `code=10043 版本已创建` 的历史卡死就是因为没这一步；带回来供调用方在日志里
+       * 说清「提交了旧草稿」还是「发了新版本」。
+       */
+      versionReused?: boolean;
+      /**
+       * 版本提交后**回读发现它仍是草稿**（或回读本身失败）。`publish/commit` 回
+       * `code=0` 不代表版本真的提交了——实测过 code=0 却留在草稿态，日志因此谎报
+       * 「published」。有这个字段时**不能**对外宣称已发布。
+       */
+      versionWarning?: string;
+      /**
+       * 这一版提交后是否**秒过**（审批流全「自动通过」、零真人审批人）。
+       * `undefined` = 判不出来（接口报错 / 算不出流程），调用方**不许**当成任一结论。
+       */
+      approvalAutoPassed?: boolean;
+      /** 需要真人审批时，那些审批人的姓名（抄送人不算——抄送只知会、不阻塞）。 */
+      approvalHumanApprovers?: string[];
     }
   | {
       ok: false;
@@ -170,7 +238,13 @@ export type OpenPlatformAutomationResult =
         | 'version_verification_failed'
         | 'visibility_unreadable'
         | 'network'
-        | 'api_error';
+        | 'api_error'
+        /**
+         * 应用正在飞书审核中（`code=10046`），开放平台把它的配置写入整体锁了。
+         * **等待即自愈**，不是错误：审批通过后写操作恢复。与其它 reason 分开是为了让
+         * 调用方既能说人话，又能跳过无意义的反复重试。
+         */
+        | 'app_under_review';
       message: string;
       sessionFile?: string;
       /** Number of events successfully subscribed (0 when event update failed before downstream error). */
@@ -191,6 +265,12 @@ export type OpenPlatformAutomationResult =
       verifiedEventCount?: number;
       /** Exact published version ACK, preserved across later scope propagation failure. */
       versionId?: string;
+      /**
+       * `app_under_review` 专用：当前那个**待审版本**的 id（读不到时 undefined）。
+       * 只用于上层「同一个待审版本别重复打扰管理员」的节流 key —— undefined 时上层
+       * 自然退化成「不节流」，那是刻意的（见 automation 里 under_review 分支的注释）。
+       */
+      inReviewVersionId?: string;
     };
 
 export interface OpenPlatformAutomationOptions {
@@ -217,6 +297,24 @@ export interface OpenPlatformAutomationOptions {
   appJustCreated?: boolean;
   fetchImpl?: typeof fetch;
   scopeManifest?: ScopeManifest;
+  /**
+   * 调用方已经确知**当前已授权**的 scope 名字集合，**按 token 类型分桶**（来自
+   * tenant-token `application/v6` 的 scope 列表，见 event-dispatcher 的
+   * `checkRequiredScopes`——该接口每个 scope 条目自带 `token_types: (tenant|user)[]`）。
+   *
+   * 传入时，本函数会在**映射成 ID 之前**分别用 `tenant` / `user` 桶对 manifest 的
+   * 对应桶做 name 差集，只对「该 token 类型下真正还没授权」的 scope 发 `scope/update`，
+   * 并且**只在差集非空**时把 scope 记为一次变更（驱动末尾是否发版）。不传时保持历史
+   * 行为：拿不到已授权信号，就以「发出过一次非空 scope/update」作为保守近似（宁可偶尔
+   * 多发一版，也不少发导致新权限不生效）。
+   *
+   * ⚠️ 必须**按桶**做差、且在 name 空间做：`lark-scopes.json` 里约 121 个名字同时出现
+   * 在 tenant 与 user 两个桶，而 tenant/user 是两份独立授权。若把已授权名字拍平成一个
+   * 扁平集合去过滤两个桶，「tenant 已授权」会连带把 user 桶里的同名 scope 也误删，导致
+   * 真正缺失的 user 侧权限被静默吞掉、永远补不上（PR #1044 R2）。catalog 映射后是 ID，
+   * 与 name 不可直接比，故差集只能在 mapped 之前的 name 空间做。
+   */
+  grantedScopeNames?: { tenant: string[]; user: string[] };
   pollIntervalMs?: number;
   maxWaitMs?: number;
   onQrCode?: (info: { qrText: string; qrPayload: string }) => void | Promise<void>;
@@ -417,6 +515,277 @@ export function mapManifestScopesToOpenPlatformIds(
     missingTenantScopes: mapScopeIds(tenant, catalog, 'tenant').missing,
     missingUserScopes: mapScopeIds(user, catalog, 'user').missing,
   };
+}
+
+/**
+ * 把整份 scope 清单裁到「只保留 `wantedNames` 里点名的权限」，tenant / user 分桶
+ * **原样沿用 manifest 的归属**。
+ *
+ * 权限自愈只缺某几项时，历史实现把整份 {@link readDefaultScopeManifest}（300+ 项）
+ * 全量 `operation:'add'` 追加进去——「用缺失项当触发器，却拿完整清单当申请集合」，
+ * 于是补一个 `im:feed_group_v1:read` 会连带申请日历/文档/表格等一大批 botmux 自己
+ * 都不校验的权限。调用方先用本函数把 manifest 裁成缺失项，再传给
+ * {@link automateOpenPlatformSetup} 的 `scopeManifest`，申请集合就与缺失集合一致。
+ *
+ * ⚠️ 故意**不**自己猜 bucket：`im:feed_group_v1:*` 只在 user 桶、`im:resource` 只在
+ * tenant 桶，同名权限也可能同时落两个桶（manifest 里有 121 项 tenant∩user 重叠）。
+ * 以 manifest 的分桶为准，能落哪个桶就保留哪个桶，避免把 user 权限误当 tenant 申请。
+ * 不在 manifest 里的名字直接落空（automation 侧的 catalog 映射也会把它算进
+ * skippedScopeCount），不硬塞。
+ */
+export function filterScopeManifest(manifest: ScopeManifest, wantedNames: string[]): ScopeManifest {
+  const wanted = new Set(uniqueStrings(wantedNames));
+  return {
+    scopes: {
+      tenant: uniqueStrings(manifest.scopes?.tenant ?? []).filter(name => wanted.has(name)),
+      user: uniqueStrings(manifest.scopes?.user ?? []).filter(name => wanted.has(name)),
+    },
+  };
+}
+
+/**
+ * 从 `POST /developers/v1/privilege/all/<appId>` 的返回里解析「权限可访问的数据
+ * 范围」条目。
+ *
+ * ⚠️ 这是**独立于 scope/update 的第二条链路**：`scope/update` 只把权限点加进
+ * 应用清单，而每个权限点还可能带一份「这个权限能看到哪些数据」的配置（console
+ * 上是权限详情里的「权限可访问的数据范围」单选：全部 / 与应用的可用范围一致 /
+ * 按条件筛选）。两者的 appId 相同但接口、payload、生效时机全不一样。
+ *
+ * 第三条相关链路是 `contact_range`（通讯录权限范围），又是另一个概念，不在这里。
+ */
+export function extractOpenPlatformPrivileges(payload: unknown): OpenPlatformPrivilegeState {
+  const data = asRecord(asRecord(payload).data);
+  const rawPrivileges = Array.isArray(data.privileges) ? data.privileges : [];
+  const rawBizNames = Array.isArray(data.scopeBiz) ? data.scopeBiz : [];
+  const bizNames = new Map<string, string>();
+  for (const biz of rawBizNames) {
+    const record = asRecord(biz);
+    const bizId = pickString(record, ['bizId', 'biz_id']);
+    const bizName = pickString(record, ['bizName', 'biz_name']);
+    if (bizId && bizName) bizNames.set(bizId, bizName);
+  }
+  const privileges: OpenPlatformPrivilege[] = [];
+  for (const entry of rawPrivileges) {
+    const record = asRecord(entry);
+    const bizId = pickString(record, ['bizId', 'biz_id']);
+    // resource 允许为空串（contact 这类整 biz 一条的形态），但 bizId 必须有：
+    // 缺了它连合并键都拼不出来，写回去也定位不到条目。
+    if (!bizId) continue;
+    privileges.push({
+      raw: record,
+      bizId,
+      resource: pickString(record, ['resource']) ?? '',
+      name: pickString(record, ['name']) ?? '',
+      bizName: bizNames.get(bizId) ?? '',
+      isRequired: record.isRequired === true,
+      content: pickString(record, ['content']) ?? '',
+      schemaType: typeof record.schemaType === 'number' ? record.schemaType : undefined,
+      organizationType: typeof record.organizationType === 'number' ? record.organizationType : undefined,
+      fields: extractPrivilegeStaffFields(record),
+    });
+  }
+  return { privileges };
+}
+
+/**
+ * 「与应用的可用范围一致」在飞书 console 里的内部取值。console 前端把这三个
+ * mode 定义在同一个 enum 上（`availability_of_app` / `part` / `all`），选中第
+ * 二项时写进 filter value 的就是这个字符串。
+ */
+export const PRIVILEGE_RANGE_SAME_AS_APP_AVAILABILITY = 'availability_of_app';
+
+/**
+ * 判断某条数据范围**能不能**用「与应用的可用范围一致」自动填。
+ *
+ * console 的判据（`em()` / `om()`，CDP 读前端 bundle 确认）是
+ * `schemaType === SelectionExpression(1) && organizationType === InternalOrganization(1)`；
+ * 在此之上本函数额外要求每个字段都是「选人」类型且支持 `in` 操作符，因为
+ * `availability_of_app` 是**成员范围**语义——把它塞进「工作地点」这类字符串
+ * 字段是无意义的（DLP 那条 privilege 就同时有 `member_range` 和 `place` 两个
+ * 字段）。字段里只要有一个不满足就整条跳过，宁可留给人手配，也不猜一个可能
+ * 被审核驳回的组合。
+ */
+export function canFillPrivilegeWithAppAvailability(privilege: OpenPlatformPrivilege): boolean {
+  if (privilege.schemaType !== PRIVILEGE_SCHEMA_TYPE_SELECTION_EXPRESSION) return false;
+  if (privilege.organizationType !== PRIVILEGE_ORG_TYPE_INTERNAL) return false;
+  if (!privilege.fields.length) return false;
+  return privilege.fields.every(field => field.selectStaff && field.supportsIn);
+}
+
+/**
+ * 构造一条数据范围的 `content`——即 console 上选「与应用的可用范围一致」后保存
+ * 的那个字符串。
+ *
+ * 形态是**逐字节复刻 console** 的（拿 6 个已由人手在 console 配好的线上应用
+ * 对照，5 个完全相同，第 6 个只有 `description` 里的权限显示名是飞书改名前的
+ * 旧文案 —— 说明 description 纯展示、不参与语义）：
+ *   • `mode: 'part'` + 每个字段一条 `in` filter，filter value 是**再套一层
+ *     JSON 字符串**的 `[{mode:'availability_of_app',members:[],…}]`
+ *   • `expression` 是 filter 的 1-based 序号用 ` and ` 连起来
+ *   • `description` 是给人看的摘要（console 的 `GC()` 拼的同款）
+ */
+export function buildPrivilegeAppAvailabilityContent(privilege: OpenPlatformPrivilege): string {
+  const filters = privilege.fields.map(field => ({
+    field: field.id,
+    value: JSON.stringify([{
+      mode: PRIVILEGE_RANGE_SAME_AS_APP_AVAILABILITY,
+      members: [] as string[],
+      departments: [] as string[],
+      groups: [] as string[],
+    }]),
+    operator: 'in',
+  }));
+  const description =
+    `${privilege.bizName} - ${privilege.name}\n`
+    + privilege.fields.map(field => `\t${field.name} 包含 与应用的可用范围一致 `).join('')
+    + '\n';
+  return JSON.stringify({
+    biz_id: privilege.bizId,
+    mode: 'part',
+    resource: privilege.resource,
+    filters,
+    expression: filters.map((_, index) => index + 1).join(' and '),
+    description,
+  });
+}
+
+/**
+ * 这条数据范围是否已经被**收敛过**（即不需要我们再动它）。
+ *
+ * ⚠️ 不能简单判 `content` 非空。实测「一键创建智能体」模板建出来的应用，出生就
+ * 带着 `{"mode":"all"}`（console 上显示为选中「全部」）——正是审批规则里要额外
+ * 说明理由、视情况加签至 CEO-2 的那一档。按「有 content 就算配过」会把这个默认
+ * 值当成用户的选择而跳过，于是新建 bot 永远带着「全部」提审，改动完全空转。
+ *
+ * 所以判据是「**已收敛到 all 以外**」：
+ *   • `mode:'all'`（全部）→ 需要我们收窄，视为未配置
+ *   • `mode:'part'` 但 `filters` 为空 → console 自己的 `XC()` 也不认这算配置好
+ *     （它要求 `mode==='all' || filters.length>0`），是个「看着配过、其实空」的
+ *     中间态，同样视为未配置
+ *   • `mode:'part'` 且有 filters / 其它 → 人为或我们之前配过的具体范围，绝不覆盖
+ *   • 空 / `mode` 缺失 / `mode:'null'`（console 的「无」）→ 未配置
+ */
+export function isPrivilegeRangeNarrowed(privilege: OpenPlatformPrivilege): boolean {
+  if (!privilege.content) return false;
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = asRecord(JSON.parse(privilege.content));
+  } catch {
+    // content 存在但不是合法 JSON:不敢当成"配过了",也不敢覆盖——保守视为已配置,
+    // 交给人处理(覆盖一个读不懂的值风险更大)。
+    return true;
+  }
+  const mode = parsed.mode;
+  if (typeof mode !== 'string' || mode === '' || mode === 'all' || mode === 'null') return false;
+  // 与 console 的 XC() 对齐：非 all 的 mode 必须真的带上筛选条件才算配置好。
+  return Array.isArray(parsed.filters) && parsed.filters.length > 0;
+}
+
+/**
+ * 挑出「必须配、但还没收敛」且能安全自动填的数据范围条目。
+ *
+ * 只取 `isRequired`：console 自己的 gate（`jC()`）也只强制这一档，实测线上租户
+ * 84 条 privilege 条目里 required 的只有 2 条（会议号查询会议信息 / 创建更新
+ * 任务时可指定的人员范围）。已经收敛到具体范围的一律不碰——那可能是人手精心配
+ * 过的，覆盖它比不配更糟；但模板默认的 `mode:'all'` **要**收窄（见
+ * {@link isPrivilegeRangeNarrowed}）。
+ */
+export function selectPrivilegesNeedingAppAvailability(
+  state: OpenPlatformPrivilegeState,
+): OpenPlatformPrivilege[] {
+  return state.privileges.filter(privilege =>
+    privilege.isRequired
+    && !isPrivilegeRangeNarrowed(privilege)
+    && canFillPrivilegeWithAppAvailability(privilege));
+}
+
+/**
+ * 构造 `POST /developers/v1/privilege/update/<appId>` 的 payload。
+ *
+ * ⚠️ 与 {@link buildSafeSettingPayload}（全量覆盖）**语义相反**：实测服务端按
+ * `(bizId, resource)` **增量合并**——只传 1 条、改动它，同一应用里另一条已配好
+ * 的数据范围逐字节不变。所以这里只传「本次要填的那几条」，不必像 console 前端
+ * 那样把 84 条整包读回来再写。
+ *
+ * 每条都在原始条目上浅拷贝改 `content`，其余字段（schema / privilegeStatus /
+ * isRequired…）原样回传，避免把服务端还会读的字段丢掉。
+ */
+export function buildPrivilegeUpdatePayload(appId: string, privileges: OpenPlatformPrivilege[]) {
+  return {
+    clientId: appId,
+    privileges: privileges.map(privilege => ({
+      ...privilege.raw,
+      content: buildPrivilegeAppAvailabilityContent(privilege),
+    })),
+  };
+}
+
+/**
+ * 读 `privilege/all` → 把「必须配但还没收敛」的数据范围写成「与应用的可用范围
+ * 一致」。返回实际写了几条（0 = 没有待收窄的）。
+ *
+ * 抽成共享函数是因为**两条路径都必须做**，且各自发的是不同的版本：
+ *   • {@link createOpenPlatformAppWithClient} —— 模板建完立刻发第一版
+ *   • {@link automateOpenPlatformSetup} —— 权限自愈 / 补配时发下一版
+ * 只做前者，存量 bot 永远不收窄；只做后者，新建 bot 的第一版仍带「全部」提审。
+ *
+ * 调用方决定失败怎么处理（两处都是非致命，但一处 warn 一处进 result.warning）。
+ */
+/**
+ * 只读探查「这个应用为什么可能卡审批」，给管理员 DM 里补一句**具体线索**。
+ *
+ * 为什么值得单独探一次：光说「可能是数据范围没配」是转述，说「实测这两条现在是
+ * 『全部/未配置』」才是证据 —— 人拿着它能直接去 console 对应位置改。审核锁只锁写，
+ * `privilege/all` 这类读接口照常可用（实测），所以这次探查在审核中也能成功。
+ *
+ * 全程 best-effort：任何一步失败就返回空串，绝不让「补充线索」这种附加信息把主流程
+ * （告诉管理员卡住了）搞坏。
+ */
+export async function inspectUnderReviewConfigHints(appId: string, brand?: 'feishu' | 'lark'): Promise<string> {
+  if (brand === 'lark') return '';
+  try {
+    const prepared = await prepareFeishuWebSession({ disableQrLogin: true, disableBytedcliFallback: true });
+    if (!prepared.ok) return '';
+    const clientResult = await createOpenPlatformApiClient(prepared.cookies);
+    if (!clientResult.ok) return '';
+    const post = clientResult.client.postJson;
+    const parts: string[] = [];
+    // ① 数据范围：把「还没收敛」的必填条目点出来（这正是最常见的卡审批原因）
+    try {
+      const state = extractOpenPlatformPrivileges(await post(`/developers/v1/privilege/all/${appId}`, {}));
+      const unnarrowed = state.privileges.filter(p => p.isRequired && !isPrivilegeRangeNarrowed(p));
+      if (unnarrowed.length > 0) {
+        const listed = unnarrowed.map(p => `${p.bizName || p.bizId}/${p.name || p.resource}`).join('、');
+        parts.push(`实测该应用有 ${unnarrowed.length} 项必填「数据范围」尚未收敛（${listed}）——大概率就是卡点`);
+      } else {
+        parts.push('实测必填「数据范围」都已收敛，卡点可能是别的规则（看审批详情）');
+      }
+    } catch { /* 读不到就不提数据范围 */ }
+    // ② 租户审批规则原文链接：比我们转述强 —— 万一卡的是别的规则，链接照样有用。
+    // body 传空 `{}` 即可：实测跨 3 台（有草稿 / 审核中 / 无待发布版本）对照过
+    // `{}` 与 `{versionId}`，两者返回**逐字相同**（都拿到 auditUrl + 452 字的
+    // auditSummary）⟹ 该端点返回的是**租户级**规则、与具体版本无关，不必透传 versionId。
+    try {
+      const rule: any = await post(`/developers/v1/config/audit_rule/${appId}`, {});
+      const auditUrl = pickString(asRecord(asRecord(rule).data), ['auditUrl']);
+      if (auditUrl) parts.push(`企业审批规则原文：${auditUrl}`);
+    } catch { /* 拿不到链接不影响其余线索 */ }
+    return parts.length > 0 ? `\n\n**线索**：${parts.join('；')}。` : '';
+  } catch {
+    return '';
+  }
+}
+
+async function narrowRequiredPrivilegeRanges(
+  api: { postJson(path: string, body?: unknown): Promise<unknown> },
+  appId: string,
+): Promise<number> {
+  const state = extractOpenPlatformPrivileges(await api.postJson(`/developers/v1/privilege/all/${appId}`, {}));
+  const needFill = selectPrivilegesNeedingAppAvailability(state);
+  if (needFill.length === 0) return 0;
+  await api.postJson(`/developers/v1/privilege/update/${appId}`, buildPrivilegeUpdatePayload(appId, needFill));
+  return needFill.length;
 }
 
 export function buildScopeUpdatePayload(appId: string, mapped: Pick<MappedScopeIds, 'tenantScopeIds' | 'userScopeIds'>) {
@@ -1051,6 +1420,15 @@ export async function automateOpenPlatformSetup(
   // 不了)。这一步独立 try/catch:失败只记 redirectWarning,不 return、不阻断后续。
   let redirectConfigured = false;
   let redirectWarning: string | undefined;
+  // 「本次自动化到底改没改过线上配置」。只有确实落地过写操作（redirect 白名单、
+  // scope、事件、回调、接收模式）才置 true。用来在流程末尾判断是否值得再
+  // create+publish 一个新版本——权限/事件全都本就齐全时，历史实现仍会无条件
+  // 发一版（scope 不 diff、发版无短路），存量 bot 每次重启命中自检都凭空多一个
+  // 版本。⚠️ scope/update 用整份 catalog 映射、平台侧幂等 add，botmux 拿不到
+  // 「哪些本就已授权」的可靠信号（scope/all 只是可选权限目录，无 grant flag），
+  // 所以这里以「本次 scope/update 是否真的发出且成功」作为保守近似：宁可偶尔
+  // 多发一版，也不少发导致新权限不生效。
+  let mutated = false;
   try {
     // wanted 显式算一次并原样传下去：`redirectConfigured` 要靠「wanted 是否全部落盘」
     // 判定（见 {@link missingRedirectUrls}），拿不到这份 wanted 就只能退回按 status
@@ -1060,6 +1438,11 @@ export async function automateOpenPlatformSetup(
       // 只有「本次刚建出来的 app」才允许在读失败时盲写覆盖；存量 app 读不到就零写入。
       allowBlindWrite: options.appJustCreated === true,
     });
+    // 只有真的发了写请求（updated / updated_fallback）才算改过；unchanged（幂等
+    // 短路）与 skipped_unreadable（一次都没写）都不置位。
+    if (written.status === 'updated' || written.status === 'updated_fallback') {
+      mutated = true;
+    }
     if (written.status === 'skipped_unreadable') {
       // 「读不到线上现值 → 一次写请求都没发」。与下面的「写了但没写全」是两回事：
       // 这里连线上有什么都不知道，谈不上缺哪几条，措辞也要分开。
@@ -1095,8 +1478,31 @@ export async function automateOpenPlatformSetup(
   }
 
   const manifest = options.scopeManifest ?? readDefaultScopeManifest();
+  // 调用方给了「已授权」名字集合时，在**映射成 ID 之前**做 name 差集，把 manifest
+  // 收窄成「本次真正还缺的」——只有它非空才需要发 scope/update、也才算一次变更。
+  // 这正是「无变更短路」在走默认全量 manifest 的生产链路里能真正生效的关键：否则
+  // manifest 恒非空 → scope/update 恒发 → mutated 恒真 → 短路永不触发。
+  //
+  // 差集必须**按 token 桶各自做**：约 121 个名字同时在 tenant/user 两桶，而两者是
+  // 两份独立授权。若拿一个扁平集合过滤两桶，「tenant 已授权」会连带删掉 user 桶的
+  // 同名 scope，把真正缺的 user 侧权限静默吞掉（PR #1044 R2）。
+  const grantedTenant = options.grantedScopeNames
+    ? new Set(options.grantedScopeNames.tenant)
+    : undefined;
+  const grantedUser = options.grantedScopeNames
+    ? new Set(options.grantedScopeNames.user)
+    : undefined;
+  const hasGrantedSignal = !!(grantedTenant || grantedUser);
+  const effectiveManifest: ScopeManifest = hasGrantedSignal
+    ? {
+        scopes: {
+          tenant: (manifest.scopes?.tenant ?? []).filter(name => !grantedTenant?.has(name)),
+          user: (manifest.scopes?.user ?? []).filter(name => !grantedUser?.has(name)),
+        },
+      }
+    : manifest;
   const catalog = extractOpenPlatformScopeEntries(allScopesPayload);
-  const mapped = mapManifestScopesToOpenPlatformIds(manifest, catalog);
+  const mapped = mapManifestScopesToOpenPlatformIds(effectiveManifest, catalog);
   const missing = [...mapped.missingTenantScopes, ...mapped.missingUserScopes];
   const skippedScopeCount = missing.length;
   if (missing.length > 0) {
@@ -1110,10 +1516,37 @@ export async function automateOpenPlatformSetup(
   if (importedScopeCount > 0) {
     try {
       await postJson(`/developers/v1/scope/update/${options.appId}`, buildScopeUpdatePayload(options.appId, mapped));
+      // 已知 granted 时：manifest 已收窄成「真正还缺的」，走到这里就一定有新增权限，
+      // 记为变更、允许后续发版让新权限生效。未知 granted 时保守近似：拿不到「哪些本就
+      // 已授权」的信号，只要成功发出了一次非空 scope/update 就当作可能改动过权限。
+      mutated = true;
     } catch (err: any) {
       scopeWarning = safeErrorMessage(err);
       importedScopeCount = 0;
     }
+  }
+
+  // 权限点加进清单后，其中一部分还带一份「权限可访问的数据范围」要填（console
+  // 上是权限详情里的单选：全部 / 与应用的可用范围一致 / 按条件筛选）。这些权限
+  // 的 scope level 是「需审核」，而字节租户的审批规则明写「非必要不申请全员数据，
+  // 如申请全员范围请提供充分的理由说明，视情况加签至 CEO-2」——留空提审时这一格
+  // 是空的（privilegeStatus=Unset），且 schema 的 fallback_value 是 mode:'all'，
+  // 等于把范围往「全部」那侧靠。所以这里主动收敛成「与应用的可用范围一致」：
+  // 语义上正是 botmux 需要的（bot 只对能看到它的人干活），也是审批规则鼓励的方向。
+  //
+  // 非致命，与 scope 注册同档：数据范围没配好不该阻塞建 bot（它只影响后续审批
+  // 快慢，不影响 bot 收发消息）。写入按 (bizId,resource) 增量合并，且只碰
+  // 「isRequired 且当前为空」的条目——人手配过的范围一律不覆盖。
+  let privilegeRangeCount = 0;
+  let privilegeRangeWarning: string | undefined;
+  try {
+    privilegeRangeCount = await narrowRequiredPrivilegeRanges({ postJson }, options.appId);
+    // 返回值就是「实际写进去的条目数」：>0 说明真发了 privilege/update，属于一次
+    // 落地的配置变更，必须计入 mutated——否则「只有数据范围被收敛」的那一轮会走
+    // 无变更短路、不发版，改动留在草稿里不生效（#1042 与 #1044 合并处新增）。
+    if (privilegeRangeCount > 0) mutated = true;
+  } catch (err: any) {
+    privilegeRangeWarning = safeErrorMessage(err);
   }
 
   // Web 创建的是普通企业自建应用（不是 SDK PersonalAgent），需要显式开启
@@ -1123,6 +1556,56 @@ export async function automateOpenPlatformSetup(
     await postJson(`/developers/v1/robot/switch/${options.appId}`, { clientId: options.appId, enable: true });
     await postJson(`/developers/v1/event/switch/${options.appId}`, { clientId: options.appId, eventMode: 4 });
   } catch (err: any) {
+    // 「应用正在审核中」是**等待即自愈**的状态，不是配置错误：审核期间开放平台把整个
+    // 应用配置写锁了（scope/update / robot/switch / safe_setting/update / base_info 全
+    // 拒，读接口照常），审批通过后自然恢复。给它一个独立 reason，让上层能说人话、
+    // 并且不要每次重启都把整条链路重跑一遍（线上两台 bot 各已空转 8 次）。
+    // 注意：这一步**不是本函数第一个写操作**（redirect 白名单、scope/update、
+    // privilege/update 都在它前面，也都会被 10046 拒），而是第一个**不吞错**的写 ——
+    // 前三个各自 try/catch 成 warning 继续走，只有这里会把错误抛到这个 catch。所以
+    // 归因放在这里是可行的（它无条件执行），但别据此以为前面没有写操作：真要提前
+    // 识别 10046，得去看那几个 warning 而不是指望这里最先命中。
+    if (openPlatformUnderReview(err)) {
+      // ⚠️ **不自动撤回待审版本**（曾经写过，已删）。原先的推理是「缺必需权限 + 审核中
+      // = 权限永远补不上 ⟹ 撤回是唯一出路」，那默认了「审批是中性的排队机制」。实际
+      // **触发审批说明有配置不合规**：模板建的应用出生带「数据范围=全部」，正是租户
+      // 审批规则里「申请全员范围要额外说明理由、视情况加签至 CEO-2」那一档（见
+      // {@link isPrivilegeRangeNarrowed} 的注释），而 narrowRequiredPrivilegeRanges
+      // 只收窄**新**版本 ⟹ 卡住的必然是没收窄过的旧版。
+      //
+      // ⟹ 撤回重提交会被**同一条规则再拦一次**，等于用不可逆动作（丢掉审批队列位置，
+      // 线上见过排 18 / 23 天且不属于本机 owner 的）驱动一个死循环。更一般地：**审批是
+      // 规则驱动的闸，不是队列**，撤回不绕过规则、只丢位置 —— 所以即便存在「配置合规
+      // 但仍进审批」的情形，自动撤回照样不解决问题。正确处置是**告诉人、让人修配置**。
+      //
+      // 取待审版本 id 只为给上层做「同一个待审版本别重复打扰」的节流 key。这次读是
+      // 只读（审核锁下照常可读）、且只在失败路径发生，常态零开销。
+      //
+      // ⚠️ 读失败必须降级成「没有 versionId」，**绝不能把已经确定的 app_under_review
+      // 覆盖成 network / api_error**：分类是主信号，versionId 只是节流用的上下文，
+      // 上下文取不到不能反过来污染主信号。拿不到 id 时上层自然退化成「不节流」——
+      // 那也正是我们要的：「撞了 10046 却找不到待审版本」意味着模型与实际不一致，
+      // 每次都值得说一遍（万一是我们判据自己有 bug，节流会掐掉唯一的信号）。
+      let inReviewVersionId: string | undefined;
+      try {
+        inReviewVersionId = findInReviewVersionId(
+          await postJson(`/developers/v1/app_version/list/${options.appId}`, {}),
+        );
+      } catch { /* 拿不到就不节流，见上 */ }
+      return {
+        ok: false,
+        reason: 'app_under_review',
+        message:
+          '应用正在飞书审核中，开放平台暂时锁定了它的配置写入（权限申请、机器人能力、回调白名单都改不了）。'
+          + '**审批被触发通常意味着有配置不合规**（最常见：权限的「数据范围」没配，默认成「全部/全员」，'
+          + '撞上租户「非必要不申请全员数据」的加签规则）。需要人工处理：到开放平台看审批详情 → 修掉不合规项 '
+          + '→ 撤回该待审版本 → 重新提交。注意：撤回后直接重提**不会**自动通过，规则会再拦一次。',
+        sessionFile,
+        redirectConfigured,
+        redirectWarning,
+        inReviewVersionId,
+      };
+    }
     return {
       ok: false,
       reason: 'api_error',
@@ -1160,6 +1643,9 @@ export async function automateOpenPlatformSetup(
   const missingAppEvents = wantedAppEvents.filter(name => !hasEvent(name));
   const missingUserEvents = VC_MEETING_USER_EVENTS.filter(name => !hasEvent(name));
   if (missingAppEvents.length > 0 || missingUserEvents.length > 0) {
+    // 有缺失事件才进这一支，说明确实要发写请求补订阅——置 mutated。逐个补的
+    // 兜底分支即使个别失败，也已经改过一部分，仍算改动过。
+    mutated = true;
     const eventMode = eventState?.eventMode ?? LONG_CONNECTION_EVENT_MODE;
     try {
       await addEvents(missingAppEvents, missingUserEvents, eventMode);
@@ -1209,6 +1695,8 @@ export async function automateOpenPlatformSetup(
     eventWarnings.push(`读取当前回调订阅失败: ${safeErrorMessage(err)}`);
   }
   if (callbackState && callbackState.callbackMode !== LONG_CONNECTION_EVENT_MODE) {
+    // 回调接收模式不是长连接才需要切——发了 switch 写请求即算改动过。
+    mutated = true;
     try {
       await postJson(`/developers/v1/callback/switch/${options.appId}`, {
         clientId: options.appId,
@@ -1221,6 +1709,8 @@ export async function automateOpenPlatformSetup(
   }
   let missingCallbacks = BOT_BASELINE_CALLBACKS.filter(name => !callbackState?.callbacks.includes(name));
   if (missingCallbacks.length > 0) {
+    // 有缺失回调才补——发了 callback/update 写请求即算改动过。
+    mutated = true;
     try {
       await postJson(
         `/developers/v1/callback/update/${options.appId}`,
@@ -1274,6 +1764,60 @@ export async function automateOpenPlatformSetup(
     };
   }
 
+  // 无变更短路：redirect / scope / 事件 / 回调 / 接收模式一路下来都没落地过任何
+  // 写操作，说明应用配置本就齐全，再 create+publish 一个新版本纯属凭空多一版
+  // （存量 bot 每次重启命中权限自检/VC 自检都发一版）。此时跳过发版，直接回成功。
+  //
+  // 两个例外**必须**照常发版：
+  //  • appJustCreated —— 刚建出来的 app 要靠首次发版才能上架启用；
+  //  • requireVerifiedEvents —— 受管 onboarding/恢复靠回读到的精确 versionId 作为
+  //    激活 ACK（见 bot-onboarding 的 hasExactManagedAutomationAck / versionId 读取），
+  //    不发版就拿不到 versionId，激活会判失败。
+  // 这两条都传 false / 未传时，才走无变更短路。
+  //
+  // ⚠️ 第三个例外：**存在未提交的草稿**。草稿会让后续 `app_version/create` 一律撞
+  // `code=10043 版本已创建`（见下方 findUncommittedDraftVersionId 处的长注释），而
+  // 「有草稿」与「本轮有没有配置变更」是两件独立的事：一个 scope 已齐、事件已订阅、
+  // 数据范围已收窄的 bot，`mutated` 恒为 false，会在这里短路 return —— 下面那段
+  // 「提交草稿」的代码**永远到不了**，草稿就一直卡着。这正是本次要修的死锁，所以
+  // 有草稿时必须往下走，把它提交掉（提交草稿本身不新建版本、不烧版本号）。
+  // 读一次版本列表：既用来判「有没有卡住的草稿」（决定能否走无变更短路），也直接
+  // 复用给下面的发版逻辑，避免同一轮里重复请求。读失败不阻断——退回「按 mutated 判」
+  // 的旧行为，最坏是少救一次草稿，不会因为一个读请求把整条自愈判死。
+  let versionList: unknown;
+  try {
+    versionList = await postJson(`/developers/v1/app_version/list/${options.appId}`, {});
+  } catch (err: any) {
+    await options.onStatus?.(`读取版本列表失败（${safeErrorMessage(err)}），跳过草稿检查`);
+  }
+  const pendingDraftVersionId = versionList === undefined ? undefined : findUncommittedDraftVersionId(versionList);
+  const mustPublish = options.appJustCreated === true || options.requireVerifiedEvents === true;
+  if (!mutated && !mustPublish && !pendingDraftVersionId) {
+    return {
+      ok: true,
+      sessionFile,
+      sessionSource: preparedSession.source,
+      cookieCount: preparedSession.cookieCount,
+      scopeCount: importedScopeCount,
+      skippedScopeCount,
+      scopeWarning,
+      privilegeRangeCount,
+      privilegeRangeWarning,
+      subscribedEventCount,
+      eventWarning,
+      missingVcEvents,
+      eventModeReady,
+      redirectConfigured,
+      redirectWarning,
+      // 没发版：versionId 留空，另置 publishSkipped 标记「本次确实没建版」。非受管
+      // 路径本就不依赖 versionId（受管路径已被 mustPublish 排除在短路之外），下游据
+      // publishSkipped 区分「跳过发版」与「发了版但没解析到 versionId」——前者不该被
+      // classifySetupOpenPlatformOutcome 计入 warning，也不该让 CLI 提示去后台找草稿。
+      versionId: undefined,
+      publishSkipped: true,
+    };
+  }
+
   try {
     // 原样镜像**线上版本**的可见范围（白/黑名单都带）——绝不注入「当前 Web
     // session 操作者」:automateOpenPlatformSetup 也被 VC listener 保存 / 权限自愈 /
@@ -1307,13 +1851,40 @@ export async function automateOpenPlatformSetup(
         redirectWarning,
       };
     }
-    const versionList = await postJson(`/developers/v1/app_version/list/${options.appId}`, {});
-    const appVersion = nextAppVersion(versionList);
-    const versionPayload = buildAppVersionCreatePayload(appVersion) as unknown as Record<string, unknown>;
-    versionPayload.visibleSuggest = visibility.visibleSuggest;
-    versionPayload.blackVisibleSuggest = visibility.blackVisibleSuggest;
-    const created = await postJson(`/developers/v1/app_version/create/${options.appId}`, versionPayload);
-    const versionId = extractVersionId(created);
+    const versions = versionList ?? await postJson(`/developers/v1/app_version/list/${options.appId}`, {});
+    // 已存在的**未提交草稿**要先消化掉，不能直接 create：飞书不允许并存两个未提交
+    // 版本，有草稿时 create 一律回 `code=10043 版本已创建，请刷新`。历史行为是撞上就
+    // 整个自愈失败并给管理员发 DM，而下次重启又原样重跑——一个草稿把自愈**永久**卡死
+    // （线上实测 3 台、一天各 5 次）。
+    //
+    // 修法是**提交那个草稿**而不是绕过它：草稿的 scope 集合就是应用当前已声明的集合
+    // （实测逐项相等，181/181 零差集），正是我们想发的内容；`scope/update` 早在本函数
+    // 上半段就已经把缺失权限加进清单了，草稿会带上它们。实测直接 commit 即
+    // `versionStatus` 0→2（已上线），不新建版本、不烧版本号。
+    //
+    // 故意**不**做「取消草稿再重建」：那需要引入一个破坏性的删除端点（本仓库从未用过
+    // 任何 delete/cancel 版本的端点），还会多烧一个版本号，收益为零。
+    //
+    // ⚠️ 已知取舍：复用草稿等于发布**草稿自己那份可见范围快照**，而不是上面刚从
+    // `visible/online` 读出来的现值（`visibleSuggest` 只在新建版本时才用得上）。本次
+    // 涉及的两台 bot 实测草稿与线上版本的可见范围逐字相同（同一个 open_id、无部门/
+    // 黑名单），所以没有收窄发生；但一个**很久以前**留下的草稿理论上可能带着过时的
+    // 可见范围。这仍然比现状好：现状是自愈**永久失败**、权限一项都到不了位。真出现
+    // 过时草稿时，用户在开放平台能看到该版本的可见范围并自行修正。
+    const draftVersionId = findUncommittedDraftVersionId(versions);
+    let versionId: string | undefined;
+    let versionReused = false;
+    if (draftVersionId) {
+      versionId = draftVersionId;
+      versionReused = true;
+    } else {
+      const appVersion = nextAppVersion(versions);
+      const versionPayload = buildAppVersionCreatePayload(appVersion) as unknown as Record<string, unknown>;
+      versionPayload.visibleSuggest = visibility.visibleSuggest;
+      versionPayload.blackVisibleSuggest = visibility.blackVisibleSuggest;
+      const created = await postJson(`/developers/v1/app_version/create/${options.appId}`, versionPayload);
+      versionId = extractVersionId(created);
+    }
     if (options.requireVerifiedEvents && !versionId) {
       return {
         ok: false,
@@ -1328,8 +1899,41 @@ export async function automateOpenPlatformSetup(
         redirectWarning,
       };
     }
+    let versionWarning: string | undefined;
+    let approvalAutoPassed: boolean | undefined;
+    let approvalHumanApprovers: string[] | undefined;
     if (versionId) {
+      // 提交前先问一句「这一版提交后会不会秒过」。判据见 {@link predictApprovalFlow}：
+      // 全自动通过 + 零真人审批人 ⟹ 提交不打扰任何人、立即生效，尽管提。
+      //
+      // 反过来，有真人审批人时**仍然照常提交**——这是既有行为，不改：botmux 建 bot /
+      // 补权限本来就需要发版才生效，替用户提审是本来的分工。这里查流程的作用是**把
+      // 「秒过」与「要人审」分开告知**：秒过的一声不吭办完；要人审的明确说「已提交，
+      // 需要 X 审批」，让用户知道在等谁、以及别再重复点。
+      //
+      // 判不出来（known:false，接口报错 / 没有可判定的关卡）时不猜：既不宣称秒过，
+      // 也不宣称要人审，只在日志里留原因。
+      const prediction = await fetchApprovalFlowPrediction(postJson, options.appId, versionId, visibility);
+      if (prediction.known) {
+        approvalAutoPassed = prediction.autoApproved;
+        if (prediction.humanApprovers.length > 0) approvalHumanApprovers = prediction.humanApprovers;
+      } else if (prediction.reason) {
+        await options.onStatus?.(`审批流程预判不可用（${prediction.reason}），按常规提交`);
+      }
       await postJson(`/developers/v1/publish/commit/${options.appId}/${versionId}`, { clientId: options.appId });
+      // commit 返回 code=0 ≠ 版本真的提交了：线上实测过 commit 回 `{code:0,isOk:true}`
+      // 而版本仍停在草稿态，于是日志谎报「published」，留下的草稿正是卡死后续自愈的
+      // 元凶。回读一次把「以为发了」和「真发了」分开——查得到就是查得到，别再拿返回码
+      // 当结论。回读本身失败不改判结果（版本可能已经提交成功），只记 warning。
+      try {
+        const after = await postJson(`/developers/v1/app_version/list/${options.appId}`, {});
+        if (!isVersionCommitted(after, versionId)) {
+          versionWarning =
+            `版本 ${versionId} 提交后回读仍是「未提交审核」草稿：请到开放平台「版本管理」手动点「申请发布」`;
+        }
+      } catch (err: any) {
+        versionWarning = `版本 ${versionId} 提交状态回读失败（无法确认是否已提交）: ${safeErrorMessage(err)}`;
+      }
     }
     return {
       ok: true,
@@ -1339,12 +1943,18 @@ export async function automateOpenPlatformSetup(
       scopeCount: importedScopeCount,
       skippedScopeCount,
       scopeWarning,
+      privilegeRangeCount,
+      privilegeRangeWarning,
       subscribedEventCount,
       eventWarning,
       missingVcEvents,
       eventModeReady,
       redirectConfigured,
       redirectWarning,
+      versionReused,
+      versionWarning,
+      approvalAutoPassed,
+      approvalHumanApprovers,
       ...(options.requireVerifiedEvents
         ? {
             eventMode: eventState?.eventMode,
@@ -1413,6 +2023,12 @@ export interface OpenPlatformAppSummary {
 export interface OpenPlatformApiClient {
   apiOrigin: string;
   postJson(path: string, body?: unknown): Promise<unknown>;
+  /**
+   * 语义幂等的 console POST（重复调用无副作用：设值型 switch、只读拉取）。
+   * 与 GET/HEAD 同权享受完整的瞬态错误退避重试，且**预算只在 fetchRaw 这一层**
+   * —— 调用方不要再在外面套第二轮 retry，那会与内层相乘（实测 3×3=9 次）。
+   */
+  postJsonIdempotent(path: string, body?: unknown): Promise<unknown>;
   postForm(path: string, body: FormData): Promise<unknown>;
 }
 
@@ -1452,7 +2068,9 @@ export async function createOpenPlatformApiClient(
     };
   }
 
-  const request = async (path: string, body?: BodyInit, contentType?: string): Promise<unknown> => {
+  const request = async (
+    path: string, body?: BodyInit, contentType?: string, opts: { idempotent?: boolean } = {},
+  ): Promise<unknown> => {
     const url = `${apiOrigin}${path}`;
     const response = await session.fetchRaw(fetcher, url, {
       method: 'POST',
@@ -1464,7 +2082,7 @@ export async function createOpenPlatformApiClient(
         ...(contentType ? { 'content-type': contentType } : {}),
       },
       body,
-    });
+    }, 10, opts);
     let data: any;
     try {
       data = await response.json();
@@ -1482,9 +2100,16 @@ export async function createOpenPlatformApiClient(
 
   const postJson = async (path: string, body?: unknown): Promise<unknown> =>
     request(path, body === undefined ? undefined : JSON.stringify(body), body === undefined ? undefined : 'application/json');
+  const postJsonIdempotent = async (path: string, body?: unknown): Promise<unknown> =>
+    request(
+      path,
+      body === undefined ? undefined : JSON.stringify(body),
+      body === undefined ? undefined : 'application/json',
+      { idempotent: true },
+    );
   const postForm = async (path: string, body: FormData): Promise<unknown> => request(path, body);
 
-  return { ok: true, client: { apiOrigin, postJson, postForm }, identity };
+  return { ok: true, client: { apiOrigin, postJson, postJsonIdempotent, postForm }, identity };
 }
 
 /**
@@ -1699,18 +2324,32 @@ export async function createOpenPlatformAppWithClient(
     // robot/event switch 都是幂等设值,故对宿主机↔飞书的瞬态网络抖动小步重试:
     // 一次 undici `fetch failed` 不该让「应用已建成但没启用能力」半途而废
     // (那会把用户丢进手动读 Secret + CLI 续跑的恢复路径)。
-    await retryIdempotentOnTransientNetworkError(() =>
-      client.postJson(`/developers/v1/robot/switch/${appId}`, { clientId: appId, enable: true }));
-    await retryIdempotentOnTransientNetworkError(() =>
-      client.postJson(`/developers/v1/event/switch/${appId}`, { clientId: appId, eventMode: 4 })); // WebSocket
+    await client.postJsonIdempotent(`/developers/v1/robot/switch/${appId}`, { clientId: appId, enable: true });
+    await client.postJsonIdempotent(`/developers/v1/event/switch/${appId}`, { clientId: appId, eventMode: 4 }); // WebSocket
+
+    // 模板建出来的应用，「权限可访问的数据范围」出生就是 `mode:'all'`（console 上
+    // 显示「全部」）——而这里紧接着就要发**第一个版本**。不先收窄，这一版就带着
+    // 「全部」进审批：正是租户规则里要补充理由、视情况加签至 CEO-2 的那一档。
+    // 后续 automateOpenPlatformSetup 也会做同一件事，但它发的是**下一个**版本，
+    // 救不回这一版，所以两处都必须做。
+    //
+    // 非致命：数据范围只影响审批快慢，不影响应用能不能收发消息。这里正处在
+    // 「应用已建成、还没发版」的窗口里，为它把整条创建链路判死（用户被丢进手动读
+    // Secret 的恢复路径）代价明显更大。
+    await narrowRequiredPrivilegeRanges(client, appId).catch((err: unknown) => {
+      console.warn(`权限数据范围自动收窄失败（不影响建 bot，可到开放平台手动选「与应用的可用范围一致」）: ${safeErrorMessage(err)}`);
+    });
 
     // 复刻 console launcher「一键创建智能体」的最后一步:立刻用极简版本发布一次,
     // 让应用**上架启用**(tenantAppStatus 0→2)。这样返回的就是一个「已启用、可
     // 收发消息」的应用——等价于旧 SDK registerApp 直接产出可用 PersonalAgent 的效果。
     // 这一步 fail-closed:拿到 versionId 后 commit 失败、或 code=0 却没 versionId
-    // (可能留下未发布草稿),都视为创建失败抛出(带 appId,由调用方兜底/提示),
-    // 不宣称「后续 setup 会软兜底」——setup 的 nextAppVersion 不复用未发布草稿,
-    // 版本号可能撞车导致二次发版继续失败,应用永远停在未启用。
+    // (可能留下未发布草稿),都视为创建失败抛出(带 appId,由调用方兜底/提示)。
+    //
+    // 这里**不做**「回读版本状态 + 补一刀 commit」:线上那 3 台卡死 bot 的 1.0.0
+    // (本函数发的版本)全部 `status=1 已上线`,即本步的 commit 是成功的;卡死源是随后
+    // automateOpenPlatformSetup 发的 1.0.1 草稿(见那边的 findUncommittedDraftVersionId)。
+    // 给没有证据坏的路径加重试,只会给建应用链路凭空引入一个 fail-closed 抛点。
     // ⚠️ version/create、publish/commit 是非幂等写操作(传输失败即结果未知,
     // 重放会重复建版/撞版本号),故绝不套 retryIdempotent… 包装,与 fetchRaw
     // 只对 GET/HEAD 重试同源。
@@ -1727,8 +2366,7 @@ export async function createOpenPlatformAppWithClient(
     // 读 Secret 是纯只读 POST(getAppSecret 同款,不触碰 reset),幂等可重试:
     // 应用已建成、已发布,唯独最后一步读 Secret 撞网络抖动而失败最可惜——
     // 重试让它自愈,而不是把整条链路判死。
-    const appSecret = await retryIdempotentOnTransientNetworkError(() =>
-      fetchOpenPlatformAppSecret(client, appId!));
+    const appSecret = await fetchOpenPlatformAppSecret(client, appId!, { idempotentRetry: true });
     return { appId, appSecret };
   } catch (err) {
     throw new CreatedOpenPlatformAppError(appId, err);
@@ -1896,8 +2534,13 @@ export async function listOpenPlatformApps(
 export async function fetchOpenPlatformAppSecret(
   client: OpenPlatformApiClient,
   clientId: string,
+  opts: { idempotentRetry?: boolean } = {},
 ): Promise<string> {
-  const payload = await client.postJson(`/developers/v1/secret/${clientId}`, {});
+  // 纯只读 POST（不触碰 reset）⟹ 语义幂等。建应用链路显式开启重试：应用已建成
+  // 已发布，唯独最后一步读 Secret 撞网络抖动最可惜。预算只在 fetchRaw 一层。
+  const payload = opts.idempotentRetry
+    ? await client.postJsonIdempotent(`/developers/v1/secret/${clientId}`, {})
+    : await client.postJson(`/developers/v1/secret/${clientId}`, {});
   const record = asRecord(payload);
   const secret = pickString(asRecord(record.data), ['secret']) ?? pickString(record, ['secret']);
   if (!secret) throw new Error('开放平台没有返回 secret 字段');
@@ -2027,18 +2670,15 @@ async function pollFeishuQrLogin(
   };
 }
 
-function readDefaultScopeManifest(): ScopeManifest {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const candidates = [
-    join(here, 'lark-scopes.json'),
-    join(here, 'setup', 'lark-scopes.json'),
-    join(here, '..', 'src', 'setup', 'lark-scopes.json'),
-  ];
-  for (const candidate of candidates) {
-    if (!existsSync(candidate)) continue;
-    return JSON.parse(readFileSync(candidate, 'utf-8')) as ScopeManifest;
-  }
-  throw new Error('找不到 botmux lark-scopes.json');
+export function readDefaultScopeManifest(): ScopeManifest {
+  // Static JSON import (bundledScopeManifest) rather than readFileSync of a
+  // module-relative path: Bun's `--compile` inlines the import into the binary,
+  // whereas readFileSync(join(__dirname, ...)) resolves against the read-only
+  // virtual /$bunfs at runtime and always missed — the first `setup --create-app`
+  // from a curl install died with "找不到 botmux lark-scopes.json". structuredClone
+  // so callers (e.g. filterScopeManifest) can mutate without corrupting the shared
+  // bundled object.
+  return structuredClone(bundledScopeManifest) as ScopeManifest;
 }
 
 // 宿主机到飞书的偶发网络抖动（DNS EAI_AGAIN、连接被重置、路由瞬断等）会让
@@ -2061,6 +2701,73 @@ const TRANSIENT_NETWORK_ERROR_CODES = new Set([
 
 const TRANSIENT_FETCH_RETRY_DELAYS_MS = [300, 900];
 
+/**
+ * 「TLS 握手完成之前连接就断了」——Node 内置 `_tls_wrap.js` 的 `onConnectEnd`
+ * 唯一产出这句话（`ConnResetException`，code=ECONNRESET）。它的关键性质是
+ * **可证明零副作用**，因此连非幂等写请求都能安全重放。
+ *
+ * 证明链（Node + undici 的 dispatch 时序，**不是**「握手未完成 ⟹ 没有加密通道」
+ * —— 那个说法对 TLS 1.3 不成立：ServerHello 之后的握手消息已加密，协议还定义了
+ * 0-RTT early data。成立的是下面这条客户端实现约束）：
+ *   • undici 的 connector 只在 TLSSocket 的 `secureConnect` 监听器里回调
+ *     （`socket.setNoDelay(true).once('secureConnect', … cb(null, this))`），
+ *     HTTP client 拿到这个 socket 之后才 dispatch/write 请求；
+ *   • `onConnectEnd` 只在建 socket 时 `prependListener('end', …)` 挂上，并在
+ *     `onConnectSecure` 里摘掉。注意源码顺序是**先** `emit('secureConnect')`
+ *     **再** `removeListener`，所以不能说成「先摘监听器再交给 undici」；成立的是：
+ *     远端 FIN / `end` 只可能在后续 I/O 分派中被处理，而那时监听器已摘。因此这句
+ *     错误产出时，`secureConnect` 监听器没有成功走完 ⟹ undici 还没拿到可 dispatch
+ *     的连接 ⟹ 应用请求行 / 头 / body 未写出；
+ *   • Node 目前也没有让 fetch 走 TLS 0-RTT early data 的路径。
+ *   • 实测（本机 TCP 抓包型探针）：服务端只收到 1583 字节且首字节 0x16
+ *     （TLS handshake record），文本里 **不含** 请求方法、路径与 body 字段；
+ *     对照组「握手完成后才断」收到 248 字节应用数据，且错误换成
+ *     `UND_ERR_SOCKET / other side closed` —— 两类错误可靠可分。
+ *
+ * 代理场景下「零字节」限定为**目标应用的 HTTP 请求**：HTTP proxy 的 CONNECT 可能
+ * 已经发给代理，但目标 POST 尚未通过隧道发出，故「无重复副作用」的结论仍成立。
+ *
+ * ⚠️ 仅此一句话享受该待遇。`ECONNRESET` 本身**不够**：连接建成、请求已送达后
+ * 被 RST 同样是 ECONNRESET，那种情况服务端可能已处理，重放会重复提交。
+ *
+ * ⚠️ 该形态绑定 Node/undici。Bun 原生 fetch 对同一真实故障抛的是顶层 `TypeError`
+ * （message `The socket connection was closed unexpectedly...`、code=ECONNRESET、
+ * **无 cause**），不满足本判据 ⟹ 不命中、不重试（保持旧行为）。这是已知的跨运行时
+ * 缺口而非安全问题；要覆盖 Bun 必须先为它的文案建立同等级的「只可能握手前」证明。
+ */
+const PRE_TLS_DISCONNECT_MESSAGE =
+  'Client network socket disconnected before secure TLS connection was established';
+
+/**
+ * 传输层失败是否**可证明「请求未送达」**，即重放绝不会产生重复副作用。
+ * 只认 {@link PRE_TLS_DISCONNECT_MESSAGE} 那一句（唯一可证明未送达的
+ * ECONNRESET）。外层会被 undici 包成 `TypeError('fetch failed', { cause })`，
+ * 故顺**单一 cause 链**找。
+ *
+ * ⚠️ 刻意**不支持 AggregateError**，这是有意收窄而非遗漏：
+ *   • 真实的 Node pre-TLS 断连本来就不是聚合体 —— `net.internalConnectMultiple`
+ *     只在**所有** TCP connect 尝试失败时才构造 `NodeAggregateError`（成员一律
+ *     来自 `createConnectionError(…, 'connect', …)`），而这句文案由
+ *     `_tls_wrap.onConnectEnd` 在某条腿 connect **成功之后**才可能产出，两者
+ *     互斥；
+ *   • 一旦支持聚合体，就要对 `.errors` 与 `AggregateError` 同样合法的 `.cause`
+ *     同时做全称量词检查，任一遗漏都是 fail-open（实测：
+ *     `new AggregateError([preTls], '', { cause: socketHangUp })` 会被放行）。
+ *     provably 的证明责任配不上这点收益。
+ *
+ * 同理，精确文案的节点若**自带 cause**，说明它不是我们证明过的那个
+ * `ConnResetException`（Node 构造它时不挂 cause），一律 fail-closed。
+ */
+function isProvablyUnsentTransportError(err: unknown, depth = 0): boolean {
+  if (depth > 4 || !(err instanceof Error)) return false;
+  if (err.name === 'AbortError' || err.name === 'TimeoutError') return false;
+  if (err instanceof AggregateError) return false;
+  if ((err as { code?: unknown }).code === 'ECONNRESET' && err.message === PRE_TLS_DISCONNECT_MESSAGE) {
+    return err.cause === undefined;
+  }
+  return isProvablyUnsentTransportError((err as { cause?: unknown }).cause, depth + 1);
+}
+
 function isLikelyTransientNetworkError(err: unknown, depth = 0): boolean {
   if (depth > 4 || !(err instanceof Error)) return false;
   // 调用方主动 abort / 超时不算网络抖动，重试会违背调用方意图。
@@ -2076,26 +2783,6 @@ function isLikelyTransientNetworkError(err: unknown, depth = 0): boolean {
     return err.cause === undefined || isLikelyTransientNetworkError(err.cause, depth + 1);
   }
   return isLikelyTransientNetworkError((err as { cause?: unknown }).cause, depth + 1);
-}
-
-// 对「幂等」console 请求复用 fetchRaw 的瞬态退避:传输层抖动(fetch failed /
-// ECONNRESET 等)时小步重试,一次网络毛刺不再中断整条链路。API 层拒绝
-// (OpenPlatformApiError、HTTP 非 2xx、code!=0)无 code / cause,isLikely… 判 false,
-// 只会立刻抛出而不会被重放。
-// ⚠️ 只能包装「重复调用无副作用」的请求。app_version/create、publish/commit 这类
-// 「传输失败即结果未知、重放会重复提交/撞版本号」的非幂等写操作绝不能用本包装
-// (与 fetchRaw 只对 GET/HEAD 重试同源:见其上方注释)。
-async function retryIdempotentOnTransientNetworkError<T>(fn: () => Promise<T>): Promise<T> {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      return await fn();
-    } catch (err) {
-      if (attempt >= TRANSIENT_FETCH_RETRY_DELAYS_MS.length || !isLikelyTransientNetworkError(err)) {
-        throw err;
-      }
-      await sleep(TRANSIENT_FETCH_RETRY_DELAYS_MS[attempt]);
-    }
-  }
 }
 
 class MutableCookieJar {
@@ -2123,13 +2810,27 @@ class MutableCookieJar {
     };
   }
 
-  async fetchRaw(fetcher: typeof fetch, url: string, init: RequestInit = {}, maxHops = 10): Promise<Response> {
+  async fetchRaw(
+    fetcher: typeof fetch,
+    url: string,
+    init: RequestInit = {},
+    maxHops = 10,
+    opts: { idempotent?: boolean } = {},
+  ): Promise<Response> {
     let current = url;
     let referer: string | undefined;
-    // 只有幂等的 GET/HEAD 允许瞬态网络错误重试：POST 全是 console 写操作或登录
-    // 流程，传输错误时服务端可能已 commit（结果未知），重试等于重复提交。
+    // 幂等的 GET/HEAD：任意瞬态网络错误都可小步退避重试。
+    // POST 全是 console 写操作或登录流程，传输错误时服务端可能已 commit（结果
+    // 未知），重试等于重复提交 —— 唯一例外是「TLS 握手完成前就断连」，那类错误
+    // 可证明请求一个字节都没发出去（见 isProvablyUnsentTransportError），重放
+    // 不可能产生重复副作用；不放过它的代价是一次网络毛刺就让用户的改名/改头像
+    // 整轮失败。
+    // `opts.idempotent` 让调用方声明「这个 POST 重复调用无副作用」（robot/event
+    // switch 设值、只读拉 Secret），从而与 GET/HEAD 同权：认全部瞬态错误。
+    // 关键是预算**只此一层**——历史上这三处在外层另包了一轮 retry，与内层相乘
+    // 成 9 次（实测 4.8s 退避）；预算集中在这里后总尝试恒为 3。
     const method = (init.method ?? 'GET').toUpperCase();
-    const retryable = method === 'GET' || method === 'HEAD';
+    const retryable = opts.idempotent === true || method === 'GET' || method === 'HEAD';
     for (let hop = 0; hop <= maxHops; hop += 1) {
       const headers = new Headers(init.headers);
       const cookieHeader = getCookieHeader(this.cookies, current);
@@ -2143,7 +2844,12 @@ class MutableCookieJar {
           response = await fetcher(current, { ...init, headers, redirect: 'manual' });
           break;
         } catch (err) {
-          if (!retryable || attempt >= TRANSIENT_FETCH_RETRY_DELAYS_MS.length || !isLikelyTransientNetworkError(err)) {
+          // 可重试 = 幂等方法遇任意瞬态错误，或任意方法遇「可证明未送达」的
+          // pre-TLS 断连。后者对写操作也安全（零字节送达 ⟹ 无副作用）。
+          const mayRetry = retryable
+            ? isLikelyTransientNetworkError(err)
+            : isProvablyUnsentTransportError(err);
+          if (attempt >= TRANSIENT_FETCH_RETRY_DELAYS_MS.length || !mayRetry) {
             throw err;
           }
           await sleep(TRANSIENT_FETCH_RETRY_DELAYS_MS[attempt]);
@@ -2192,6 +2898,24 @@ function openPlatformOwnerAccessDenied(error: unknown): boolean {
   if (!(error instanceof OpenPlatformApiError)) return false;
   const payload = asRecord(error.payload);
   return error.status === 403 && payload.code === 10003;
+}
+
+/**
+ * 飞书开放平台的「应用整体正在审核中」锁：`code=10046 审核中, 请刷新`。
+ *
+ * 审核期间应用配置被**整体写锁**——实测被拒的不只是发版，还包括
+ * `scope/update`（申请权限本体）、`robot/switch`、`safe_setting/update`、`base_info`；
+ * 读接口（`scope/all` / `privilege/all` / `app_version/list` / `visible/online` /
+ * `event/` / `callback/`）全部照常可读。
+ *
+ * 所以这是一种**等待即可自愈**的状态，不是配置错误：审批通过后写操作自然恢复。历史
+ * 行为是把它当普通 `api_error` 硬失败，于是每次 daemon 重启都把整条链路重跑一遍、
+ * 再报一次「开放平台 API 错误」（线上两台别人的 bot 今天各撞 8 次），既没用又盖掉了
+ * 真实原因。识别出来单独给个 reason，让调用方能说人话、并且**不必反复重试**。
+ */
+export function openPlatformUnderReview(error: unknown): boolean {
+  if (!(error instanceof OpenPlatformApiError)) return false;
+  return asRecord(error.payload).code === 10046;
 }
 
 class FeishuWebSessionError extends Error {
@@ -2258,6 +2982,46 @@ function collectScopeEntries(value: unknown, bucket: 'tenant' | 'user' | undefin
   }
 }
 
+/**
+ * 从一条 privilege 里取出数据范围表单的字段定义。
+ *
+ * 字段在响应里出现**两处**：解析好的 `schemaContent.selectionExpressionSchemaContent`
+ * 和原始 JSON 字符串 `schema`（内层 key 是首字母大写的
+ * `SelectionExpressionSchemaContent`）。优先用前者，缺失时回退解析后者——两者
+ * 在实测数据里内容一致，但结构化那份不保证一直在。
+ */
+function extractPrivilegeStaffFields(record: Record<string, unknown>): OpenPlatformPrivilegeField[] {
+  const structured = asRecord(asRecord(record.schemaContent).selectionExpressionSchemaContent);
+  let rawFields = Array.isArray(structured.fields) ? structured.fields : undefined;
+  if (!rawFields) {
+    const schemaText = pickString(record, ['schema']);
+    if (schemaText) {
+      try {
+        const parsed = asRecord(asRecord(JSON.parse(schemaText)).schema_content);
+        const inner = asRecord(parsed.SelectionExpressionSchemaContent);
+        if (Array.isArray(inner.fields)) rawFields = inner.fields;
+      } catch {
+        // schema 不是合法 JSON:当作没有字段,上层 canFill… 会因此跳过这条
+      }
+    }
+  }
+  if (!rawFields) return [];
+  const fields: OpenPlatformPrivilegeField[] = [];
+  for (const entry of rawFields) {
+    const field = asRecord(entry);
+    const id = pickString(field, ['id']);
+    if (!id) continue;
+    const operators = Array.isArray(field.operators) ? field.operators : [];
+    fields.push({
+      id,
+      name: pickString(field, ['name']) ?? '',
+      selectStaff: pickString(asRecord(field.data_source), ['type']) === 'select_staff',
+      supportsIn: operators.includes('in'),
+    });
+  }
+  return fields;
+}
+
 function mapScopeIds(scopeNames: string[], catalog: OpenPlatformScopeEntry[], bucket: 'tenant' | 'user') {
   const ids: string[] = [];
   const missing: string[] = [];
@@ -2292,6 +3056,252 @@ export function nextAppVersion(payload: unknown): string {
     return a;
   });
   return [max[0], max[1], max[2] + 1].join('.');
+}
+
+/**
+ * console `app_version/list` 里 `versionStatus` 的取值。**别用公开 API
+ * (`application/v6/.../app_versions`) 的 `status` 语义去读它** ——两套枚举不一样，
+ * 实测同一批版本的对照（左 console / 右公开 API）：
+ *
+ * | console `versionStatus` | 公开 API `status` | 含义 |
+ * |---|---|---|
+ * | `0`   | `4` | 未提交审核（草稿） |
+ * | `1`   | `3` | 审核中 |
+ * | `2`   | `1` | 已上线（当前线上版本） |
+ * | `100` | `1` | 历史已上线版本 |
+ *
+ * 草稿定 `DRAFT`、审核中定 `IN_REVIEW`：两者语义**相反**（草稿要提交，审核中要撤回），
+ * 各有一个消费者。判据一律写成 `=== 常量`，别写 `!== 某个` 这种反向式——那会把
+ * `100`/`2`（历史/当前线上版本）也一起卷进来。
+ */
+export const CONSOLE_VERSION_STATUS_DRAFT = 0;
+export const CONSOLE_VERSION_STATUS_IN_REVIEW = 1;
+
+/**
+ * 找出 `app_version/list` 里那个**未提交审核的草稿**（console 上「待提交」）。
+ *
+ * 为什么需要它：飞书**不允许并存两个未提交版本**——存在草稿时 `app_version/create`
+ * 一律回 `code=10043 版本已创建，请刷新`。而 botmux 的权限自愈每次都想发一版，于是
+ * 一个草稿就能把自愈**永久**卡死：每次 daemon 重启都重跑一遍必败的请求，还给管理员
+ * 重发一遍「缺 N 项权限」的 DM（线上实测一天 5 次，其中一台还是别人的 bot）。
+ *
+ * ⚠️ **只认草稿（`versionStatus=0`），绝不碰审核中（`versionStatus=1`）。** 审核中
+ * 的版本是别人真的提交上去、正在排队的东西，自动流程去动它等于把人家的审批干掉。
+ * 线上就有两台处于审核中且**不属于本机 owner**，所以这个边界是硬的。
+ *
+ * 返回草稿的 `versionId`；没有草稿返回 undefined。
+ */
+export function findUncommittedDraftVersionId(payload: unknown): string | undefined {
+  const data = asRecord(asRecord(payload).data);
+  const versions = Array.isArray(data.versions) ? data.versions : [];
+  for (const item of versions) {
+    const record = asRecord(item);
+    if (record.versionStatus !== CONSOLE_VERSION_STATUS_DRAFT) continue;
+    const versionId = pickString(record, ['versionId', 'version_id', 'id']);
+    if (versionId) return versionId;
+  }
+  return undefined;
+}
+
+/**
+ * 回读 `app_version/list`，确认某个 versionId **真的离开了草稿态**。
+ *
+ * `publish/commit` 返回 `code=0` **不等于**版本已提交：线上实测过一次
+ * commit 回 `{code:0, data:{isOk:true}}`、版本却仍停在 `versionStatus=0`，于是日志
+ * 高高兴兴写「version … published」，实际留下的正是卡死后续所有自愈的那个草稿。
+ * 同文件里 `eventModeReady` 早就立了「switch 接口返回成功≠生效，必须回读」的规矩，
+ * 发版这条链路照抄一遍。
+ *
+ * 返回 true = 该版本已不是草稿（已上线或已进审核）。
+ */
+export function isVersionCommitted(payload: unknown, versionId: string): boolean {
+  const data = asRecord(asRecord(payload).data);
+  const versions = Array.isArray(data.versions) ? data.versions : [];
+  for (const item of versions) {
+    const record = asRecord(item);
+    if (pickString(record, ['versionId', 'version_id', 'id']) !== versionId) continue;
+    return record.versionStatus !== CONSOLE_VERSION_STATUS_DRAFT;
+  }
+  // 版本号在列表里找不到 → 无法证明它已提交，保守判 false（宁可多报一句 warning，
+  // 也不要重复上一次「拿 code=0 当已发布」的错）。
+  return false;
+}
+
+/**
+ * 找出正在**审核中**的版本（console 上「审核中」）。
+ *
+ * 与 {@link findUncommittedDraftVersionId} 是**互补的两种卡死**：草稿（0）让
+ * `app_version/create` 撞 `code=10043`；审核中（1）让开放平台把**整个应用配置写锁**
+ * （`scope/update` / `robot/switch` / `safe_setting/update` 全回 `code=10046`），
+ * 详见 {@link openPlatformUnderReview}。
+ *
+ * 审核中的版本**只能先撤回**才能改配置——console 自己也这么说（"Unable to edit, as
+ * the organization administrator is reviewing the app's version release request."），
+ * 它的 Withdraw 按钮打的就是 {@link cancelPendingReviewVersion} 里那个端点。
+ */
+export function findInReviewVersionId(payload: unknown): string | undefined {
+  const data = asRecord(asRecord(payload).data);
+  const versions = Array.isArray(data.versions) ? data.versions : [];
+  for (const item of versions) {
+    const record = asRecord(item);
+    if (record.versionStatus !== CONSOLE_VERSION_STATUS_IN_REVIEW) continue;
+    const versionId = pickString(record, ['versionId', 'version_id', 'id']);
+    if (versionId) return versionId;
+  }
+  return undefined;
+}
+
+/**
+ * 撤回一个正在审核中的版本，好让应用配置重新可写。
+ *
+ * 端点是从 console 实测抓来的（**不是猜的**）：版本详情页的 Withdraw 按钮打
+ * `POST /developers/v1/publish/cancel_commit/<appId>/<versionId>`，body `{}` ——
+ * 与既有的 `publish/commit/<appId>/<versionId>` 完全对称。当时用页面内 hook 拦下了
+ * 请求所以没有真撤掉别人的审批。
+ *
+ * 🔴 **当前没有任何自动调用方，这是刻意的。** 曾经在「缺必需权限 + 审核中」时自动撤，
+ * 后来判定那是错的：**触发审批通常意味着有配置不合规**（最常见是数据范围默认「全部」，
+ * 撞租户加签规则），撤回重提会被同一条规则再拦一次 ⟹ 等于用不可逆动作（丢掉审批队列
+ * 位置，线上见过排 18 / 23 天的）驱动一个死循环。更一般地：**审批是规则驱动的闸，不是
+ * 队列**，撤回不绕过规则、只丢位置。所以正确处置是告诉人、让人改配置后自己撤。
+ *
+ * 保留它是为了「检测」与将来可能的**人工辅助**入口（比如显式命令）。若要再接自动调用，
+ * 先回答「撤回之后凭什么这次能过」—— 答不上就不该撤。
+ *
+ * 撤回后**回读确认**：`cancel_commit` 返回 code=0 不等于状态真的变了（同一个坑在
+ * `publish/commit` 上已经栽过一次，见 {@link isVersionCommitted}）。
+ */
+export async function cancelPendingReviewVersion(
+  postJson: OpenPlatformPostJson,
+  appId: string,
+  versionId: string,
+): Promise<{ ok: boolean; message?: string }> {
+  try {
+    await postJson(`/developers/v1/publish/cancel_commit/${appId}/${versionId}`, {});
+  } catch (err: any) {
+    return { ok: false, message: `撤回审核中版本失败: ${safeErrorMessage(err)}` };
+  }
+  try {
+    const after = await postJson(`/developers/v1/app_version/list/${appId}`, {});
+    if (findInReviewVersionId(after) === versionId) {
+      return { ok: false, message: `版本 ${versionId} 撤回后回读仍是「审核中」` };
+    }
+    return { ok: true };
+  } catch (err: any) {
+    // 撤回请求本身没报错，只是回读失败 ⟹ 状态未知。当作失败处理（保守），让上层
+    // 落回「审核中」提示而不是继续往一个可能仍锁着的应用上写。
+    return { ok: false, message: `撤回后状态回读失败（无法确认）: ${safeErrorMessage(err)}` };
+  }
+}
+
+/**
+ * 「提交发布后会不会**秒过**」的预判结果。
+ *
+ * `autoApproved: true` = 审批流里除「发起 / 结束 / 抄送」外的节点全是「自动通过」，
+ * 没有任何真人审批人 ⟹ 提交它不打扰任何人、立即生效。
+ */
+export interface ApprovalFlowPrediction {
+  /** 能否确定地判断（false = 接口报错 / 结构不认识 / 算不出流程，调用方必须 fail-closed）。 */
+  known: boolean;
+  /** 全自动通过且零真人审批人。仅 known:true 时有意义。 */
+  autoApproved: boolean;
+  /** 流程里的真人审批人姓名（抄送人不算——抄送只是知会，不阻塞）。 */
+  humanApprovers: string[];
+  /** 无法判断时的原因（进日志用）。 */
+  reason?: string;
+}
+
+/** 审批流程里「不构成审批关卡」的节点名（中英文环境都出现过）。 */
+const APPROVAL_FLOW_NON_GATE_NODES = new Set(['发起', '结束', 'Initiate', 'End']);
+/** console 对「这一关不需要人审」的节点类型取值（中/英文环境）。 */
+const APPROVAL_FLOW_AUTO_NODE_TYPES = new Set(['自动通过', 'Auto approved']);
+
+/**
+ * 解析 `approval_nodes/get` 的返回，判断这一版提交后是否会自动通过。
+ *
+ * ⚠️ **两个「名字像在回答这个问题、实际答的是另一个」的字段，都不能当判据**：
+ *
+ * | 字段 | 来源 | 实测 | 真实语义 |
+ * |---|---|---|---|
+ * | `canAutoApproval` | 同一个 `approval_nodes/get` 响应 | 秒过那台是 **false**、无待发布版本那台反而 **true** | 更像「理论上能否免审」，与本次会不会秒过**相反** |
+ * | `ApprovalType` | `config/audit_rule` | 秒过/要人审的 **4 台全是 1**，只有无待发布版本那台是 0 | 更像「有没有审批流」 |
+ *
+ * 两个都跨 5～6 台实测过。判据只能落在 `applyNodes` 的节点类型上 —— 上面那张表是为了
+ * 让后人别图省事去读那两个字段（名字比 `applyNodes` 好懂得多，正因如此才危险）。
+ *
+ * ⚠️ 解析路径是 `data.applyInstanceInfo.applyNodes`。**不是** `approvalNodes.nodes`
+ * ——按那个路径读，跨 6 台 bot 全部返回空数组，「所有输入同一输出」正是判据失效的
+ * 特征（当时打了原始 JSON 才找到真路径）。
+ *
+ * 抄送人（`nodeCcUser`）**不算**审批人：抄送只知会、不阻塞流程，把它算进去会让本可
+ * 自动提交的版本被误判成需要人工。
+ */
+export function predictApprovalFlow(payload: unknown): ApprovalFlowPrediction {
+  const nodes = asRecord(asRecord(asRecord(payload).data).applyInstanceInfo).applyNodes;
+  if (!Array.isArray(nodes) || nodes.length === 0) {
+    // 空数组的正常成因是「没有待发布版本，无流程可算」，不是故障；但既然算不出来，
+    // 就必须让调用方走保守路径，不能默认成「可以自动提交」。
+    return { known: false, autoApproved: false, humanApprovers: [], reason: '审批流程为空（可能没有待发布版本）' };
+  }
+  const gates = nodes
+    .map(node => asRecord(node))
+    .filter(node => {
+      const name = pickString(node, ['nodeName']) ?? '';
+      if (APPROVAL_FLOW_NON_GATE_NODES.has(name)) return false;
+      // 抄送节点：有 nodeCcUser 且没有 nodeUser
+      const cc = Array.isArray(node.nodeCcUser) ? node.nodeCcUser : [];
+      const users = Array.isArray(node.nodeUser) ? node.nodeUser : [];
+      return !(cc.length > 0 && users.length === 0);
+    });
+  if (gates.length === 0) {
+    return { known: false, autoApproved: false, humanApprovers: [], reason: '审批流程里没有可判定的关卡节点' };
+  }
+  const humanApprovers: string[] = [];
+  for (const gate of gates) {
+    for (const entry of (Array.isArray(gate.nodeUser) ? gate.nodeUser : [])) {
+      const name = pickString(asRecord(asRecord(entry).approver), ['name', 'enName']);
+      if (name) humanApprovers.push(name);
+    }
+  }
+  const allAuto = gates.every(gate => APPROVAL_FLOW_AUTO_NODE_TYPES.has(pickString(gate, ['nodeType']) ?? ''));
+  return {
+    known: true,
+    autoApproved: allAuto && humanApprovers.length === 0,
+    humanApprovers: uniqueStrings(humanApprovers),
+  };
+}
+
+/**
+ * 查这一版提交后是否会自动通过。
+ *
+ * body 必须**带全字段**：只传 `{}` 会被开放平台拒 `code=10001 请求错误，请刷新页面后重试`。
+ * `visibleSuggest` 用线上现值原样填（与发版同源，见 {@link parseOnlineVisibility}），
+ * 因为可见范围会影响审批规则（申请全员范围要加签）。
+ *
+ * 任何异常都返回 `known:false`，由调用方 fail-closed —— 判不出来时**不许**自动提交。
+ */
+export async function fetchApprovalFlowPrediction(
+  postJson: OpenPlatformPostJson,
+  appId: string,
+  versionId: string,
+  visibility: { visibleSuggest: VisibilitySuggest; blackVisibleSuggest: VisibilitySuggest },
+): Promise<ApprovalFlowPrediction> {
+  try {
+    const payload = await postJson(`/developers/v1/approval_nodes/get/${appId}`, {
+      visibleSuggest: visibility.visibleSuggest,
+      blackVisibleSuggest: visibility.blackVisibleSuggest,
+      b2cShareSplitConfigSuggest: {
+        b2cGroupChatShareEnable: false,
+        b2cP2PChatShareEnable: false,
+        b2cP2PChatNeedAudit: false,
+      },
+      versionId,
+      notCalculateFlow: false,
+    });
+    return predictApprovalFlow(payload);
+  } catch (err: any) {
+    return { known: false, autoApproved: false, humanApprovers: [], reason: safeErrorMessage(err) };
+  }
 }
 
 /** 从 app_version/create 响应提取 versionId（多种响应形态兼容）。 */

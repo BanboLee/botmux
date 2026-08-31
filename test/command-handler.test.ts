@@ -502,7 +502,7 @@ vi.mock('../src/im/lark/cot-message.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { setCotMode } from '../src/services/cot-mode-store.js';
 import { handleCotThinkingUpdate } from '../src/im/lark/cot-message.js';
@@ -660,7 +660,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/fork', '/forklist', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth'];
+    const expected = ['/close', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/fork', '/forklist', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -693,10 +693,10 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 35 = current master command set (34, incl. /forklist and /cot) + /cli.
-    // /fork and /issue remain first-class daemon commands. /subscribe-lark-doc remains
-    // as its original per-file API subscription command rather than an alias.
-    expect(DAEMON_COMMANDS.size).toBe(35);
+    // 36 = master 的 35 条（含 /forklist、/cot、/cli）+ /retry。
+    // /fork 与 /issue 仍是一等 daemon 命令；/subscribe-lark-doc 保持原本的
+    // 按文件 API 订阅命令语义，不做别名。
+    expect(DAEMON_COMMANDS.size).toBe(36);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
@@ -1299,7 +1299,7 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     }
   });
 
-  it('keeps raw passthrough off Codex App while honoring a frozen session CLI override', () => {
+  it('keeps raw passthrough off structured/service CLIs while honoring a frozen interactive override', () => {
     mockCodexAppBot();
 
     // App Server turns must use the structured message lane; raw_input has no
@@ -1317,6 +1317,10 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(resolvePassthroughCommands(LARK_APP_ID, 'mira').size).toBe(0);
     expect(resolvePassthroughCommands(LARK_APP_ID, 'mir').size).toBe(0);
     expect(resolvePassthroughCommands(LARK_APP_ID, 'dsh').size).toBe(0);
+    // ebsd is interactive, but every external message must pass through the
+    // service-user envelope and structured terminal-marker ledger.
+    expect(cliHasNoRawPassthroughSurface('ebsd')).toBe(true);
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'ebsd').size).toBe(0);
   });
 
   it('threads the frozen CLI through the ADAPTER-SCOPED layer, not just the builtin set', () => {

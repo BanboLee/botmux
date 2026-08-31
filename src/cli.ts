@@ -6,6 +6,7 @@
  *   botmux setup          — interactive first-time configuration
  *   botmux setup --no-open-platform-auto — skip Feishu Open Platform automation
  *   botmux setup list|add|configure|edit|remove — scripted (non-TUI) bot management, see `botmux setup help`
+ *   botmux clone <bot> [--name <name>] — create a new app, then copy an existing bot's configuration
  *   botmux start          — start daemon and auto plugin services
  *   botmux stop [--with-plugin] — stop daemon (optionally stop auto plugin services)
  *   botmux restart [--with-plugin] — restart daemon, then ensure auto plugin services
@@ -44,6 +45,7 @@ import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchC
 import { withBotSteerDirective } from './core/bot-steer-directive.js';
 import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
 import {
+  consumeAutostartUnitMarker,
   enableAutostart,
   disableAutostart,
   autostartStatus,
@@ -55,6 +57,8 @@ import {
   applyBotConfigEdits,
   assertUniqueBotProcessNames,
   botProcessName,
+  cloneBotConfig,
+  cloneOwnerEntries,
   normalizeBotConfig,
   parseBotConfigsJson,
   parseBotSelection,
@@ -67,7 +71,7 @@ import {
 } from './setup/bot-config-editor.js';
 import { resolveCliSelection, selectionKeyForBot } from './setup/cli-selection.js';
 import { checkCliAvailability, hasAgentLaunchConfigChanged } from './setup/cli-availability.js';
-import { resolveSetupAppName } from './setup/app-name.js';
+import { resolveCloneAppName, resolveSetupAppName } from './setup/app-name.js';
 import {
   blocksSetupBotStart,
   classifySetupOpenPlatformOutcome,
@@ -92,6 +96,7 @@ import {
 } from './setup/owner-identity.js';
 import { interactiveSelect, pickChoice, pickCliSelection } from './setup/interactive-select.js';
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
+import bundledScopeManifest from './setup/lark-scopes.json' with { type: 'json' };
 import type { CliId } from './adapters/cli/types.js';
 import type { CodexAppDispatchLedgerEntry } from './types.js';
 import {
@@ -100,8 +105,8 @@ import {
 import { hasProtectedSessionMutationOwnership } from './core/session-mutation-guard.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
-import { reapLegacyPm2 } from './core/legacy-pm2-reaper.js';
-import { withFileLock, withFileLockSync } from './utils/file-lock.js';
+import { reapLegacyPm2, liveGodAt } from './core/legacy-pm2-reaper.js';
+import { withFileLock, withFileLockSync, FileLockTimeoutError } from './utils/file-lock.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional, hasFlagOrEq } from './cli/arg-utils.js';
@@ -130,16 +135,24 @@ import {
   PM2_DAEMON_KILL_TIMEOUT_MS,
   PM2_DAEMON_RESTART_DELAY_MS,
 } from './core/shutdown-budgets.js';
-import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
+import { describeSendFailure, dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
+import { buildCardPatchSuccessOutput, CARD_COMMAND_USAGE, CARD_PATCH_USAGE, cardPatchArgsWantHelp, executeCardPatch, parseCardPatchArgs, readCardPatchInput } from './cli/card-dispatch.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
+import { ensureDevboxDashboardExport } from './platform/devbox-dashboard-export.js';
+import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/binding.js';
+import { isRemoteAccessEnabled } from './global-config.js';
 import {
   DASHBOARD_COMMAND_USAGE,
-  executeDashboardCommand,
+  dashboardComingUpFromState,
+  dashboardFailureIsTerminal,
+  executeDashboardCliCommand,
   formatDashboardFallbackFailure,
   formatDashboardSuccessLines,
+  formatDashboardUnreachable,
+  shouldKeepWaitingForDashboard,
 } from './cli/dashboard-command.js';
 import { globalInstallUpdateLockTarget, globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
 import {
@@ -147,7 +160,10 @@ import {
   resolveGlobalInstallPlan,
   UnsupportedGlobalInstallError,
 } from './utils/global-install.js';
-import { isLocalDevInstall, botmuxCliEntryAt, bakedBinaryVersion } from './utils/install-info.js';
+import { isLocalDevInstall, botmuxCliEntryAt, bakedBinaryVersion, botmuxInstallRoot } from './utils/install-info.js';
+import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-self-update.js';
+import { fetchLatestVersion, isNewerVersion } from './core/update-check.js';
+import { resolveCurrentVersion } from './utils/install-diagnostics.js';
 import {
   resolveLocalDevCheckoutDir,
   isGitWorktree,
@@ -190,6 +206,7 @@ import {
   type BotCollaborationFactsByAppId,
 } from './cli/bots-list-output.js';
 import { ensureBotChatGrantMatrix, requestExactChatGrant } from './cli/exact-chat-grant-client.js';
+import { loopbackFetch } from './core/loopback-fetch.js';
 import {
   buildFooterAddressing,
   hasKnownBotMention,
@@ -508,20 +525,8 @@ function botBrand(b: any): Brand {
  * Returns: 写出的 JSON 文件绝对路径.
  */
 function writeScopesJsonToConfigDir(): string {
-  // build script 会把 src/setup/lark-scopes.json copy 到 dist/setup/.
-  // dist 模式下 __dirname 是 dist/, 找 ./setup/lark-scopes.json; dev (tsx)
-  // 模式找 src/setup/lark-scopes.json 在源码同目录也成立.
-  const here = dirname(fileURLToPath(import.meta.url));
-  const srcCandidates = [
-    join(here, 'setup', 'lark-scopes.json'),
-    join(here, '..', 'src', 'setup', 'lark-scopes.json'),
-  ];
-  let scopesPath = srcCandidates[0];
-  for (const p of srcCandidates) {
-    if (existsSync(p)) { scopesPath = p; break; }
-  }
   const destPath = join(CONFIG_DIR, 'lark-scopes.json');
-  copyFileSync(scopesPath, destPath);
+  writeFileSync(destPath, `${JSON.stringify(bundledScopeManifest, null, 2)}\n`);
   return destPath;
 }
 
@@ -676,7 +681,14 @@ async function finishOpenPlatformSetup(
       say(`      请到开放平台「安全设置」→「重定向 URL」手动添加: ${redirectUrls.join('、')}`);
       say('      缺了它，群聊模式 p2pMode=group / 会话群标签 / `/login` 点授权会直接报 20029。');
     }
-    if (result.versionId) say(`   已提交发布版本: ${result.versionId}`);
+    // 「已提交发布版本」不能无条件说：commit 回 code=0 而版本仍停在草稿态是实测发生过
+    // 的（那个草稿正是卡死后续每一次权限自愈的元凶）。versionWarning 有值时权限**不会
+    // 生效**，报「已提交」就是假绿灯，用户会干等。
+    if (result.versionWarning) {
+      say(`   ⚠️ 版本未确认提交发布：${result.versionWarning}`);
+      say('      权限要等版本发布后才生效；请到开放平台「版本管理与发布」确认该版本状态。');
+    } else if (result.versionId) say(`   已提交发布版本: ${result.versionId}`);
+    else if (result.publishSkipped) say('   本次配置无变更，已跳过发版（未创建新版本）。');
     else say('   已创建版本；未从响应中解析到 versionId，请到开放平台确认是否需要手动发布。');
     say('');
     return outcome;
@@ -1466,7 +1478,10 @@ function botJsonView(bot: Record<string, any>, index: number): Record<string, an
  * 的老姿势在问题序列变化时会静默错位）。校验口径与 TUI 一致：目录存在性、
  * owner 必填、凭证变更时的 tenant_access_token 校验，任一失败不写盘。
  */
-async function cmdSetupScripted(argv: string[]): Promise<void> {
+async function cmdSetupScripted(
+  argv: string[],
+  cloneSource?: Record<string, any>,
+): Promise<void> {
   const wantsJson = argv.includes('--json');
   let cmd: SetupCommand;
   try {
@@ -1734,6 +1749,9 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
     } catch (err: any) {
       failSetupScripted(cmd.json, err?.message ?? String(err));
       return;
+    }
+    if (cloneSource) {
+      bot = cloneBotConfig(cloneSource, bot);
     }
 
     if (existing.some(b => b?.larkAppId === bot.larkAppId)) {
@@ -2040,6 +2058,51 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
   }
 }
 
+async function cmdClone(argv: string[]): Promise<void> {
+  const [sourceSelector, nameFlag, requestedName] = argv;
+  if (
+    !sourceSelector
+    || (argv.length !== 1 && (argv.length !== 3 || nameFlag !== '--name' || !requestedName?.trim()))
+  ) {
+    console.error('用法: botmux clone <进程名|配置名|AppID> [--name <新名称>]');
+    process.exitCode = 1;
+    return;
+  }
+  const bots = loadBotsJson();
+  const sourceIndex = parseBotSelection(sourceSelector, bots);
+  if (sourceIndex === undefined) {
+    console.error(`找不到机器人 "${sourceSelector}"。`);
+    process.exitCode = 1;
+    return;
+  }
+  const source = bots[sourceIndex];
+  const owners = cloneOwnerEntries(
+    source,
+    process.env.BOTMUX_LARK_APP_ID,
+    process.env.BOTMUX_OWNER_OPEN_ID ?? process.env.__OWNER_OPEN_ID,
+  );
+  if (!hasOwnerEntry(owners)) {
+    console.error('源机器人没有可跨应用复用的 owner（邮箱、手机号、on_ union_id，或当前会话已认证的 owner）。');
+    process.exitCode = 1;
+    return;
+  }
+  const addArgs = ['add', '--create-app', '--allowed-users', owners.join(',')];
+  if (botBrand(source) === 'lark') {
+    if (requestedName) {
+      console.error('Lark SDK 创建路径暂不支持自定义应用名称。');
+      process.exitCode = 1;
+      return;
+    }
+    addArgs.push('--brand', 'lark');
+  } else {
+    const sourceName = typeof source.displayName === 'string' && source.displayName.trim()
+      ? source.displayName.trim()
+      : botProcessName(source, sourceIndex);
+    addArgs.push('--app-name', resolveCloneAppName(requestedName, sourceName));
+  }
+  await cmdSetupScripted(addArgs, source);
+}
+
 // ─── Commands ────────────────────────────────────────────────────────────────
 
 async function cmdSetup(): Promise<void> {
@@ -2318,6 +2381,9 @@ function preflightNodeSanity(): void {
 }
 
 async function cmdStart(): Promise<void> {
+  // FIRST STATEMENT, before any await or dependency probe: those run as child
+  // processes and would inherit the marker. See consumeAutostartUnitMarker.
+  const bootHookStart = consumeAutostartUnitMarker();
   // `--systemd-service` and the PM2-God ownership gating that used to live here
   // are gone with pm2 itself: the built-in supervisor owns single-owner exclusion
   // via fleet-state (pid + kill-0 under the fleet mutation lock), so there is no
@@ -2331,7 +2397,9 @@ async function cmdStart(): Promise<void> {
   await ensureSystemDependencies();
 
   const botsForCheck = await preflightConfiguredBotCredentials();
-  await startConfiguredFleet(botsForCheck);
+  // The boot hook marks itself so purely presentational waiting can be skipped
+  // there (see startConfiguredFleet).
+  await startConfiguredFleet(botsForCheck, { bootHookStart });
 }
 
 /** Validate before systemd handoff so a predictable failure cannot stop the old fleet. */
@@ -2368,7 +2436,7 @@ async function preflightConfiguredBotCredentials() {
 
 async function startConfiguredFleet(
   botsForCheck: ReturnType<typeof loadBotsJson>,
-  options: { systemdServiceStart?: boolean } = {},
+  options: { bootHookStart?: boolean } = {},
 ): Promise<void> {
 
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
@@ -2406,17 +2474,27 @@ async function startConfiguredFleet(
   console.log(`\n✅ daemon 已启动${count > 1 ? ` (${count} 个机器人, 每个独立进程)` : ''}`);
   console.log(`   日志: botmux logs`);
   console.log(`   状态: botmux status`);
-  // If the user previously enabled autostart, sync the unit file in case
-  // node/cli.js paths changed since (nvm switch, npm upgrade, etc.).
-  // A Type=forking unit necessarily has a live start Job/activating state
-  // until this ExecStart child returns. The parent repair transaction already
-  // wrote and daemon-reloaded the unit; self-refresh here would reject that
-  // expected in-flight state and make every systemd start fail.
-  if (!options.systemdServiceStart
+  // If the user previously enabled autostart, sync the unit file in case the
+  // launch paths changed since (nvm switch, npm upgrade, a move between the Node
+  // and compiled forms).
+  // NOT UNDER THE BOOT HOOK ITSELF: the unit is `Type=oneshot` with
+  // `RemainAfterExit=yes`, so this ExecStart child IS the start job — rewriting
+  // and `daemon-reload`ing the very unit that is mid-transaction is at best
+  // pointless and at worst makes the start fail.
+  if (!options.bootHookStart
       && refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
-    console.log(`   autostart 主 unit 已同步到当前 Node/cli.js 路径`);
+    console.log(`   autostart 主 unit 已同步到当前启动路径`);
   }
-  await printDashboardHintWithRetry();
+  // NOT UNDER systemd. Nobody reads a dashboard link at boot, and this poll waits
+  // up to DASHBOARD_READY_WAIT_MS (90s) — exactly the DefaultTimeoutStartUSec on a
+  // stock user manager (VERIFIED: `systemctl --user show -p
+  // DefaultTimeoutStartUSec` → 1min 30s), with the credential preflight, legacy
+  // reap and plugin reconcile already spent before we get here. A slow fleet would
+  // push this Type=oneshot unit past that deadline; systemd would call the start a
+  // failure and, under the default KillMode=control-group, take the freshly
+  // started supervisor down with the unit — so fixing the unit's path would be
+  // undone by waiting inside it. Purely presentational: skip it.
+  if (!options.bootHookStart) await printDashboardHintWithRetry();
 }
 
 /**
@@ -2452,12 +2530,22 @@ function sleepSyncMs(ms: number): void {
  * double-run alongside the supervisor. This detects that stale God and stops it
  * (delegated to the self-contained `reapLegacyPm2`), so the operator never has
  * to `pm2 kill` by hand. Fail-safe + no-op on fresh installs / when pm2 is
- * absent (always the case for the compiled single binary). The `_op` parameter
- * is retained for call-site compatibility but no longer changes behavior — the
- * reaper is a single idempotent operation.
+ * absent. The `_op` parameter is retained for call-site compatibility but no
+ * longer changes behavior — the reaper is a single idempotent operation.
+ *
+ * A reap that finds a God but cannot confirm it is down is reported on STDERR,
+ * not just through `logger`: CLI mode runs with `logger.setSilent(true)`, so the
+ * reaper's own notes are invisible without DEBUG. That silence is how a
+ * double-run started unnoticed — both fleets live, two processes consuming the
+ * same Feishu events and the same session sqlite. The operator needs to see it.
  */
 function cleanupLegacyPm2(_op?: 'stop' | 'restart'): boolean {
   const r = reapLegacyPm2(CONFIG_DIR, PKG_ROOT, (m) => logger.info(`[legacy-pm2] ${m}`));
+  if (r.unresolved) {
+    console.warn(`⚠️  检测到迁移前的 pm2 守护进程,但未能确认其已停止:${r.note}`);
+    console.warn('   旧 fleet 可能仍在消费同一批飞书事件(消息重复、会话存储争用)。');
+    console.warn('   请手动确认:ps -ef | grep index-daemon   然后停掉旧进程后重试。');
+  }
   return r.found;
 }
 
@@ -2586,11 +2674,18 @@ async function cmdRestart(): Promise<void> {
 
     await reconcilePluginServicesForCli(undefined, { autoOnly: true });
     if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
-      console.log(`autostart 主 unit 已同步到当前 Node/cli.js 路径`);
+      console.log(`autostart 主 unit 已同步到当前启动路径`);
     }
     console.log('✅ daemon 已重启');
-    await printDashboardHintWithRetry();
   }, { maxWaitMs: 5_000 });
+  // OUTSIDE THE FLEET MUTATION LOCK, deliberately. This poll waits up to
+  // DASHBOARD_READY_WAIT_MS (90s) and reads nothing the lock protects — it only
+  // asks the dashboard for a link. Holding the lock across it would block every
+  // other fleet mutation (`start`, `stop`, `start-bot`, plugin reconcile) for that
+  // whole time, and those callers give up after 5s with a lock timeout. The
+  // restart itself, its health gate, the plugin reconcile and the autostart sync
+  // all stay inside.
+  await printDashboardHintWithRetry();
 }
 
 
@@ -2849,14 +2944,18 @@ async function ensureSystemDependencies(): Promise<void> {
  * supervisor view while old pm2-managed daemons keep running. Self-contained:
  * no pm2 CLI call. `botmux start`/`restart` will reap it (reapLegacyPm2).
  *
- * TWO SIGNALS, deliberately different per home — this must agree with
- * reapLegacyPm2's detection or the warning lies in one direction or the other:
+ * TWO SIGNALS, deliberately different per home. Both go through the reaper's own
+ * `liveGodAt` so the warning and the reaper cannot disagree — this used to be a
+ * second, hand-kept copy of that logic, and it drifted: it trusted a bare
+ * `kill(pid, 0)` (true for the ZOMBIE a fresh reap leaves behind) and a bare
+ * `existsSync(rpc.sock)` (which outlives `pm2 kill`), so the warning survived a
+ * SUCCESSFUL migration and no amount of re-running `restart` could clear it.
  *
  *  • The botmux-dedicated home (~/.botmux/pm2) is exclusively ours, so ANY live
- *    God there is a migration leftover. Detect it by pm2.pid OR rpc.sock: a real
- *    God was observed supervising 50 daemons with NO pm2.pid at all, and a
- *    pid-file-only probe stayed silent through exactly the situation this warning
- *    exists for.
+ *    God there is a migration leftover. `liveGodAt` detects it by pm2.pid OR a
+ *    held rpc.sock: a real God was observed supervising 50 daemons with NO
+ *    pm2.pid at all, and a pid-file-only probe stayed silent through exactly the
+ *    situation this warning exists for.
  *
  *  • The shared default (~/.pm2) may be the user's own pm2 running unrelated
  *    apps. A live God there means nothing by itself — MEASURED on this box: the
@@ -2867,23 +2966,9 @@ async function ensureSystemDependencies(): Promise<void> {
  */
 function legacyBotmuxGodAlive(): boolean {
   const dedicated = join(CONFIG_DIR, 'pm2');
-  if (pm2GodAlive(dedicated)) return true;
+  if (liveGodAt(dedicated) !== null) return true;
   const shared = join(homedir(), '.pm2');
-  return pm2GodAlive(shared) && sharedHomeHasBotmuxRows(shared);
-}
-
-/** A God is alive at `home` if its pid file points at a live process, or (when
- *  the file is missing/stale) its RPC socket is still there. */
-function pm2GodAlive(home: string): boolean {
-  const pidFile = join(home, 'pm2.pid');
-  if (existsSync(pidFile)) {
-    let pid = 0;
-    try { pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10); } catch { pid = 0; }
-    if (Number.isSafeInteger(pid) && pid > 1) {
-      try { process.kill(pid, 0); return true; } catch { /* stale — try the socket */ }
-    }
-  }
-  return existsSync(join(home, 'rpc.sock'));
+  return liveGodAt(shared) !== null && sharedHomeHasBotmuxRows(shared);
 }
 
 /** Does the SHARED pm2 home actually hold botmux apps? pm2 writes one pid file
@@ -3004,7 +3089,7 @@ async function cmdStatus(): Promise<void> {
   // warnIfLegacyBotmuxAlive above, which is what a pre-migration host needs.
 }
 
-function cmdUpgrade(): void {
+async function cmdUpgrade(): Promise<void> {
   // 本地 checkout（有 .git/src）：走 git pull --ff-only → 重新 build → 从本
   // checkout 重启，而不是拿全局包管理器去升级（那对 dev 部署无效，见
   // install-info.ts 的 isLocalDevInstall 说明）。
@@ -3012,8 +3097,64 @@ function cmdUpgrade(): void {
     cmdUpgradeLocalDev();
     return;
   }
+  // 编译版单文件二进制没有 package.json 落盘 ⟹ resolveGlobalInstallPlan 恒抛
+  // Unsupported（实测真实 v3.18.4 二进制就是这条）。改为先按「二进制装在哪」
+  // 判形态：npm 子包形态交回 npm/pnpm/bun，install.sh 形态自己换二进制。
+  const strategy = currentUpdateStrategy(botmuxInstallRoot());
+  if (strategy.kind === 'self-replace') {
+    try {
+      const latest = await fetchLatestVersion();
+      if (!latest) {
+        console.error('❌ 无法获取最新版本号（网络不可达或 registry 异常）。');
+        process.exit(1);
+      }
+      const current = resolveCurrentVersion();
+      if (!isNewerVersion(latest, current)) {
+        console.log(`✅ 已是最新版本（${current}）。`);
+        return;
+      }
+      console.log(`🔄 升级中：下载 v${latest} 二进制并替换 ${strategy.target}`);
+      // 握与 dashboard / maintenance 同一把跨进程锁：这条路径是**写同一个文件**，
+      // 两个 update 并发跑会互相盖掉临时文件与 rename。锁文件父目录可能还不存在
+      // （daemon 从未在本机起过就先跑 update），先建再握，否则 ENOENT 会盖掉真实错误。
+      const lockTarget = globalInstallUpdateLockTarget();
+      mkdirSync(dirname(lockTarget), { recursive: true });
+      let acquired = false;
+      try {
+        await withFileLock(lockTarget, async () => {
+          acquired = true;
+          const r = await replaceStandaloneBinary(latest, strategy.target);
+          console.log(`✅ 升级完成：${r.asset} → ${r.target}（${current} → ${latest}）。运行 botmux restart 以应用更新。`);
+        }, { maxWaitMs: 2_000 });
+      } catch (error) {
+        // ⚠️ 三态，不是二态。`withFileLock` 拿不到锁时是**抛异常**不是安静返回，
+        // 但 `acquired === false` 只证明「回调没执行」，**不等于「别人持锁」**：
+        // 回调之前还可能因 `open` 的 EACCES/ENOSPC、holder 写入失败、holder 元数据
+        // 不可读、stale-claim `link` 失败而抛错。只看 `acquired` 会把这些**真实故障
+        // 全部误报成「另一个更新正在进行」**——磁盘满被说成并发冲突，是最坏的那种
+        // 误导。所以必须同时要求它是 timeout 类型：
+        //   ① 超时且回调未进入        → 友好并发提示（正常互斥结果，不是故障）
+        //   ② 回调已进入后失败        → 透出真实错误（下载/校验/替换）
+        //   ③ 回调前的基础设施失败    → 同样透出真实错误
+        // 判类型而不是匹文案：file-lock 的文案被多处按字符串匹配，不能动，但新代码
+        // 应该用 FileLockTimeoutError（async/sync 两处语义一致）。
+        if (!acquired && error instanceof FileLockTimeoutError) {
+          console.error('❌ 另一个更新正在进行中（dashboard 或定时任务），请稍后重试。');
+          process.exit(1);
+        }
+        throw error; // ②③ 交给外层统一报错，不被友好文案吞掉
+      }
+    } catch (error) {
+      console.error(`❌ 升级失败：${error instanceof Error ? error.message : error}`);
+      process.exit(1);
+    }
+    return;
+  }
   try {
-    const plan = resolveGlobalInstallPlan();
+    if (strategy.kind === 'unsupported') {
+      throw new UnsupportedGlobalInstallError('unknown', process.execPath);
+    }
+    const plan = resolveGlobalInstallPlan(strategy.packageRoot);
     console.log(`🔄 升级中：${formatGlobalInstallCommand(plan)}`);
     installLatestBotmuxSync(plan);
     console.log('\n✅ 升级完成。运行 botmux restart 以应用更新。');
@@ -3108,40 +3249,128 @@ function cmdUpgradeLocalDev(): void {
  * over {@link callDashboard}, which handles 404 disambiguation and self-heals a
  * stale `.dashboard-port` that points at the wrong service (e.g. daemon IPC).
  * See `src/cli/dashboard-endpoint.ts` for the why.
+ *
+ * `rescanWhenUnreachable` extends that self-heal to a recorded port with NOTHING
+ * listening on it. It must stay opt-in: during boot `unreachable` is the normal
+ * state and is resolved by retrying the same port, so scanning the range on every
+ * poll tick would be pure waste. `executeDashboardCliCommand` passes it for the
+ * one-shot `botmux dashboard`; the readiness poll below must NOT.
  */
-async function callDashboardEndpoint(path: DashboardEndpoint): Promise<DashboardResult> {
+async function callDashboardEndpoint(
+  path: DashboardEndpoint,
+  opts: { rescanWhenUnreachable?: boolean; requestTimeoutMs?: number } = {},
+): Promise<DashboardResult> {
   return callDashboard({
     configDir: CONFIG_DIR,
     defaultPort: 7891,
     envPort: process.env.BOTMUX_DASHBOARD_PORT,
     path,
+    rescanWhenUnreachable: opts.rescanWhenUnreachable,
+    requestTimeoutMs: opts.requestTimeoutMs,
   });
+}
+
+/**
+ * Merlin Devbox 上为当前 dashboard 端口创建（或复用）私有短链。
+ *
+ * 端口取 dashboard 落盘的 `.dashboard-port`（端口探测可能落在 7891 之外），与
+ * `devboxDashboardBaseUrl()` 读侧用的是同一份判据，避免写 9002、读 9001。
+ * 非 Devbox / 已配置中心平台或自建反代 / `merlin-cli` 不可用时全部静默 no-op。
+ */
+async function ensureDevboxDashboardExportForCurrentPort(): Promise<void> {
+  const portFile = join(CONFIG_DIR, '.dashboard-port');
+  const port = Number((existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
+    || process.env.BOTMUX_DASHBOARD_PORT || '7891');
+  await ensureDevboxDashboardExport({
+    port,
+    remoteBaseConfigured: Boolean(
+      (isRemoteAccessEnabled() && platformMachineBaseUrl()) || publicReverseProxyBaseUrl(),
+    ),
+  });
+}
+
+/**
+ * Is the supervisor going to have a dashboard answering shortly — i.e. is one
+ * running, or scheduled to be? Answers "is it worth waiting", so the question is
+ * about the SUPERVISOR'S INTENT, not about a pid existing at this instant.
+ *
+ * A pid-only check was wrong in a way that reproduced the very bug this helps fix:
+ * after a crash the supervisor records `status='launching', pid=0` and holds a
+ * restart timer (fleet-supervisor.ts, handleExit), so during that backoff a
+ * pid-based check says "not live", the poll stops, and `botmux dashboard` advises a
+ * restart — while the supervisor was about to bring it back on its own.
+ *
+ *  • No live supervisor → nothing will start anything. false.
+ *  • `launching` → true even with pid 0: that IS the supervisor saying "coming up".
+ *  • `online` → the recorded pid must really be alive; an `online` row can outlive
+ *    the process it names (a crash between state writes, or a stale state file).
+ *  • `stopped` / `errored` → the supervisor has given up. false.
+ *  • No row yet → `null`, meaning "cannot tell yet": a just-started supervisor has
+ *    not written the dashboard row, which must not be read as "never will".
+ *
+ * `fleet-runtime` is imported dynamically to match every other use of it in this
+ * file — it pulls in the supervisor machinery, which the CLI deliberately keeps
+ * off its startup path.
+ */
+async function dashboardMemberComingUp(): Promise<boolean | null> {
+  try {
+    const { fleetStatePath, DASHBOARD_PROCESS_NAME } = await import('./core/fleet-runtime.js');
+    const { readFleetState } = await import('./core/fleet-state-store.js');
+    // The mapping itself lives in dashboard-command.ts as a pure function so it is
+    // unit testable; this wrapper only supplies the I/O (state file + pid probe).
+    return dashboardComingUpFromState(
+      readFleetState(fleetStatePath()),
+      DASHBOARD_PROCESS_NAME,
+      (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } },
+    );
+  } catch {
+    return null;                                   // unreadable → cannot tell
+  }
 }
 
 /**
  * Best-effort dashboard hint printed after start/restart. Reads the LIVE link
  * via /__cli/current (non-rotating) so an already-shared URL is preserved.
- * Retries for a few seconds since the dashboard process boots after the daemon;
- * if it still isn't ready, prints a soft fallback so the user isn't blocked.
+ * Retries since the dashboard process boots after the daemon; if it still isn't
+ * ready, prints a soft fallback so the user isn't blocked.
+ *
+ * BUDGET AND STOP CONDITIONS live in `cli/dashboard-command.ts`
+ * (`DASHBOARD_READY_WAIT_MS`, `shouldKeepWaitingForDashboard`) so they are unit
+ * testable and shared with the `botmux dashboard` message below — the two used to
+ * disagree, which is how an operator got told to restart a healthy, still-booting
+ * dashboard. The wait is bounded by LIVENESS as well as by the clock, so a fleet
+ * with the dashboard disabled or already crashed falls through in one tick instead
+ * of hanging for the whole budget. A fast boot is unaffected — the loop returns the
+ * moment the dashboard answers.
  */
 async function printDashboardHintWithRetry(): Promise<void> {
-  const maxWaitMs = 6000;
   const stepMs = 500;
   const started = Date.now();
   let last: Awaited<ReturnType<typeof callDashboardEndpoint>> | null = null;
-  while (Date.now() - started < maxWaitMs) {
-    last = await callDashboardEndpoint('/__cli/current');
+  // 只在轮询之前做一次：导出结果与「dashboard 起没起来」无关，放在循环体里每轮都会
+  // 重新 spawn 一次 merlin-cli，而失败路径最坏每轮付满 5s 超时——本函数自己的预算
+  // 撑不住，实测会把 start/restart 的这段拖到近两倍。
+  await ensureDevboxDashboardExportForCurrentPort();
+  for (;;) {
+    // Bounded per request (NOT opted into rescanning): this loop's own budget is
+    // only consulted below, after the await returns, so a recorded port that
+    // accepts the connection and never answers would hang here forever and never
+    // reach that check. See requestTimeoutMs in dashboard-endpoint.ts.
+    last = await callDashboardEndpoint('/__cli/current', { requestTimeoutMs: stepMs * 4 });
     if (last.ok) {
       console.log(`   面板: botmux dashboard (${last.url})`);
       // 走中心化平台链接时，附带本地直连兜底，平台异常也能直接 ip:port 访问。
       if (last.localUrl) console.log(`   本地直连(平台异常时可用): ${last.localUrl}`);
       return;
     }
-    // Terminal states — file-backed secret/token won't appear mid-poll, unlike
-    // a not-yet-listening port. `wrong-service` means the port file points at a
-    // non-dashboard server and discovery already failed to find it, so retrying
-    // won't help either. Don't spin on any of them.
-    if (last.reason === 'no-secret' || last.reason === 'no-active-token' || last.reason === 'wrong-service') break;
+    const keepWaiting = shouldKeepWaitingForDashboard({
+      elapsedMs: Date.now() - started,
+      failure: last,
+      // Only asked when a retry is otherwise possible, so a fast boot never pays
+      // for reading the fleet state.
+      comingUp: dashboardFailureIsTerminal(last) ? false : await dashboardMemberComingUp(),
+    });
+    if (!keepWaiting) break;
     await new Promise(r => setTimeout(r, stepMs));
   }
   // Soft fallback
@@ -3160,7 +3389,16 @@ async function printDashboardHintWithRetry(): Promise<void> {
  * `dashboard` is the non-rotating get-or-create form; help and invalid
  * subcommands never call either credential endpoint. */
 async function cmdDashboard(args: string[]): Promise<void> {
-  const execution = await executeDashboardCommand(args, callDashboardEndpoint);
+  const rawAction = args[0]?.toLowerCase();
+  const resolvesEndpoint = args.length <= 1
+    && !args.some(arg => ['--help', '-h', 'help'].includes(arg.toLowerCase()))
+    && (rawAction === undefined || rawAction === 'current' || rawAction === 'rotate');
+  if (resolvesEndpoint) await ensureDevboxDashboardExportForCurrentPort();
+  // The opt-in for a dead recorded port lives INSIDE executeDashboardCliCommand
+  // so it is directly testable (see its doc comment for why source-regex guards
+  // were not). `printDashboardHintWithRetry()` deliberately does not use this
+  // wrapper — a 500ms poll must never scan the probe range per tick.
+  const execution = await executeDashboardCliCommand(args, callDashboardEndpoint);
   if (execution.kind === 'help') {
     console.log(DASHBOARD_COMMAND_USAGE);
     return;
@@ -3183,12 +3421,19 @@ async function cmdDashboard(args: string[]): Promise<void> {
   const recordedPort = (existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
     || process.env.BOTMUX_DASHBOARD_PORT
     || '7891';
-  if (r.reason === 'no-secret') {
+  // Every non-terminal failure shape is reachable while the dashboard is still
+  // booting, so ask ONCE whether a dashboard member is actually live and let that
+  // decide the advice. Telling the operator to restart a healthy, still-booting
+  // dashboard throws away the boot that was about to succeed — see
+  // dashboardFailureIsTerminal for why `no-secret`/`wrong-service` are transient.
+  const stillComingUp = dashboardFailureIsTerminal(r) ? false : await dashboardMemberComingUp();
+  if (stillComingUp !== false) {
+    console.error(formatDashboardUnreachable(recordedPort, stillComingUp));
+    if (r.reason === 'wrong-service' && r.detail) console.error(`  详情: ${r.detail}`);
+  } else if (r.reason === 'no-secret') {
     console.error('Dashboard not initialised. Run `botmux restart` first.');
   } else if (r.reason === 'unreachable') {
-    console.error(
-      `dashboard process not reachable on 127.0.0.1:${recordedPort} — \`botmux restart\` will start it`,
-    );
+    console.error(formatDashboardUnreachable(recordedPort, false));
   } else if (r.reason === 'wrong-service') {
     // 127.0.0.1:<port> answered, but it isn't the dashboard (typically the
     // daemon IPC server holding a port the stale .dashboard-port points at),
@@ -3252,6 +3497,13 @@ interface SessionData {
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
   /** Per-turn reply targets（见 Session.replyTargets in types.ts）——排队/并发轮次各自的回复锚点。 */
   replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string }>;
+  /** Frozen per-turn reply contexts（见 Session.turnReplyContexts in types.ts）。
+   *  `botmux send` 只读其中的 `inThread`：判断本轮 quote 目标当初是否从**顶层**
+   *  进来，据此拦住「顶层 @ 之后那条消息才被开成话题」时 quote 把回复带进话题。 */
+  turnReplyContexts?: Record<string, {
+    target?: { mode?: string; chatId?: string; rootMessageId?: string };
+    inThread?: boolean;
+  }>;
   codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
   codexAppGenerationCommits?: unknown;
   queued?: boolean;
@@ -4923,7 +5175,7 @@ async function postSessionCliIpc(
   } satisfies RequestInit;
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
-    : fetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+    : loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
 }
 
 /** `botmux preview <port>` registers a reachable loopback Web service for the
@@ -5264,6 +5516,8 @@ async function readCardUsageSnapshotForSend(
       // (parity with the daemon reader and the ledger/dashboard consumers).
       larkAppId: larkAppId ?? session.larkAppId,
       fresh: true,
+      // 定价覆盖：从 bot 配置解析，未配置时 undefined（costCny 缺省）。
+      pricing: larkAppId ? resolvePricingForCli(larkAppId) : undefined,
     });
   } catch {
     return { context: null, tokens: null };
@@ -5820,6 +6074,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 命令:
   setup       交互式配置（首次使用 / 添加机器人）
               默认使用 botmux 内置 Feishu Web QR 登录尝试自动导入权限/redirect/发布版本；可加 --no-open-platform-auto 跳过
+  clone <机器人名> [--name <新名称>]
+              创建新应用并复制该机器人的行为配置；留空名称自动使用 源名称-copy-时间戳
   start       启动 daemon，并启动 mode=auto 的插件 service
   stop        停止 daemon（默认不停止插件 service；--with-plugin 显式停止 mode=auto 的插件 service）
   restart     重启 daemon（默认不停止插件 service，core 启动后确保 mode=auto 正在运行；--with-plugin 显式先停再启动 auto service）
@@ -5868,6 +6124,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   voice                配置语音总结（高级功能，独立于 setup）— 交互式填 TTS 引擎+凭证
        voice status    查看当前语音配置（凭证打码）
        voice disable   关闭语音功能（移除配置）
+       voice asr       配置语音识别（飞书语音消息→文字驱动会话）
+       voice asr status|disable   查看 / 关闭 ASR
   vc-agent tat-gate|poll
                        飞书会议智能体 P0：校验 TAT 会中事件读取、轮询会议事件并触发 workflow
   plugin              管理 botmux 插件
@@ -5930,6 +6188,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
     Bot→Bot 默认进入 Queue；要显式调整对方活跃的 Codex App turn，把 @steer 写成
     正文首个语义行（可放在收件人 @ 行之后）。接收端会消费该指令，不交给模型。
     （可设 BOTMUX_REQUIRE_MENTION_DECISION=false 关闭硬门）
+  card patch --message-id <om_xxx> (--card-file <path> | --card-json <json>)
+                       原地更新之前用 send --card-file/--card-json 发出的自定义卡片
+                       （不发新消息、不换群/话题）；messageId 取自 send 成功输出的 .messageId，
+                       卡片安全校验与 send 相同；[--session-id <sid>] 可手动指定会话
   bots list                            列出当前群聊中的机器人（含 open_id）
   bots invite --chat <chatId> --team <id> --agent <appId>...
                                        往「已存在的团队群」补人：把同团队、已 opt-in 的 agent + 各自 owner 一起拉进；
@@ -6770,6 +7032,25 @@ async function cmdHistory(rest: string[]): Promise<void> {
         ...(cardJson !== undefined ? { cardJson } : {}),
       };
     }));
+    // Range guidance, emitted at the moment the model is actually reading
+    // history. The decisive fact is `sessionScope` (this session's own scope),
+    // NOT the chat's `chat_mode`: a thread opened inside a 普通群 keeps
+    // chat_mode='group' while its session is thread-scope, so reasoning from the
+    // group type would wrongly conclude "I may search the whole chat". Both
+    // `--scope` gates above key on isChatScope for exactly that reason.
+    //
+    // Wording note: describe only what the model can OBSERVE. Daemon-side
+    // invocations (`/t` and friends) are stripped before the prompt is built, so
+    // the model never sees them — naming them here would be an instruction it
+    // cannot act on. Describe the symptom instead: the topic starts mid-discussion
+    // and its own history looks too short to explain the task.
+    const rangeHint = isChatScope
+      ? '范围：本次返回当前群整群最近 N 条（不限于 session 创建之后）。需要更早的消息就把 `--limit` 调大。当前是 chat-scope 会话，没有话题边界，`--scope thread` / `--scope ambient` 在此不适用。'
+      : effectiveScope === 'thread'
+        ? '范围：本次只返回当前话题内的消息。如果话题内的内容不足以说明任务背景（例如任务像是延续话题之外的讨论、出现没有出处的指代或结论），说明上下文在话题外的群聊里：用 `botmux history --scope ambient --limit 20` 读取本话题之外、话题根之前的群聊消息（自动排除本话题）。注意隐私边界：ambient 会读到话题外的群聊内容，仅在确实需要群聊背景时使用，并优先用较小的 limit。'
+        : effectiveScope === 'ambient'
+          ? '范围：本次返回的是话题之外的群聊消息（话题根之前，已排除本话题）。要回到本话题内的消息用 `botmux history`（默认即本话题）。'
+          : '范围：本次按 `--scope chat` 返回整群最近 N 条（含本话题内的消息）。只要本话题内的用 `botmux history`（默认即本话题）。';
     console.log(JSON.stringify({
       sessionId: sid,
       chatId: s.chatId,
@@ -6785,6 +7066,7 @@ async function cmdHistory(rest: string[]): Promise<void> {
       } : {}),
       messages,
       total: messages.length,
+      rangeHint,
       // Discoverability: agents reading history often need the actual image
       // bytes (alert charts) or the raw card JSON — both live one command away.
       ...(messages.some(m => (m as any).resources?.length || m.msgType === 'interactive') ? {
@@ -6957,11 +7239,13 @@ import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './servi
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
-import { effectiveDefaultWorkingDir, loadBotConfigs, resolveBrandLabel, resolveUsageDisplay } from './bot-registry.js';
+import { effectiveDefaultWorkingDir, loadBotConfigs, resolveBrandLabel, resolveUsageDisplay, getBot } from './bot-registry.js';
+import { resolvePricingConfig, type ResolvedModelPricing } from './services/model-pricing.js';
 import { config } from './config.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
   resolveQuoteTarget,
+  shouldDropAfterTheFactTopicQuote,
   validateMentionDecision,
   mentionBackAmbiguity,
   mentionBackAmbiguityError,
@@ -7311,6 +7595,11 @@ async function registerSelfFromCredFile(): Promise<void> {
  *  `loadBotConfigs()` 重载会把沙箱残留的 stale bots.json（可能是同 appId 的旧
  *  secret）覆盖到注册表上——每次本地重载后必须把 env bot 重新注册回去压轴。 */
 let envPinnedRiffBot: import('./bot-registry.js').BotConfig | null = null;
+
+/** 从 bot 配置解析定价（bots.json pricing 块 → 内置表）。未配置时返回 undefined。 */
+function resolvePricingForCli(larkAppId: string): ResolvedModelPricing | undefined {
+  return resolvePricingConfig(getBot(larkAppId)?.config?.pricing);
+}
 
 function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { session: SessionData; botConfig: import('./bot-registry.js').BotConfig } | null {
   const appId = process.env.BOTMUX_LARK_APP_ID;
@@ -8300,7 +8589,7 @@ async function cmdSend(rest: string[]): Promise<void> {
           : {}),
       }));
     } catch (e: any) {
-      console.error(`语音发送失败：${e?.message ?? e}`);
+      console.error(`语音发送失败：${describeSendFailure(e)}`);
       if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* */ } }
       process.exit(1);
     }
@@ -8368,7 +8657,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       console.error(`✓ 已回复文档评论 ${exactDocTarget.commentId.slice(0, 12)}（${chunks.length} 条）`);
       console.log(JSON.stringify({ success: true, commentId: exactDocTarget.commentId, sessionId: originSessionId, kind: 'doc-comment', chunks: chunks.length }));
     } catch (e: any) {
-      console.error(`文档评论发送失败：${e?.message ?? e}`);
+      console.error(`文档评论发送失败：${describeSendFailure(e)}`);
       process.exit(1);
     }
     return;
@@ -8478,7 +8767,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!statSync(p).isFile()) { console.error(`不是普通文件: ${p}`); process.exit(1); }
   }
 
-  const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError, getChatModeStrict } = await import('./im/lark/client.js');
+  const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError, getChatModeStrict, getMessageThreadId } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
   // Effective target chat for top-level mode (defaults to session's chat)
   const targetChatId = overrideChatId ?? s.chatId;
@@ -8734,6 +9023,31 @@ async function cmdSend(rest: string[]): Promise<void> {
         ?? frozenTurnDispatch?.quoteTargetId
         ?? s.quoteTargetId,
   });
+  // 「顶层 @ 之后那条消息才被开成话题」的发送侧半边。飞书的 reply 接口让回复继承
+  // 被引用消息**此刻**的话题归属（`reply_in_thread:false` 只是不新开话题，逃不出
+  // 已有话题），所以引用一条事后被开成话题的顶层消息，会把回复带进用户根本没在
+  // 其中 @ 过 bot 的话题里 —— dispatcher 侧的 fold 只管住了卡片，正文由这里决定。
+  //
+  // 只在「该轮确证从顶层进来（inThread === false）且本次真要 quote」时才探测一次
+  // 飞书；话题内轮次、`--top-level`、`--no-quote`、`--quote`、thread-scope 全部在
+  // 上面或 `shouldDropAfterTheFactTopicQuote` 里短路，普通热路径不多付这次调用。
+  // 探测失败一律保持 quote（既有默认行为），绝不因为不确定就改变所有正常回复的落点。
+  const quotedTurnInThread = quoteTargetId
+    ? (s.turnReplyContexts?.[currentTurnId ?? '']?.inThread
+      ?? s.turnReplyContexts?.[quoteTargetId]?.inThread)
+    : undefined;
+  let effectiveQuoteTargetId = quoteTargetId;
+  if (quoteTargetId && !explicitQuote && quotedTurnInThread === false) {
+    const probedThreadId = await getMessageThreadId(appId, quoteTargetId).catch(() => undefined);
+    if (shouldDropAfterTheFactTopicQuote({
+      quoteTargetId,
+      quotedTurnInThread,
+      currentThreadId: probedThreadId,
+      explicitQuote,
+    })) {
+      effectiveQuoteTargetId = undefined;
+    }
+  }
   let primaryQuotedId: string | null = null;
   let vcMeetingListenerReplyReplay = false;
   const dispatchPrimary = async (
@@ -8746,7 +9060,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     revalidateVcMeetingManagedSend();
     const proposedOutput = {
       targetChatId,
-      ...(quoteTargetId ? { quoteTargetId } : {}),
+      ...(effectiveQuoteTargetId ? { quoteTargetId: effectiveQuoteTargetId } : {}),
       msgType,
       content,
     };
@@ -9317,7 +9631,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         try { secret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
         const res = secret
           ? await fetchDaemonIpc(attentionPort, '/api/attention', request, secret)
-          : await fetch(`http://127.0.0.1:${attentionPort}/api/attention`, request);
+          : await loopbackFetch(`http://127.0.0.1:${attentionPort}/api/attention`, request);
         if (!res.ok) throw new Error(`daemon HTTP ${res.status}`);
         attentionRaised = true;
         console.error(`🙋 已举手：本会话已进 dashboard「需要你」列（用户回复后自动撤下）`);
@@ -9345,9 +9659,70 @@ async function cmdSend(rest: string[]): Promise<void> {
         : {}),
     }));
   } catch (err: any) {
-    console.error(`发送失败: ${err.message}`);
+    console.error(`发送失败: ${describeSendFailure(err)}`);
     process.exit(1);
   }
+}
+
+// ─── Card subcommand (patch a previously-sent custom card in place) ───
+
+async function cmdCard(rest: string[]): Promise<void> {
+  const sub = rest[0] ?? '';
+  if (sub === '' || sub === '--help' || sub === '-h') {
+    console.log(CARD_COMMAND_USAGE);
+    return;
+  }
+  if (sub !== 'patch') {
+    console.error(
+      `未知 card 子命令: ${sub}\n` +
+      `用法: botmux card patch --message-id <om_xxx> (--card-file <path> | --card-json <json>) [--session-id <sid>]`,
+    );
+    process.exit(2);
+  }
+  const args = rest.slice(1);
+  // Help wins over the missing-arg validation and the transport gates below.
+  if (cardPatchArgsWantHelp(args)) {
+    console.log(CARD_PATCH_USAGE);
+    return;
+  }
+  // Same two transport doors as `botmux send`: a no-transport turn (apiOnly bot
+  // or HTTP virtual session) may not originate ANY Feishu write — including a
+  // card patch.
+  assertTurnTransportOrExit('card patch');
+  // Read isolation: register this bot from its own worker-written cred file so
+  // the Lark client resolves without reading the denied bots.json (same as
+  // cmdSend/cmdHistory).
+  await registerSelfFromCredFile();
+
+  const parsed = parseCardPatchArgs(args);
+  if (!parsed.ok) {
+    console.error(`botmux card patch: ${parsed.error}`);
+    process.exit(2);
+  }
+  const input = readCardPatchInput(parsed.cardFile, parsed.cardJson);
+  if (!input.ok) {
+    console.error(`botmux card patch: ${input.error}`);
+    process.exit(input.exitCode);
+  }
+  // Bot identity comes from the session context only (same as send): no
+  // --bot-style explicit selector. Resolves --session-id / ancestor pid marker
+  // / BOTMUX_SESSION_ID / riff sandbox, and registers the bot so getBotClient
+  // works. Exits 1 on failure (session not found / no larkAppId), same as send.
+  const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
+  // Target-aware door: a --session-id pointing at a virtual/apiOnly session is
+  // refused even from a transport-capable turn.
+  assertSessionTransportOrExit({ chatId: session.chatId, larkAppId }, 'card patch');
+
+  const { updateMessage } = await import('./im/lark/client.js');
+  const outcome = await executeCardPatch(
+    { updateMessage },
+    { larkAppId, messageId: parsed.messageId, rawCard: input.rawCard },
+  );
+  if (!outcome.ok) {
+    console.error(`botmux card patch: ${outcome.error}`);
+    process.exit(outcome.exitCode);
+  }
+  console.log(buildCardPatchSuccessOutput(outcome.messageId, sid));
 }
 
 // ─── Dispatch subcommand (Phase 0: open a sub-project thread + assign bots) ───
@@ -9380,7 +9755,7 @@ async function postCurrentSessionDaemonRoute(input: {
     relayDir,
     process.env.BOTMUX_ORIGIN_CHANNEL_ID,
   );
-  return fetch(`http://127.0.0.1:${port}${input.path}`, {
+  return loopbackFetch(`http://127.0.0.1:${port}${input.path}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -10601,7 +10976,7 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
     }
     res = hostSecret
       ? await fetchDaemonIpc(daemon.ipcPort, '/api/asks', init, hostSecret)
-      : await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/asks`, init);
+      : await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}/api/asks`, init);
   } catch (fetchErr) {
     // Socket refused / reset / timeout → daemon is down or restarting → retryable.
     const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
@@ -11105,7 +11480,7 @@ async function cmdSessionReady(): Promise<void> {
         try { hostSecret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
       }
       if (!hostSecret) {
-        await fetch(`http://127.0.0.1:${ipcPort}/api/session-ready`, init);
+        await loopbackFetch(`http://127.0.0.1:${ipcPort}/api/session-ready`, init);
       } else {
         await fetchDaemonIpc(ipcPort, '/api/session-ready', init, hostSecret);
       }
@@ -11206,7 +11581,7 @@ async function cmdUserPromptHook(): Promise<void> {
     const path = `/api/sessions/${encodeURIComponent(sessionId)}/prompt-ctx/claim`;
     const res = hostSecret
       ? await fetchDaemonIpc(ipcPort, path, init, hostSecret)
-      : await fetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+      : await loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
     if (res.status !== 200) process.exit(0);
     const data = await res.json() as { envelope?: unknown };
     const envelope = typeof data?.envelope === 'string' ? data.envelope : undefined;
@@ -11908,11 +12283,52 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'worker') await import('./worker.js');
   else if (__entrySubcommand === 'supervisor') await import('./index-supervisor.js');
   else if (__entrySubcommand === 'dashboard') await import('./index-dashboard.js');
+  // CLI-adapter runners. Same mechanism, different role: these ARE the CLI session
+  // process an adapter launches, not a fleet member. Without these branches the
+  // compiled binary re-execed itself with a `/$bunfs/…-runner.js` argv[0] that
+  // dispatch did not recognise, so it printed help and exited 0 — the user saw a
+  // help dump instead of a session, and nothing reported an error.
+  else if (__entrySubcommand === 'codex-app-runner') await import('./codex-app-runner.js');
+  else if (__entrySubcommand === 'dsh-runner') await import('./dsh-runner.js');
+  else if (__entrySubcommand === 'mira-runner') await import('./mira-runner.js');
+  else if (__entrySubcommand === 'mir-runner') await import('./mir-runner.js');
   // The entry module now drives the process (top-level main() keeps the event
   // loop alive for the daemon; the worker's IPC listener does the same; a
   // core-only bind failure exits from within). Park here so the normal dispatch
   // below never runs. This awaits forever; the imported module owns exit().
   await new Promise<never>(() => {});
+}
+
+// Hidden: perform a compiled-binary self-replace and exit. Invoked by
+// `runSelfReplaceBlocking` (src/core/maintenance.ts) so the synchronous
+// maintenance tick / dashboard handler can wait on one child instead of
+// restructuring around an await. Not a user-facing command; it only ever makes
+// sense for the standalone binary, which owns its own file.
+if (command === '__self-update') {
+  const requested = process.argv[3] || 'latest';
+  try {
+    const { replaceStandaloneBinary, currentBinaryInstallShape } = await import('./core/binary-self-update.js');
+    if (currentBinaryInstallShape() !== 'curl-binary') {
+      // Fail closed rather than write into a tree a package manager owns.
+      console.error('__self-update: 当前不是独立二进制安装（install.sh 形态），拒绝自替换');
+      process.exit(1);
+    }
+    const { fetchLatestVersion } = await import('./core/update-check.js');
+    const version = requested === 'latest' ? await fetchLatestVersion() : requested;
+    if (!version) {
+      console.error('__self-update: 无法解析最新版本（网络不可达或 registry 异常）');
+      process.exit(1);
+    }
+    const r = await replaceStandaloneBinary(version);
+    // The caller parses this line: after a self-replace the running process still
+    // reports its OWN baked version, so it cannot discover the new one by re-reading.
+    console.log(`BOTMUX_SELF_UPDATE_VERSION=${version}`);
+    console.log(`__self-update: ${r.asset} → ${r.target} (${r.bytes} bytes)`);
+    process.exit(0);
+  } catch (error) {
+    console.error(`__self-update: ${error instanceof Error ? error.message : error}`);
+    process.exit(1);
+  }
 }
 
 
@@ -12067,6 +12483,55 @@ async function cmdVoiceSetup(args: string[]): Promise<void> {
   if (sub === 'disable' || sub === 'off') {
     mergeGlobalConfig({ voice: null });
     console.log('✅ 已移除全局语音配置（回复卡片不再显示「🔊 语音总结」按钮）。重启 daemon 生效。');
+    return;
+  }
+  if (sub === 'asr') {
+    const asrSub = (args[1] ?? '').toLowerCase();
+    const maskAsr = (s?: string) => (s ? `${s.slice(0, 4)}***` : '(未设)');
+    if (asrSub === 'status') {
+      const asr = readGlobalConfig().voice?.asr;
+      if (!asr) { console.log('语音识别（ASR）未配置。运行 `botmux voice asr` 配置。'); return; }
+      console.log('当前 ASR 配置（全局 ~/.botmux/config.json）:');
+      console.log(`  启用: ${asr.enabled ? '是' : '否'}`);
+      console.log(`  baseUrl: ${asr.baseUrl ?? '(未设)'}`);
+      console.log(`  model: ${asr.model ?? '(未设)'}`);
+      console.log(`  apiKey: ${maskAsr(asr.apiKey)}`);
+      if (asr.language) console.log(`  语言: ${asr.language}`);
+      if (typeof asr.timeoutMs === 'number') console.log(`  超时: ${asr.timeoutMs}ms`);
+      return;
+    }
+    if (asrSub === 'disable' || asrSub === 'off') {
+      const curVoice = readGlobalConfig().voice ?? {};
+      mergeGlobalConfig({ voice: { ...curVoice, asr: { ...(curVoice.asr ?? {}), enabled: false } } as any });
+      console.log('✅ 已关闭语音识别（ASR）。重启 daemon 生效。');
+      return;
+    }
+    if (asrSub && asrSub !== 'setup') {
+      console.error('用法: botmux voice asr [status|disable]（无参 = 交互式配置）');
+      process.exit(1);
+    }
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      console.log('🎤 配置语音识别（ASR）。飞书语音消息将转写为文本驱动会话。写入全局 ~/.botmux/config.json，重启后生效。\n');
+      const baseUrl = (await ask(rl, 'baseUrl（OpenAI 兼容，如 https://api.openai.com/v1）: ')).trim();
+      const apiKey = (await ask(rl, 'apiKey（无则留空）: ')).trim();
+      const model = (await ask(rl, 'model（如 whisper-1）: ')).trim();
+      if (!baseUrl || !model) { console.error('❌ baseUrl 和 model 必填，未写入。'); return; }
+      const language = (await ask(rl, '语言提示（可选，如 zh，留空跳过）: ')).trim();
+      const curVoice = readGlobalConfig().voice ?? {};
+      const asr: Record<string, any> = {
+        enabled: true,
+        baseUrl,
+        model,
+        ...(apiKey ? { apiKey } : {}),
+        ...(language ? { language } : {}),
+      };
+      mergeGlobalConfig({ voice: { ...curVoice, asr } as any });
+      console.log('\n✅ 已写入 voice.asr 配置。`botmux restart` 后，发给机器人的语音消息会自动转写。');
+      console.log('   查看：`botmux voice asr status`  关闭：`botmux voice asr disable`');
+    } finally {
+      rl.close();
+    }
     return;
   }
   if (sub && sub !== 'setup') {
@@ -12690,7 +13155,7 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 // managed origin → NOT gated: the operator keeps full access. per-command +
 // daemon-side getBotClient/larkTransportEnabled gates remain authoritative.
 const LARK_FACING_COMMANDS = new Set([
-  'send', 'dispatch', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread',
+  'send', 'dispatch', 'card', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread',
   'vc-agent', 'report', 'actor',
 ]);
 if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
@@ -12750,6 +13215,7 @@ switch (command) {
     else await cmdSetup();
     break;
   }
+  case 'clone': await cmdClone(process.argv.slice(3)); break;
   case 'start':   await cmdStart(); break;
   case 'serve':   await cmdServe(process.argv.slice(3)); break;
   case 'start-bot': await cmdStartBot(process.argv.slice(3)); break;
@@ -12759,7 +13225,7 @@ switch (command) {
   case 'logs':    await cmdLogs(); break;
   case 'status':  await cmdStatus(); break;
   case 'upgrade':
-  case 'update':  cmdUpgrade(); break;
+  case 'update':  await cmdUpgrade(); break;
   case 'dashboard': await cmdDashboard(process.argv.slice(3)); break;
   case 'bind': {
     // `botmux bind <code>` — 把本机绑定到中心化平台
@@ -12782,6 +13248,36 @@ switch (command) {
   case 'list':
   case 'ls':      await cmdList(); break;
   case '__zmx-attach-managed': cmdManagedZmxAttach(process.argv.slice(3)); break;
+  // Hidden self-check for the compiled single-file binary: exercise the two
+  // setup-time code paths that load lark-scopes.json off a module-relative path —
+  // readDefaultScopeManifest() (real Open Platform setup) and
+  // writeScopesJsonToConfigDir() (writes ~/.botmux/lark-scopes.json). In compiled
+  // mode the module graph lives in the read-only virtual /$bunfs, so the old
+  // readFileSync/copyFileSync of a __dirname-derived path threw
+  // "找不到 botmux lark-scopes.json". The npm/Node unit tests can't catch that —
+  // dist/ physically exists there — so smoke-bun-binary.mjs drives THIS against
+  // the actual binary. Prints a one-line JSON summary and exits 0; any throw
+  // (missing/empty manifest, unwritable path) exits non-zero and fails the smoke.
+  case '__selfcheck': {
+    const { readDefaultScopeManifest } = await import('./setup/open-platform-automation.js');
+    const manifest = readDefaultScopeManifest();
+    const tenant = manifest.scopes?.tenant?.length ?? 0;
+    const user = manifest.scopes?.user?.length ?? 0;
+    if (tenant <= 0 || user <= 0) {
+      console.error(`__selfcheck: lark-scopes manifest empty (tenant=${tenant}, user=${user})`);
+      process.exit(1);
+    }
+    const written = writeScopesJsonToConfigDir();
+    const onDisk = JSON.parse(readFileSync(written, 'utf-8'));
+    const wroteTenant = onDisk?.scopes?.tenant?.length ?? 0;
+    const wroteUser = onDisk?.scopes?.user?.length ?? 0;
+    if (wroteTenant !== tenant || wroteUser !== user) {
+      console.error(`__selfcheck: written manifest mismatch (${wroteTenant}/${wroteUser} vs ${tenant}/${user})`);
+      process.exit(1);
+    }
+    console.log(JSON.stringify({ ok: true, tenant, user, written }));
+    process.exit(0);
+  }
   case 'delete':
   case 'del':
   case 'rm':      await cmdDelete(); break;
@@ -12969,6 +13465,7 @@ switch (command) {
     break;
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
+  case 'card':     await cmdCard(process.argv.slice(3)); break;
   case 'chat':     await cmdChat(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;

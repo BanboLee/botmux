@@ -90,6 +90,7 @@ import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
+import { shouldRecordFailedTurn, buildFailedTurnRecord } from './services/failed-turn-retry.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
@@ -98,7 +99,11 @@ import { migrateOverloadAlertAtStartup } from './services/overload-alert-migrati
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
+import { setUsageLedgerPricingResolver, setUsageLedgerRecordSink } from './services/usage-ledger.js';
+import { trackBudgetSpend, formatBudgetAlert } from './services/budget-tracker.js';
+import { resolvePricingConfig } from './services/model-pricing.js';
 import { createImgNumberer, extractPostAtParticipants, messageMentionsBot, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
+import { resolveInboundAudio } from './im/lark/audio-transcribe.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
@@ -278,7 +283,7 @@ import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn 
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { fillNativeTopicId } from './core/native-topic-id.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
-import { beginReplyTargetTurn, buildTurnParticipantsFrom, fallbackTurnId, isSubstituteTurn, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import {
   buildBotmuxLarkNativeSessionTitle,
@@ -647,6 +652,8 @@ import {
   type VcMeetingImRoutingCandidate,
   type VcMeetingSealedReceiverSessionBinding,
 } from './services/vc-meeting-im-routing.js';
+import { VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT } from './services/vc-meeting-listener-output-protocol.js';
+import { loopbackFetch } from './core/loopback-fetch.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -2817,7 +2824,7 @@ async function fetchVcMeetingDaemonJson(
       path,
       headers: vcAuthenticatedHeaders,
     });
-    const upstream = await fetch(`http://127.0.0.1:${daemon.ipcPort}${path}`, {
+    const upstream = await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}${path}`, {
       ...init,
       headers: authenticatedHeaders,
       signal: init.signal ?? controller.signal,
@@ -5491,6 +5498,16 @@ const cardDeps: CardHandlerDeps = {
     }
     handlers.replayMessageEvent(data);
   },
+  // 卡片「🗜️ 压缩」按钮：等价于用户在话题里发 /compact——走已有的
+  // deliverPassthroughToExistingSession（raw_input 透传，含完整 turn 生命周期）。
+  deliverPassthroughCommand: (ds, cmd, opts) =>
+    deliverPassthroughToExistingSession(ds, cmd, cmd, opts.anchor, ds.larkAppId, {
+      messageId: opts.messageId,
+      replyRootId: opts.replyRootId,
+      senderOpenId: opts.senderOpenId,
+      senderIsBot: opts.senderIsBot,
+      substitute: false,
+    }),
 };
 
 const LEGACY_WORKFLOW_API_RETIRED = {
@@ -17199,6 +17216,9 @@ function deliverPassthroughToExistingSession(
     senderOpenId?: string;
     senderIsBot: boolean;
     substitute: boolean;
+    /** The inbound message carried a Lark thread_id (see
+     *  FrozenSessionReplyContext.inThread). */
+    inThread?: boolean;
     /** raw input 已写入 worker 后回调（worker 不在线的拒绝分支不触发），供 ingress
      *  调用方打接纳标——其后同步收尾（落盘/事件派发）抛错不得再诱导重发，否则
      *  /compact 这类非幂等 passthrough 会被重发重复执行。 */
@@ -17223,6 +17243,7 @@ function deliverPassthroughToExistingSession(
       senderOpenId: turn.senderOpenId,
       participants: passthroughWindow.participants,
       participantsIncomplete: passthroughWindow.incomplete,
+      inThread: turn.inThread,
     });
     if (turn.senderOpenId && ds.session.lastCallerOpenId !== turn.senderOpenId) {
       ds.session.lastCallerOpenId = turn.senderOpenId;
@@ -17387,7 +17408,7 @@ async function startInitialPassthroughSession(args: {
     sessionStore.updateSession(ds.session);
   }
   const initialWindow = buildTurnParticipants(larkAppId, senderOpenId, resolvedSenderIsBotTriState, undefined, initialPassthroughSender?.name);
-  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { senderOpenId, participants: initialWindow.participants, participantsIncomplete: initialWindow.incomplete });
+  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { senderOpenId, participants: initialWindow.participants, participantsIncomplete: initialWindow.incomplete, inThread: !!parsed.threadId });
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
   if (!registration.accepted) {
@@ -17476,7 +17497,10 @@ async function startInitialPassthroughSession(args: {
 
 
 function vcMeetingApplicationContext(ctx: RoutingContext): string {
-  return (ctx.vcMeetingContextLifecycle === 'sealed'
+  return (ctx.vcMeetingImTurnOrigin
+    ? VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT
+    : '')
+    + (ctx.vcMeetingContextLifecycle === 'sealed'
     ? '[会议上下文状态] 本轮正在复用一场已结束会议的专属会话；这是会后追问。可以基于既有会议上下文回答，但不得声称会议仍在进行，也不要尝试会中文本或语音动作。\n'
     : '')
     + (ctx.vcMeetingContextMayLag
@@ -17715,6 +17739,25 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // every event that flows through us teaches the cache without touching
   // the contact API. Must run before any await on the sender resolver.
   learnFromMentions(larkAppId, parsed.mentions);
+
+  // 语音消息转写：下载 opus → ASR → 用转写文本替换 '[语音]' 占位符。
+  // 必须在 followupContent 之前——命令识别、标题生成、会话创建都读它。
+  // 转写失败（未配置/下载失败/空结果）已回复用户，直接返回不留孤儿会话。
+  if (parsed.msgType === 'audio') {
+    const audioOutcome = await resolveInboundAudio(
+      larkAppId,
+      messageId,
+      parsed.msgType,
+      data.message?.content ?? '',
+      parsed.content,
+      (text) => replyMessage(larkAppId, replyAnchorId, text, 'text'),
+    );
+    if (audioOutcome.kind === 'transcribed') {
+      parsed.content = audioOutcome.text;
+    } else if (audioOutcome.kind === 'failed') {
+      return;
+    }
+  }
 
   const senderOpenId: string | undefined = data.sender?.sender_id?.open_id;
   const isBotSenderType = data.sender?.sender_type === 'app' || data.sender?.sender_type === 'bot';
@@ -18346,7 +18389,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // Turn key is the reply anchor (== messageId outside session-group births) so
   // the per-turn reply context and currentReplyTarget.turnId line up with the
   // worker's turn id — current-turn provenance requires that equality.
-  beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete });
+  beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId });
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
   if (!registration.accepted) {
@@ -18677,6 +18720,9 @@ async function handleBotAdded(
     }
     const promptBody = opts?.forcePrompt ?? resolveGroupJoinPrompt(botCfg.autoStartOnGroupJoinPrompt);
     const title = (promptBody || tr('daemon.auto_start_join_title', undefined, localeForBot(larkAppId))).substring(0, 50);
+    // 入群 seed 消息文案：bot 配置了 autoStartOnGroupJoinSeed 用之，否则回退内置 i18n。
+    const joinSeedText = botCfg.autoStartOnGroupJoinSeed?.trim()
+      || tr('daemon.auto_start_join_seed', undefined, localeForBot(larkAppId));
     // D8 deliberately keeps the legacy prompt empty when no join prompt is
     // configured, so the agent can inspect group context without receiving a
     // synthetic instruction. Codex App still needs a non-blank visible
@@ -18693,8 +18739,7 @@ async function handleBotAdded(
     let scope: 'thread' | 'chat';
     let anchor: string;
     if (opensOwnTopic) {
-      const seedText = tr('daemon.auto_start_join_seed', undefined, localeForBot(larkAppId));
-      anchor = await sendMessage(larkAppId, chatId, seedText, 'text');
+      anchor = await sendMessage(larkAppId, chatId, joinSeedText, 'text');
       scope = 'thread';
     } else {
       anchor = chatId;
@@ -18851,7 +18896,7 @@ async function handleBotAdded(
         sharedReplyRootId = await sendMessage(
           larkAppId,
           chatId,
-          tr('daemon.auto_start_join_seed', undefined, localeForBot(larkAppId)),
+          joinSeedText,
           'text',
         );
       } catch (err: any) {
@@ -19106,6 +19151,24 @@ async function handleThreadReplyAdmitted(
   }
 
   if (!prepared) learnFromMentions(larkAppId, parsed.mentions);
+
+  // 语音消息转写：必须排在会话群自愈命名之前，让转写文本（而非 '[语音]'
+  // 占位符）喂给标题生成。prepared 重投路径下 content 已带前缀时幂等跳过。
+  if (parsed.msgType === 'audio') {
+    const audioOutcome = await resolveInboundAudio(
+      larkAppId,
+      parsed.messageId ?? ctx.messageId,
+      parsed.msgType,
+      data.message?.content ?? '',
+      parsed.content,
+      (text) => replyMessage(larkAppId, anchor, text, 'text'),
+    );
+    if (audioOutcome.kind === 'transcribed') {
+      parsed.content = audioOutcome.text;
+    } else if (audioOutcome.kind === 'failed') {
+      return;
+    }
+  }
 
   // 会话群自愈命名：出生时 AI 命名失败（CLI 抖动/超时/当时无模板）的群会停在
   // 截断占位名——任意后续文本消息触发一次补跑（title 服务内 in-flight 去重 +
@@ -19431,6 +19494,7 @@ async function handleThreadReplyAdmitted(
           senderOpenId: threadSenderOpenId,
           senderIsBot: isForeignBot,
           substitute: !!substituteTrigger,
+          inThread: !!parsed.threadId,
           onDelivered: () => markIngressAdmitted(ctx),
         });
       }
@@ -19702,7 +19766,7 @@ async function handleThreadReplyAdmitted(
     // on the double-race (matches the new-topic path's collectPostAtMentions args).
     const existingPostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
     const existingWindow = buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, undefined, existingPostAt);
-    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete });
+    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId });
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
     }
@@ -20136,7 +20200,7 @@ async function handleThreadReplyAdmitted(
       : 'thread';
     const autoCreatePostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
     const autoCreateWindow = buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name, autoCreatePostAt);
-    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete });
+    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId });
     sessionStore.updateSession(newDs.session);
     const registration = await claimNewDaemonSession(activeSessions, newDs);
     if (!registration.accepted) {
@@ -21408,6 +21472,34 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     logger.warn(`[tmux] failed to scrub server-global env key(s): ${tmuxEnvScrub.failed.join(', ')}`);
   }
 
+  // ─── 成本/预算接线 ─────────────────────────────────────────────────────
+  // pricingResolver：把 larkAppId 解析成 bot 的定价配置（bots.json pricing 块
+  // → 内置表）。recordSink：每条正 delta 记录落盘后，累计到预算跟踪器，
+  // 超阈值时私聊 bot owner 告警。sink 内异常被 catch，绝不影响 ledger 主路径。
+  setUsageLedgerPricingResolver((larkAppId) => {
+    if (!larkAppId) return undefined;
+    return resolvePricingConfig(getBot(larkAppId)?.config?.pricing);
+  });
+  setUsageLedgerRecordSink((record) => {
+    if (!record.larkAppId || !record.costCny || record.costCny <= 0) return;
+    try {
+      const bot = getBot(record.larkAppId);
+      const budget = bot?.config?.budget;
+      if (!budget) return;
+      const alert = trackBudgetSpend(record.larkAppId, record.costCny, { budget });
+      if (alert) {
+        const ownerOpenId = bot?.config?.ownerOpenId;
+        if (ownerOpenId) {
+          sendUserMessage(record.larkAppId, ownerOpenId, formatBudgetAlert(alert), 'text')
+            .catch(err => logger.warn(`[budget] failed to send alert to owner: ${err}`));
+        }
+        logger.warn(`[budget] ${record.larkAppId} alert: spent=${alert.spentCny} budget=${alert.monthlyCny} (${alert.percent}%)`);
+      }
+    } catch (err) {
+      logger.warn(`[budget] sink error: ${err}`);
+    }
+  });
+
   // Issue Board 领取的「激活」入口。
   //
   // 复用 handleBotAdded 而不是另写建会话逻辑：那套 CAS 注册 + ready 屏障 + 接管检测是有
@@ -21881,6 +21973,33 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           ),
         });
       }
+      // Record the failed/interrupted turn for /retry. Best-effort: a persist
+      // failure must not crash the worker IPC handler (same contract as the
+      // turn-completion enqueue above). The reply-target guard skips type-ahead
+      // scenarios where a newer turn already owns the captured prompt.
+      try {
+        // shouldRecordFailedTurn guarantees failed/ambiguous; re-narrow to the
+        // typed builder (property narrowing does not propagate to the argument).
+        const failedStatus = terminal.status === 'failed' || terminal.status === 'ambiguous'
+          ? terminal.status
+          : undefined;
+        if (failedStatus && shouldRecordFailedTurn(terminal, ds.currentReplyTarget?.turnId)) {
+          const record = buildFailedTurnRecord(
+            { turnId: terminal.turnId, status: failedStatus, errorCode: terminal.errorCode },
+            {
+              userPrompt: ds.lastUserPrompt,
+              cliInput: ds.lastCliInput,
+              codexAppInput: ds.lastCodexAppInput,
+            },
+          );
+          if (record) {
+            ds.session.lastFailedTurn = record;
+            sessionStore.updateSession(ds.session);
+          }
+        }
+      } catch (err) {
+        logger.error(`[retry] failed to record lastFailedTurn for ${terminal.turnId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+      }
     },
     onDeferredScheduleTurnSettled(ds, context) {
       scheduleDeferredScheduleSettlement(ds, context);
@@ -22343,6 +22462,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       beforeSessionTurn: (data, ctx) => maybeCatchUpVcMeetingConsumerBeforeTurn(data, ctx),
       isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
       resolveReplyThreadAlias: (rootId, chatId, appId) => findChatReplyAlias(rootId, chatId, appId),
+      chatSessionAnsweredRootAtTopLevel: (rootId, chatId, appId) => {
+        for (const ds of activeSessions.values()) {
+          if (ds.larkAppId !== appId || ds.scope !== 'chat' || ds.chatId !== chatId) continue;
+          if (chatSessionAnsweredRootAtTopLevel(ds.session, rootId)) return true;
+        }
+        return sessionStore.listSessions().some(s =>
+          s.status === 'active'
+          && s.larkAppId === appId
+          && s.chatId === chatId
+          && chatSessionAnsweredRootAtTopLevel(s, rootId));
+      },
       // Chat was converted 普通群 → 话题群 while we held a chat-scope session.
       // Idle legacy owners are evicted so subsequent inbound messages land on
       // fresh thread-scope sessions. Owners with accepted/pending work remain

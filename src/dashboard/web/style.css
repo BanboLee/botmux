@@ -45,6 +45,10 @@
   --button-padding-x: 15px;
   --dropdown-trigger-width: 118px;
   --dropdown-popover-min-width: 156px;
+  /* 下拉弹层的限高：超过就在弹层内部滚动，而不是把选项顶出视口。
+     滚动容器是 main（overflow-y:auto），其上的 .chrome-body / .app-shell 是
+     overflow:hidden——溢出视口的选项会被裁掉、鼠标事件也落不到弹层上。 */
+  --dropdown-popover-max-height: min(320px, 52vh);
   --page-title-row-height: 48px;
   --page-title-divider-gap: 14px;
   --section-title-row-height: 36px;
@@ -537,6 +541,46 @@ main:has(.groups-page) .groups-matrix-section > #g-loading {
     min-height: 0;
     overflow-x: hidden;
     overflow-y: auto;
+  }
+}
+
+/* Bot 配置桌面：整页吃满 main，名册和详情各占一列。名册若只靠
+   sticky + 100dvh 估算限高，往往会比 main 可视区高出一截——钉住之后
+   仍会被含块底边往上挤，搜索框就从视口顶被切掉。窄屏仍走整页滚动。 */
+@media (min-width: 981px) {
+  main:has(.bot-defaults-page) {
+    padding-bottom: 0;
+    overflow: hidden;
+  }
+
+  main:has(.bot-defaults-page) .bot-defaults-page {
+    height: 100%;
+    min-height: 0;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    overflow: hidden;
+  }
+
+  main:has(.bot-defaults-page) .bd-layout {
+    height: 100%;
+    min-height: 0;
+    align-items: stretch;
+  }
+
+  main:has(.bot-defaults-page) .bd-roster {
+    position: static;
+    top: auto;
+    height: 100%;
+    max-height: none;
+    min-height: 0;
+  }
+
+  main:has(.bot-defaults-page) .bd-detail {
+    height: 100%;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
   }
 }
 
@@ -6370,7 +6414,7 @@ dialog.onboarding-dialog::backdrop {
   left: 0;
   width: 100%;
   min-width: 100%;
-  max-height: min(280px, 42vh);
+  max-height: min(280px, 42vh, var(--dropdown-popover-space, 100vh));
   overflow-y: auto;
   transform: none;
   z-index: 1300;
@@ -9954,12 +9998,23 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   display: grid;
   gap: 4px;
   min-width: var(--dropdown-popover-min-width);
+  max-height: min(var(--dropdown-popover-max-height), var(--dropdown-popover-space, 100vh));
   padding: 6px;
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-lg);
   background: var(--surface);
   box-shadow: var(--modal-shadow);
   transform: translateX(-50%);
+  /* 选项多于限高时在弹层内部滚动。少于限高时 auto 不会显示滚动条，
+     所以短列表（排序菜单等）外观不变。overscroll 收敛住，避免滚到底后
+     把外层 main 一起带着滚。 */
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+/* 下方空间不够、且上方更宽裕时向上弹（DropdownMenu 量完可用空间后加的类）。 */
+.sect-sort-menu.is-drop-up > .sect-sort-pop {
+  top: auto;
+  bottom: calc(100% + 8px);
 }
 /* 会话筛选里的「来源 / 所在聊天」弹层宽度自适应 + 不折行的规则统一定义在下方
    （.sessions-filters .sect-sort-pop，靠后覆盖），此处不再重复。 */
@@ -23090,6 +23145,19 @@ dialog select[multiple]:hover:not(:disabled) {
 }
 
 /* ─── Bot 配置：平台化表单控件 ───────────────────────────────────────────── */
+.bot-defaults-page .clone-bot-menu[open] {
+  z-index: 1000;
+}
+
+.bot-defaults-page .clone-bot-menu > .sect-sort-pop {
+  right: 0;
+  left: auto;
+  width: max-content;
+  min-width: 220px;
+  max-width: min(340px, calc(100vw - 48px));
+  transform: none;
+}
+
 .bot-defaults-page .bd-detail,
 .bot-defaults-page .bd-card.bd-profile {
   background: transparent;
@@ -23418,7 +23486,11 @@ dialog select[multiple]:hover:not(:disabled) {
 }
 
 .bot-defaults-page .bd-roster {
+  /* Search/count stay put; the list row is the scrollport. Desktop height
+     comes from the fill-height shell (main:has); mobile caps it below. */
   top: 0;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  overflow: hidden;
 }
 
 .bot-defaults-page #bd-filters {
@@ -23474,6 +23546,9 @@ dialog select[multiple]:hover:not(:disabled) {
   display: grid;
   gap: 3px;
   min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 @media (max-width: 980px) {
@@ -24360,7 +24435,7 @@ dialog select[multiple]:hover:not(:disabled) {
   left: 0;
   width: 100%;
   min-width: 100%;
-  max-height: min(280px, 42vh);
+  max-height: min(280px, 42vh, var(--dropdown-popover-space, 100vh));
   overflow-y: auto;
   transform: none;
   z-index: 1300;
@@ -25502,7 +25577,7 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .vc-profile-agent-menu > .sect-sort-pop {
   min-width: min(300px, 84vw);
   max-width: 340px;
-  max-height: min(320px, 60vh);
+  max-height: min(320px, 60vh, var(--dropdown-popover-space, 100vh));
   overflow-y: auto;
 }
 .vc-profile-agent-menu .sect-sort-pop button {

@@ -158,6 +158,8 @@ import { getPendingGrantLimits, _resetForTest as _resetGrantPending } from '../s
 import { logger } from '../src/utils/logger.js';
 import { config } from '../src/config.js';
 import { __resetPeerCrossRefCacheForTest } from '../src/services/peer-cross-ref-store.js';
+import { CLONE_EXCLUDED_KEYS, cloneBotConfig, cloneOwnerEntries } from '../src/setup/bot-config-editor.js';
+import { normalizeManagedOwnerEntries } from '../src/setup/owner-identity.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -813,6 +815,7 @@ function setupBotState(opts?: {
 	  grantDefaultDurationMs?: number;
 	  messageListeners?: Record<string, unknown>;
 	  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
+	  chatMentionModes?: Record<string, 'always' | 'topic' | 'never' | 'ambient'>;
 	  p2pMode?: 'thread' | 'chat';
 	  summaryRange?: { limit?: number; sinceHours?: number };
 	  summaryMemory?: boolean;
@@ -846,6 +849,7 @@ function setupBotState(opts?: {
 	      grantDefaultDurationMs: opts?.grantDefaultDurationMs,
 	      messageListeners: opts?.messageListeners,
 	      chatReplyModes: opts?.chatReplyModes,
+	      chatMentionModes: opts?.chatMentionModes,
 	      p2pMode: opts?.p2pMode,
 	      summaryRange: opts?.summaryRange,
 	      summaryMemory: opts?.summaryMemory,
@@ -866,6 +870,7 @@ function setupBotState(opts?: {
   isSessionOwner: ReturnType<typeof vi.fn>;
   onChatModeConverted: ReturnType<typeof vi.fn>;
   resolveReplyThreadAlias: ReturnType<typeof vi.fn>;
+  chatSessionAnsweredRootAtTopLevel: ReturnType<typeof vi.fn>;
   handleVcMeetingPush: ReturnType<typeof vi.fn>;
 } {
   return {
@@ -875,6 +880,7 @@ function setupBotState(opts?: {
     handleVcMeetingPush: vi.fn(async () => {}),
     isSessionOwner: vi.fn(() => false),
     resolveReplyThreadAlias: vi.fn(() => null),
+    chatSessionAnsweredRootAtTopLevel: vi.fn(() => false),
     onChatModeConverted: vi.fn(),
   };
 }
@@ -4300,6 +4306,198 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
+  it('chat mode: a topic opened ON an earlier top-level @ keeps the reply at top level (root_id is an om_ message, not the omt_ thread)', async () => {
+    // Regression (user-reported): 顶层 @bot 建立 chat-scope 会话后，用户在**同一条
+    // 顶层消息上手动「开启话题」**。飞书随后把该话题内的消息投递成
+    // root_id = 那条原顶层 om_ 消息、thread_id = 新建的 omt_ 话题 —— 即
+    // root_id !== thread_id，且 root_id 是一条普通 om_ 消息。
+    //
+    // 与上一个用例（root_id === thread_id === 既有话题根，回复必须留在话题里）
+    // 的区别就在这里：那是「消息本就诞生在既有话题内」，而这里的话题是在 bot 已
+    // 按顶层建立会话之后才出现的。此时 fold 判定折叠回群是对的（scope=chat），
+    // 但不能再把可见回复钉进这个事后创建的话题 —— 否则用户在顶层 @ 得到的回复
+    // 会跑进一个他并未在其中 @ 过 bot 的话题里。
+    setupBotState({ regularGroupReplyMode: 'chat', allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-after-topic');
+    // 前提:bot 此前已按顶层平铺答过 om_earlier_top_level_at 这条消息
+    // (daemon 侧即 turnReplyContexts[root].target.mode === 'plain')。
+    handlers.chatSessionAnsweredRootAtTopLevel.mockImplementation(
+      (rootId: string) => rootId === 'om_earlier_top_level_at',
+    );
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA follow up after I opened a topic' }),
+      // root_id 指向此前那条顶层 @ 消息（om_ 前缀），thread_id 是事后新建的话题
+      rootId: 'om_earlier_top_level_at',
+      threadId: 'omt_opened_afterwards',
+      messageId: 'msg-after-topic-opened',
+      chatId: 'chat-after-topic',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    const call = handlers.handleThreadReply.mock.calls.find(c => c[0] === event)
+      ?? handlers.handleNewTopic.mock.calls.find(c => c[0] === event);
+    expect(call).toBeTruthy();
+    // 会话仍折叠回群 chat-scope（这部分本来就是对的）
+    expect(call![1]).toEqual(expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-after-topic',
+      larkAppId: MY_APP_ID,
+    }));
+    // 关键断言：不得把回复钉进事后创建的话题
+    expect(call![1].replyRootId).toBeUndefined();
+  });
+
+  // ── 判据本体的真机制覆盖 ─────────────────────────────────────────────
+  // 上一个用例把 chatSessionAnsweredRootAtTopLevel 当 mock 喂死值，验的是
+  // 「判据命中之后 dispatcher 怎么做」。但「判据在什么输入下才该命中」同样是
+  // 契约的一半，且只 mock 的话它零覆盖 —— 曾因此漏掉原生话题 seed 也被记成
+  // mode='plain' 的情况。所以下面这组用真 beginReplyTargetTurn 落记录、再喂给
+  // **真判据本体**（从 reply-target.js 导入 daemon 用的同一个函数，绝不在测试里
+  // 手抄一份 —— 手抄的副本会让判据本体的变异照样全绿）。
+  const chatScopeDs = (chatId: string): any => ({
+    scope: 'chat',
+    chatId,
+    session: {
+      sessionId: `sess-${chatId}`, chatId, rootMessageId: chatId, title: 't',
+      status: 'active', createdAt: new Date().toISOString(), scope: 'chat',
+    },
+  });
+
+  it('判据: 顶层 @ 那轮(无 thread_id)记为 plain+inThread:false → 命中', async () => {
+    const { beginReplyTargetTurn, chatSessionAnsweredRootAtTopLevel: answeredAtTopLevel } = await import('../src/core/reply-target.js');
+    const ds = chatScopeDs('oc_toplevel');
+    // daemon 顶层 @ 路径：replyRootId=undefined、inThread=!!parsed.threadId=false
+    beginReplyTargetTurn(ds, undefined, 'om_top_at', new Date().toISOString(), { inThread: false });
+    expect(ds.session.turnReplyContexts['om_top_at'])
+      .toMatchObject({ target: { mode: 'plain', chatId: 'oc_toplevel' }, inThread: false });
+    expect(answeredAtTopLevel(ds.session, 'om_top_at')).toBe(true);
+  });
+
+  it('判据: chat 模式原生话题 seed 同样记 plain,但 inThread:true → 不命中(真话题不被平铺)', async () => {
+    const { beginReplyTargetTurn, chatSessionAnsweredRootAtTopLevel: answeredAtTopLevel } = await import('../src/core/reply-target.js');
+    const ds = chatScopeDs('oc_native');
+    // chat 模式下原生话题的开场消息：thread_id=omt_* 但没有 root_id，于是
+    // maybeFold(缺 root_id)与 shared-seed(mode≠shared)双双早退 ⇒ replyRootId
+    // 仍是 undefined ⇒ target 同样是 plain。唯一能区分它的就是 inThread。
+    beginReplyTargetTurn(ds, undefined, 'om_native_seed', new Date().toISOString(), { inThread: true });
+    expect(ds.session.turnReplyContexts['om_native_seed'].target).toEqual({ mode: 'plain', chatId: 'oc_native' });
+    expect(answeredAtTopLevel(ds.session, 'om_native_seed')).toBe(false);
+  });
+
+  it('判据: 老会话记录没有 inThread 字段 → 不命中(fail toward 既有话题锚定)', async () => {
+    const { chatSessionAnsweredRootAtTopLevel: answeredAtTopLevel } = await import('../src/core/reply-target.js');
+    const ds = chatScopeDs('oc_legacy');
+    // PR 之前落盘的记录只有 target，没有 inThread。undefined !== false，
+    // 因此按「未知」处理、保持旧行为，而不是猜它是顶层。
+    ds.session.turnReplyContexts = { om_legacy: { target: { mode: 'plain', chatId: 'oc_legacy' } } };
+    expect(answeredAtTopLevel(ds.session, 'om_legacy')).toBe(false);
+  });
+
+  it('判据: 话题内被 @ 那轮按回复消息 id 记 thread 目标,root 本身查不到 → 不命中', async () => {
+    const { beginReplyTargetTurn, chatSessionAnsweredRootAtTopLevel: answeredAtTopLevel } = await import('../src/core/reply-target.js');
+    const ds = chatScopeDs('oc_infold');
+    // fold 路径：beginReplyTargetTurn(ds, replyRootId=rootId, turnId=messageId)
+    beginReplyTargetTurn(ds, 'om_existing_root', 'om_reply_msg', new Date().toISOString(), { inThread: true });
+    expect(answeredAtTopLevel(ds.session, 'om_existing_root')).toBe(false);
+    expect(ds.session.turnReplyContexts['om_reply_msg'].target)
+      .toEqual({ mode: 'thread', rootMessageId: 'om_existing_root' });
+  });
+
+  it('端到端: 真记录 + 真判据 —— 事后开的话题被平铺,用户真开的话题保持锚定', async () => {
+    const { beginReplyTargetTurn, chatSessionAnsweredRootAtTopLevel: answeredAtTopLevel } = await import('../src/core/reply-target.js');
+    const now = new Date().toISOString();
+    const ds = chatScopeDs('chat-e2e');
+    // 会话历史里两条都被平铺答过，区别只在 inThread：
+    beginReplyTargetTurn(ds, undefined, 'om_top_level_at', now, { inThread: false }); // 顶层 @
+    beginReplyTargetTurn(ds, undefined, 'om_native_seed', now, { inThread: true });   // 原生话题 seed
+
+    setupBotState({ regularGroupReplyMode: 'chat', allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockImplementation((a: string) => a === 'chat-e2e');
+    // 关键：注入的不是死值，而是真判据跑在真记录上
+    handlers.chatSessionAnsweredRootAtTopLevel.mockImplementation(
+      (rootId: string) => answeredAtTopLevel(ds.session, rootId),
+    );
+
+    const inbound = (rootId: string, messageId: string) => makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA follow up' }),
+      rootId,
+      threadId: 'omt_some_topic',
+      messageId,
+      chatId: 'chat-e2e',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    const ctxFor = (event: any) => (
+      handlers.handleThreadReply.mock.calls.find(c => c[0] === event)
+      ?? handlers.handleNewTopic.mock.calls.find(c => c[0] === event)
+    )?.[1];
+
+    // ① 事后在顶层 @ 上开的话题 → 回复平铺回顶层
+    const afterFact = inbound('om_top_level_at', 'msg-after-fact');
+    await capturedHandlers['im.message.receive_v1'](afterFact);
+    await flushEventWork();
+    expect(ctxFor(afterFact)).toMatchObject({ scope: 'chat', anchor: 'chat-e2e' });
+    expect(ctxFor(afterFact).replyRootId).toBeUndefined();
+
+    // ② 用户真正开的原生话题 → 回复仍锚在该话题里（既有契约不受影响）
+    const genuine = inbound('om_native_seed', 'msg-in-genuine-topic');
+    await capturedHandlers['im.message.receive_v1'](genuine);
+    await flushEventWork();
+    expect(ctxFor(genuine)).toMatchObject({ scope: 'chat', anchor: 'chat-e2e', replyRootId: 'om_native_seed' });
+  });
+
+  it('抑制显示锚点时仍交出 foldedRootId,且真 producer 据此登记 alias(话题内非@消息能折回本会话)', async () => {
+    const { beginReplyTargetTurn, chatSessionAnsweredRootAtTopLevel: answeredAtTopLevel } = await import('../src/core/reply-target.js');
+    const now = new Date().toISOString();
+    const ds = chatScopeDs('chat-alias');
+    beginReplyTargetTurn(ds, undefined, 'om_top_at', now, { inThread: false });
+
+    setupBotState({ regularGroupReplyMode: 'chat', allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockImplementation((a: string) => a === 'chat-alias');
+    handlers.chatSessionAnsweredRootAtTopLevel.mockImplementation(
+      (rootId: string) => answeredAtTopLevel(ds.session, rootId),
+    );
+
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA follow up' }),
+      rootId: 'om_top_at',
+      threadId: 'omt_after_fact',
+      messageId: 'msg-alias-case',
+      chatId: 'chat-alias',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    const ctx = (
+      handlers.handleThreadReply.mock.calls.find(c => c[0] === event)
+      ?? handlers.handleNewTopic.mock.calls.find(c => c[0] === event)
+    )?.[1];
+    // 显示锚点被抑制(回复平铺),但路由归属仍交出去
+    expect(ctx.replyRootId).toBeUndefined();
+    expect(ctx.foldedRootId).toBe('om_top_at');
+
+    // 真 producer 拿到 foldedRootId 后必须登记 alias,否则该话题内的非 @ 消息
+    // 查不到本会话会另起 thread 会话
+    beginReplyTargetTurn(ds, ctx.replyRootId, 'msg-alias-case', now, {
+      inThread: true,
+      foldedRootId: ctx.foldedRootId,
+    });
+    expect(ds.session.replyThreadAliases?.['om_top_at']).toBeTruthy();
+    // 抑制显示锚点的语义不变:不设 currentReplyTarget
+    expect(ds.session.currentReplyTarget).toBeUndefined();
+  });
+
   it('new-topic mode keeps @ inside a regular-group topic as an independent thread session', async () => {
     setupBotState({ regularGroupReplyMode: 'new-topic', allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('group');
@@ -5226,6 +5424,94 @@ describe('im.message.receive_v1 — regular group reply mode (tri-state: chat | 
   });
 });
 
+describe('im.message.receive_v1 — per-chat mention mode (chatMentionModes overrides regularGroupMentionMode)', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    setupBotState();
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetCachedChatMode.mockReset();
+    mockGetCachedChatMode.mockReturnValue(undefined);
+    mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  // The per-chat override is the whole point of /mention-mode: this chat answers
+  // non-@ messages even though the per-bot default still demands an @.
+  it('per-chat never answers a non-@ message while the per-bot default stays always', async () => {
+    setupBotState({
+      regularGroupMentionMode: 'always',
+      chatMentionModes: { 'chat-mm-never': 'never' },
+      allowedUsers: [USER_OPEN_ID],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '不 @ 也该回我' }),
+      messageId: 'msg-mm-never',
+      chatId: 'chat-mm-never',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      chatId: 'chat-mm-never',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  // Same bot, same turn shape, a DIFFERENT chat: without an override the per-bot
+  // default governs, so this one is still dropped. Pins that the override is
+  // keyed by chat rather than flipping the policy bot-wide.
+  it('a chat without an override still requires an @ under the same per-bot default', async () => {
+    setupBotState({
+      regularGroupMentionMode: 'always',
+      chatMentionModes: { 'chat-mm-never': 'never' },
+      allowedUsers: [USER_OPEN_ID],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '不 @ 就不该回我' }),
+      messageId: 'msg-mm-other',
+      chatId: 'chat-mm-other',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  // The reverse direction: an explicit per-chat 'always' must be able to opt a
+  // single chat back OUT of a permissive per-bot default.
+  it('per-chat always pins one chat back to @-required under a per-bot never default', async () => {
+    setupBotState({
+      regularGroupMentionMode: 'never',
+      chatMentionModes: { 'chat-mm-pinned': 'always' },
+      allowedUsers: [USER_OPEN_ID],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '这个群我要求必须 @' }),
+      messageId: 'msg-mm-pinned',
+      chatId: 'chat-mm-pinned',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+});
+
 describe('globalGrants — global talk-only authorization (canTalk / canOperate)', () => {
   beforeEach(() => {
     mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
@@ -5260,6 +5546,97 @@ describe('globalGrants — global talk-only authorization (canTalk / canOperate)
     setupBotState({ globalGrants: ['ou_talk_only'], allowedUsers: ['ou_admin'] });
     expect(canOperate(MY_APP_ID, 'chat-A', 'ou_admin')).toBe(true);
     expect(canOperate(MY_APP_ID, 'chat-A', 'ou_talk_only')).toBe(false);
+  });
+});
+
+describe('managed Agent clone owner boundary', () => {
+  beforeEach(() => {
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
+    mockReadFileSync.mockReturnValue('{}');
+  });
+
+  it('pins the excluded-key list so a field cannot be silently dropped', () => {
+    // 下面那条用例用 CLONE_EXCLUDED_KEYS 驱动断言，好处是新增字段自动覆盖，
+    // 但代价是「从清单里删一个字段」会连带把它的断言一起删掉（自指盲区，
+    // 实测反向变异确认过）。所以这里额外用**字面量**钉死清单内容：删字段
+    // 必须在这条上红。新增字段时同步更新这份字面量即可。
+    expect([...CLONE_EXCLUDED_KEYS]).toEqual([
+      'apiOnly',
+      'name',
+      'displayName',
+      'messageListeners',
+      'oncallChats',
+      'defaultOncallAutoboundChats',
+      'allowedChatGroups',
+      'chatGrants',
+      'globalGrants',
+      'quotaState',
+      'grantExpiryState',
+      'sessionGroup',
+      'chatReplyModes',
+      'chatFeedbackPolicies',
+      'noCardChats',
+      'activationPending',
+      'activationDeactivating',
+      'activationStarting',
+      'activationCommitted',
+    ]);
+  });
+
+  it('keeps the human owner operable without cloning source instance state', async () => {
+    // 用实现导出的清单驱动：新增实例态字段时这条用例自动覆盖到。清单本身
+    // 被上一条字面量用例钉死，两条合起来堵住「加了不测」与「删了不红」。
+    // name 是 pm2 进程名（string），单独构造；其余用可辨识的对象值填充。
+    const instanceKeys = CLONE_EXCLUDED_KEYS.filter(key => key !== 'name');
+    const source = {
+      larkAppId: 'cli_source',
+      larkAppSecret: 'source-secret',
+      cliId: 'codex',
+      allowedUsers: ['ou_source_owner', 'ou_stale_coowner'],
+      name: 'source-proc',
+      ...Object.fromEntries(instanceKeys.map(key => [key, { source: key }])),
+    };
+    const owners = cloneOwnerEntries(source, 'cli_source', 'ou_source_owner');
+    expect(owners).toEqual(['ou_source_owner']);
+
+    const normalized = await normalizeManagedOwnerEntries(
+      owners.join(','),
+      { sourceAppId: 'cli_source', sourceOwnerOpenId: 'ou_source_owner', creatingApp: true },
+      async () => 'on_human_owner',
+    );
+    const target = cloneBotConfig(source, {
+      larkAppId: MY_APP_ID,
+      larkAppSecret: 'target-secret',
+      allowedUsers: normalized?.split(','),
+    });
+    expect(target.allowedUsers).toEqual(['on_human_owner']);
+    for (const key of CLONE_EXCLUDED_KEYS) expect(target).not.toHaveProperty(key);
+    // 行为配置仍照常克隆（否则「全删掉」也能让上面那条断言通过）。
+    expect(target.cliId).toBe('codex');
+
+    // 目标 app 启动时会把 union_id 解析成自己视角下的 open_id。
+    setupBotState({ configAllowedUsers: target.allowedUsers, allowedUsers: [USER_OPEN_ID] });
+    expect(canOperate(MY_APP_ID, 'chat-A', USER_OPEN_ID)).toBe(true);
+    expect(canOperate(MY_APP_ID, 'chat-A', 'ou_source_owner')).toBe(false);
+  });
+
+  it('never carries a source-app identity into the cloned bot', () => {
+    // ou_ open_id 与 app secret 都是 app-scoped：target 没有该字段时必须删除，
+    // 而不是把 source 的值留下来（那会把真人 owner 锁在新 Bot 外面）。
+    const source = {
+      larkAppId: 'cli_source',
+      larkAppSecret: 'source-secret',
+      brand: 'lark',
+      allowedUsers: ['ou_source_owner'],
+      ownerOpenId: 'ou_source_owner',
+      cliId: 'codex',
+    };
+    const target = cloneBotConfig(source, { larkAppId: 'cli_target', larkAppSecret: 'target-secret' });
+    expect(target.larkAppId).toBe('cli_target');
+    expect(target.larkAppSecret).toBe('target-secret');
+    for (const key of ['brand', 'allowedUsers', 'ownerOpenId']) {
+      expect(target).not.toHaveProperty(key);
+    }
   });
 });
 

@@ -23,6 +23,7 @@ import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMember } from '../../services/platform-team-store.js';
 import { getBotUnionId, recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
+import { wasPendingReviewNotified, markPendingReviewNotified } from '../../services/under-review-notify-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, BOT_REPLY_SENTINEL } from './doc-comment.js';
 import {
   BOTMUX_REQUIRED_SCOPES,
@@ -35,12 +36,13 @@ import {
   buildEventSubDeepLink,
   buildScopeDeepLink,
 } from '../../setup/verify-permissions.js';
-import { automateOpenPlatformSetup, probeVcMeetingEventSubscription } from '../../setup/open-platform-automation.js';
+import { automateOpenPlatformSetup, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { tryHandleGrantCommand } from './grant-command.js';
 import { tryHandleInviteCommand } from './invite-command.js';
 import { autoInviteOwnerOnGroupJoin } from '../../services/groups-store.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
+import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled, clearPending } from './grant-pending.js';
@@ -220,12 +222,22 @@ function getAdminOpenId(bot: BotState): string | undefined {
   return bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
 }
 
-async function dmAdmin(larkAppId: string, adminOpenId: string, content: string, contextTag: string): Promise<void> {
+/**
+ * 给管理员发一条提醒。**返回是否真的发出去了。**
+ *
+ * 为什么要返回值：多数调用点是 best-effort、不关心成败（所以这里吞掉异常而不是抛，
+ * 避免一次 DM 失败中断整条自检流程）。但「按待审版本节流」那处必须知道成败 ——
+ * 先记「已通知」再发的话，一次网络失败就把那个版本永久节流掉，人再也收不到提醒，
+ * 且是零信号的静默丢失。所以由这里如实回报，让**只有关心的那一处**去判断。
+ */
+async function dmAdmin(larkAppId: string, adminOpenId: string, content: string, contextTag: string): Promise<boolean> {
   try {
     await sendUserMessage(larkAppId, adminOpenId, content, 'text');
     logger.info(`[${larkAppId}] notified admin ${adminOpenId.substring(0, 12)} about ${contextTag}`);
+    return true;
   } catch (err: any) {
     logger.warn(`[${larkAppId}] failed to DM admin about ${contextTag}: ${err?.message ?? err}`);
+    return false;
   }
 }
 
@@ -247,24 +259,53 @@ async function dmAdmin(larkAppId: string, adminOpenId: string, content: string, 
  *   path so a bot that never asked for the feature isn't pinged; the log line is
  *   enough). Failures are always silent here regardless.
  */
+/**
+ * `kind`：
+ *   • `'fixed'` = 已处理完，调用方停止
+ *   • `'under_review'` = 应用正在飞书审核中、配置被写锁。调用方**不该**再让管理员去点
+ *     权限链接（审核期间连 scope/update 都被拒，点了也写不进去），也不该说「等审批通过
+ *     就好」——触发审批通常意味着有配置不合规，那一版不会自己通过，得人工修配置。
+ *   • `'failed'` = 落回人工深链 DM
+ *
+ * `inReviewVersionId`：仅 `under_review` 时可能有值 —— 当前那个待审版本的 id，用作
+ * 「同一个待审版本别重复打扰管理员」的节流 key。**读不到时为 undefined，此时刻意不
+ * 节流**（那意味着模型与飞书实际状态不一致，每次都值得说；万一是我们判据有 bug，
+ * 节流会掐掉唯一的信号）。
+ */
+type AutoFixOutcome = { kind: 'fixed' | 'under_review' | 'failed'; inReviewVersionId?: string };
+
 async function tryAutoFixScopes(
   larkAppId: string,
   bot: BotState,
   brand: Brand,
   missingCritical: { name: string; desc: string }[],
   missingOptional: { name: string; desc: string }[],
-  opts?: { disableQrLogin?: boolean; silent?: boolean },
-): Promise<boolean> {
-  if (brand !== 'feishu') return false;
+  opts?: { disableQrLogin?: boolean; silent?: boolean; grantedScopeNames?: { tenant: string[]; user: string[] } },
+): Promise<AutoFixOutcome> {
+  if (brand !== 'feishu') return { kind: 'failed' };
 
   try {
     const totalMissing = missingCritical.length + missingOptional.length;
     logger.info(`[${larkAppId}] attempting auto-fix for ${totalMissing} missing scopes via Open Platform...`);
+    // 只申请「实际缺失」的那几项：把默认清单裁成缺失集合再传进去，避免
+    // 「用缺失项当触发器、却拿完整 manifest（300+ 项）当申请集合」——那会让补一个
+    // im:feed_group_v1:read 连带申请日历/文档/表格等一大批 botmux 不校验的权限。
+    // 分桶归属仍以默认 manifest 为准（见 filterScopeManifest）。
+    const wantedScopeNames = [...missingCritical, ...missingOptional].map(s => s.name);
+    const scopeManifest = filterScopeManifest(readDefaultScopeManifest(), wantedScopeNames);
     const result = await automateOpenPlatformSetup({
       appId: bot.config.larkAppId,
       brand,
       maxWaitMs: 60_000,
       disableQrLogin: opts?.disableQrLogin,
+      scopeManifest,
+      // 已授权集合（按 tenant/user 分桶）：automation 据此对上面这份 manifest 再按桶
+      // 各自做一次差集，并按「确有新增」而非「发过 scope/update」置 mutated——「配置本
+      // 就齐全」时才能命中无变更短路。分桶是为了不让 tenant 授权误伤 user 桶同名
+      // scope（#1044）。与 scopeManifest 叠加安全：缺失判定用的扁平集合是分桶集合的
+      // 超集，故本路径上二次差集恒为空操作；它真正兜住的是「裁剪后为空」那一轮。
+      // 拿不到 granted（self_manage 冷启动）时不传，退回保守近似。
+      grantedScopeNames: opts?.grantedScopeNames,
       onStatus: (msg) => logger.info(`[${larkAppId}] auto-fix: ${msg}`),
       onQrCode: (info) => {
         logger.warn(
@@ -276,34 +317,98 @@ async function tryAutoFixScopes(
     });
 
     if (result.ok) {
+      // ⚠️ `scopeCount === 0` 有三种**互相矛盾**的成因，不能共用一句话。自从申请集合
+      // 被裁成「缺失项」后（见上方 filterScopeManifest），它的语义从「整份清单导入了
+      // 多少」变成「**缺失的那几项里成功了多少**」，于是 0 不再等于「本来就齐」，
+      // 反而最可能是「一项都没补上」——照旧说「所有必需权限已在应用清单中」就成了
+      // 恰在全部失败时谎报齐全。三种成因按可诊断性分开：
+      //   ① scopeWarning 有值 → scope/update 被租户整批拒了（开放平台明确报错）
+      //   ② skippedScopeCount > 0 → 这些名字不在该租户的开放平台目录里，不可授予
+      //      （automation 自己 warn 过「not present in the Open Platform catalog」）
+      //   ③ 都没有 → 申请集合本就是空的（缺失项已在清单中），才是真的「已齐全」
+      // 这句同时进 daemon 日志**和**下面的管理员 DM，DM 开头写着「✅ 已自动修复了
+      // 缺失的权限」，一旦这里说反就自相矛盾，管理员会以为不用管。
       const scopeDetail = result.scopeCount > 0
         ? `${result.scopeCount} 项权限已导入${result.skippedScopeCount > 0 ? `（${result.skippedScopeCount} 项跳过）` : ''}`
-        : '所有必需权限已在应用清单中';
-      logger.info(
-        `[${larkAppId}] auto-fix succeeded: ${scopeDetail}, ` +
-        `version ${result.versionId ?? 'n/a'} published, ` +
-        `${result.subscribedEventCount} events subscribed`,
-      );
+        : result.scopeWarning
+          ? `0 项权限已导入——开放平台拒绝了本次权限申请（${result.scopeWarning}），需到「权限管理」手动开通`
+          : result.skippedScopeCount > 0
+            ? `0 项权限已导入——这 ${result.skippedScopeCount} 项不在当前租户的开放平台权限目录中，无法自动申请，需到「权限管理」手动开通`
+            : '所有必需权限已在应用清单中';
+      // 一项都没申请上时，这次自愈**没有**修好任何东西，日志级别也不该是「succeeded」。
+      const autoFixEffective = result.scopeCount > 0 || (!result.scopeWarning && result.skippedScopeCount === 0);
+      // 数据范围只在**真做了事**或**真出错**时才进日志：常态是「没有待配的」，
+      // 那句话对读日志的人零信息量，还会淹没上面真正的 scope 结论。
+      const privilegeRangeDetail = result.privilegeRangeCount > 0
+        ? `, ${result.privilegeRangeCount} 项权限数据范围已设为「与应用的可用范围一致」`
+        : result.privilegeRangeWarning
+          ? `, 权限数据范围未能自动配置（${result.privilegeRangeWarning}）`
+          : '';
+      // 三种结局互斥，判定顺序不能反（#1044 的 publishSkipped 必须最先判）：
+      //   ① publishSkipped —— 无变更、**根本没建版本**，报 `version n/a published` 会误导
+      //   ② versionWarning —— 建/提交了但回读仍是草稿。「version X published」曾是**谎报**：
+      //      `publish/commit` 回 code=0 而版本仍停在未提交草稿态，日志照样写 published，
+      //      于是那个草稿一路卡死后续每一次自愈（`app_version/create` 撞 code=10043）。
+      //   ③ 正常发布
+      const versionDetail = result.publishSkipped
+        ? '无变更，已跳过发版'
+        : result.versionWarning
+          ? `version ${result.versionId ?? 'n/a'} NOT published（${result.versionWarning}）`
+          : `version ${result.versionId ?? 'n/a'} ${result.versionReused ? '(复用既有草稿) ' : ''}published`;
+      // 「秒过」与「要人审」是两种截然不同的结局，日志必须分开——否则运维看到
+      // published 会以为权限已经生效，而实际上可能还在等某个人点同意。
+      const approvalDetail = result.approvalAutoPassed === true
+        ? '（审批流自动通过，已即时生效）'
+        : result.approvalHumanApprovers?.length
+          ? `（需人工审批：${result.approvalHumanApprovers.join('、')}）`
+          : '';
+      const summary =
+        `[${larkAppId}] auto-fix ${autoFixEffective ? 'succeeded' : 'could NOT apply the missing scopes'}: ${scopeDetail}${privilegeRangeDetail}, ` +
+        `${versionDetail}${approvalDetail}, ` +
+        `${result.subscribedEventCount} events subscribed`;
+      if (autoFixEffective && !result.versionWarning) logger.info(summary);
+      else logger.warn(summary);
       // opt-in / optional-only path: succeeded silently, no admin DM (a bot that
       // never enabled the feature must not be pinged just because a non-critical
       // scope was topped up in the background). The log line above is the record.
-      if (opts?.silent) return true;
+      if (opts?.silent) return { kind: 'fixed' };
       // Notify admin that auto-fix worked — even if im:message was missing before,
       // the newly published version should now have it.
       const adminOpenId = getAdminOpenId(bot);
       if (adminOpenId) {
         const fixedList = [...missingCritical, ...missingOptional];
         const missingList = fixedList.map(s => `• ${s.desc} (\`${s.name}\`)`).join('\n');
+        // 标题跟着实际结果走：一项都没落地时说「已自动修复」是谎报，管理员会以为
+        // 不用管，而这条路径的下游（缺 critical scope）恰恰是最需要人工介入的。
+        // 同理「新版本已发布」也不能写死：scope 写进了清单但版本没提交，权限就**不会
+        // 生效**，而管理员读到「已发布」只会干等。versionWarning 有值时直接给出
+        // 手动收尾的动作。
+        //
+        // 三种结局要分清，因为「用户接下来该做什么」完全不同：
+        //   ① 秒过（审批流全自动通过）→ 已经生效了，什么都不用做
+        //   ② 要人审 → 已提交，但在等具体某个人；告诉他等谁，免得重复点或干等
+        //   ③ 判不出来 → 保持中性措辞，不猜
+        const versionLine = result.versionWarning
+          ? `⚠️ 但新版本**没有成功提交发布**（${result.versionWarning}）。权限要等版本发布后才生效。`
+          : result.approvalAutoPassed === true
+            ? '新版本已提交，审批流**自动通过**，权限已即时生效。'
+            : result.approvalHumanApprovers?.length
+              ? `新版本已提交，但需要**人工审批**（审批人：${result.approvalHumanApprovers.join('、')}），`
+                + '通过后权限才生效——不用重复提交，等审批即可。'
+              : '新版本已发布。';
         await dmAdmin(
           larkAppId,
           adminOpenId,
-          `✅ botmux 已自动为机器人 "${bot.botName ?? larkAppId}" 修复了缺失的权限：\n\n${missingList}\n\n` +
-          `${scopeDetail}，新版本已发布。\n` +
+          (autoFixEffective && !result.versionWarning
+            ? `✅ botmux 已自动为机器人 "${bot.botName ?? larkAppId}" 修复了缺失的权限：\n\n`
+            : `⚠️ botmux 尝试自动为机器人 "${bot.botName ?? larkAppId}" 补齐以下权限，但没能全部落地，需要你手动收尾：\n\n`) +
+          `${missingList}\n\n` +
+          `${scopeDetail}，${versionLine}\n` +
           `权限变更可能需要 1-2 分钟生效。如仍有问题执行 \`botmux restart\`。`,
-          `auto-fixed ${fixedList.length} scopes`,
+          autoFixEffective ? `auto-fixed ${fixedList.length} scopes` : `auto-fix could not apply ${fixedList.length} scopes`,
         );
       }
-      return true;
+      return { kind: 'fixed' };
     }
 
     // Auto-fix failed — log reason. Critical path falls through to a manual
@@ -320,16 +425,35 @@ async function tryAutoFixScopes(
       missing_csrf: '开放平台页面未返回 CSRF token',
       scope_mapping_failed: '权限映射失败',
       api_error: '开放平台 API 错误',
+      app_under_review: '应用正在飞书审核中（配置被开放平台写锁，审批通过后自动恢复）',
     };
+    // ⚠️ 泛化标签和具体消息**两个都要打**。这里曾写成
+    // `reasons[result.reason] ?? result.message`——`api_error` 在表里有值,`??`
+    // 永远短路,于是 `result.message` 一次都进不了日志。线上真实后果:一天 5 次自愈
+    // 失败只留下 5 行「开放平台 API 错误」,而被吞掉的那句正是唯一有用的诊断
+    // (`code=10043 版本已创建,请刷新`),排查只能靠重放整条链路才拿到。
+    // 泛化标签帮人快速归类,具体消息才说得清到底哪儿坏——别再让前者盖掉后者。
+    const reasonLabel = reasons[result.reason] ?? result.reason;
+    // 审核中不是「修不了」，是「现在不能改、审批通过就好」。日志级别降为 info 并显式
+    // 说明不会落回深链 DM——把权限链接推给管理员是**错误的建议**：审核期间开放平台
+    // 连 scope/update 都拒（实测 code=10046），点了也写不进去。
+    if (result.reason === 'app_under_review') {
+      logger.info(
+        `[${larkAppId}] auto-fix deferred: ${reasonLabel}` +
+        `${result.message ? ` — ${result.message}` : ''}`,
+      );
+      return { kind: 'under_review', inReviewVersionId: result.inReviewVersionId };
+    }
     logger.warn(
-      `[${larkAppId}] auto-fix not possible (${result.reason}: ${reasons[result.reason] ?? result.message}). ` +
+      `[${larkAppId}] auto-fix not possible (${result.reason}: ${reasonLabel}` +
+      `${result.message ? ` — ${result.message}` : ''}). ` +
       (opts?.silent ? 'Leaving opt-in scope ungranted (no DM).' : 'Falling back to manual deep-link DM.'),
     );
-    return false;
+    return { kind: 'failed' };
   } catch (err: any) {
     logger.warn(`[${larkAppId}] auto-fix error: ${err?.message ?? err}` +
       (opts?.silent ? ' — leaving opt-in scope ungranted (no DM)' : ' — falling back to manual DM'));
-    return false;
+    return { kind: 'failed' };
   }
 }
 
@@ -360,12 +484,16 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     // self_manage 后下次重启就能自检了。
     if (infoData.code === 99991672) {
       // Chicken-and-egg: app lacks self_manage so we can't even check what scopes
-      // are missing. Try the Open Platform web-session auto-fix to add ALL
-      // required scopes (including self_manage) in one shot.
+      // are missing. Try the Open Platform web-session auto-fix to add every
+      // botmux-required scope (including self_manage) in one shot — passing the
+      // full BOTMUX_REQUIRED_SCOPES so the next restart's self-check finds them
+      // all present, without over-applying the whole 300+ scope manifest.
       if (brand === 'feishu') {
-        const fixed = await tryAutoFixScopes(larkAppId, bot, brand,
-          [{ name: SELF_MANAGE_SCOPE, desc: '应用自查 (免审批)' }], []);
-        if (fixed) return;
+        const requiredNow = BOTMUX_REQUIRED_SCOPES.map(s => ({ name: s.name, desc: s.desc }));
+        const fixed = await tryAutoFixScopes(larkAppId, bot, brand, requiredNow, []);
+        // 审核中同样直接返回：这条路径下游是让管理员去点 self_manage 深链，而审核期间
+        // 写锁生效，点了也开不了——等审批通过下次重启自检即可。
+        if (fixed.kind !== 'failed') return;
       }
       const selfManageAuthUrl = buildScopeDeepLink(bot.config.larkAppId, SELF_MANAGE_SCOPE, brand);
       const targetAuthUrl = buildScopeDeepLink(bot.config.larkAppId, REQUIRED_BOT_AT_SCOPE, brand);
@@ -407,6 +535,23 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     const grantedScopes = new Set(
       scopesRaw.map(s => typeof s === 'string' ? s : s?.scope).filter(Boolean) as string[],
     );
+
+    // 按 token 类型分桶的已授权集合，专供 automation 的「无变更短路」按桶做差用。
+    // application/v6 每个 scope 条目自带 token_types:(tenant|user)[]（SDK 类型可查）。
+    // 之所以不能复用上面的扁平 grantedScopes：约 121 个名字同时在 tenant/user 两桶，
+    // tenant/user 是两份独立授权；扁平集合会让「tenant 已授权」误伤 user 桶同名 scope，
+    // 把真正缺的 user 权限静默吞掉（PR #1044 R2）。缺 token_types 的条目**两桶都不放**，
+    // 退回保守近似（该名字照发 scope/update），宁可多发一版也不少发。
+    const grantedScopeBuckets = { tenant: [] as string[], user: [] as string[] };
+    for (const s of scopesRaw) {
+      const name = typeof s === 'string' ? s : s?.scope;
+      if (!name) continue;
+      const tokenTypes: unknown = typeof s === 'string' ? undefined : s?.token_types;
+      if (Array.isArray(tokenTypes)) {
+        if (tokenTypes.includes('tenant')) grantedScopeBuckets.tenant.push(name);
+        if (tokenTypes.includes('user')) grantedScopeBuckets.user.push(name);
+      }
+    }
 
     // 文档评论入口就绪自检：仅对「已订阅过文档」的 bot 生效（opt-in，不打扰其他 bot）。
     // ① 校验文档 app 权限是否开通（可查 → 缺则 DM 深链）② 提醒去后台订阅评论事件
@@ -514,11 +659,14 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       // before (no API call / no prompt / no nag).
       if (missingOptional.length > 0 && brand === 'feishu') {
         const toppedUp = await tryAutoFixScopes(larkAppId, bot, brand, [], missingOptional,
-          { disableQrLogin: true, silent: true });
-        if (toppedUp) {
+          { disableQrLogin: true, silent: true, grantedScopeNames: grantedScopeBuckets });
+        // 只有真的补上了才说「auto-topped-up」：审核中什么都没写进去（开放平台
+        // 连 scope/update 都拒），说补上了就是谎报。审核中静默跳过，等审批通过。
+        if (toppedUp.kind === 'fixed') {
           logger.info(`[${larkAppId}] auto-topped-up ${missingOptional.length} optional scope(s): ${missingOptional.map(s => s.name).join('、')}`);
           return;
         }
+        if (toppedUp.kind === 'under_review') return;
         logger.debug(`[${larkAppId}] optional scope(s) missing (${missingOptional.map(s => s.name).join('、')}); no cached web session to auto-apply — leaving to opt-in feature owner`);
       }
       logger.info(`[${larkAppId}] all critical scopes granted (${BOTMUX_REQUIRED_SCOPES.filter(s => s.critical).length} checked)`);
@@ -529,8 +677,60 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     // If a cached Feishu web session exists (~/.botmux/feishu-session.json), we can
     // directly add missing scopes and publish a new version without user interaction.
     // Falls through to manual DM warning if session is missing/expired.
-    const autoFixed = await tryAutoFixScopes(larkAppId, bot, brand, missingCritical, missingOptional);
-    if (autoFixed) return;
+    const autoFixed = await tryAutoFixScopes(larkAppId, bot, brand, missingCritical, missingOptional,
+      { grantedScopeNames: grantedScopeBuckets });
+    if (autoFixed.kind === 'fixed') return;
+    // 审核中：**不推权限深链**（审核期间连 scope/update 都被拒，点了写不进去），
+    // 也**不说「等审批通过就好」**——触发审批通常意味着有配置不合规，那一版不会自己
+    // 通过（模板建的应用出生带「数据范围=全部」，正撞租户「非必要不申请全员数据」的
+    // 加签规则）。所以这里只做一件事：**如实告诉管理员卡在哪、为什么卡、怎么修**。
+    if (autoFixed.kind === 'under_review') {
+      const summary = missingCritical.map(s => `${s.name} (${s.desc})`).join('、');
+      logger.warn(
+        `[${larkAppId}] 缺少 ${missingCritical.length} 项必需权限（${summary}），` +
+        '但应用有一个版本卡在飞书审核中、配置暂时不可写；需人工修配置后撤回重提，botmux 无法自动解决。',
+      );
+      const reviewAdmin = getAdminOpenId(bot);
+      // 🔴 同一个待审版本只打扰一次。不做节流的话，卡在审核中是个持续数天的状态
+      //（线上实测 18 天 / 23 天），而本函数每次 daemon 启动都跑一遍 ⟹ 卡 N 天就发 N 条
+      // 一模一样的 DM，等于把这次要消灭的刷屏换个文案请回来。
+      // key 用待审版本 id：对齐「事情有没有变化」而非「过了多久」——人撤回重提了新版本，
+      // 该说；同一版还卡着，不必再说。拿不到 id 时**刻意不节流**（见 store 注释）。
+      const alreadyNotified = wasPendingReviewNotified(
+        config.session.dataDir, larkAppId, autoFixed.inReviewVersionId,
+      );
+      if (reviewAdmin && !alreadyNotified) {
+        const rangeHint = await inspectUnderReviewConfigHints(bot.config.larkAppId, brand);
+        const delivered = await dmAdmin(
+          larkAppId,
+          reviewAdmin,
+          `⏳ 机器人 "${bot.botName ?? larkAppId}" 还缺 ${missingCritical.length} 项必需权限，`
+          + `而它有一个版本**卡在飞书审核中**，开放平台锁定了配置写入，botmux 补不了：\n\n`
+          + `${missingCritical.map(s => `• ${s.desc} (\`${s.name}\`)`).join('\n')}\n\n`
+          + `**为什么会进审核**：触发企业审批通常说明有配置不合规，最常见是权限的「数据范围」`
+          + `没配、默认成「全部/全员」，撞上租户「非必要不申请全员数据，如申请全员范围需提供`
+          + `充分理由、视情况加签至 CEO-2」的规则。${rangeHint}\n\n`
+          + `**怎么修**（这一版不会自己通过，需要人工）：\n`
+          + `1. 开放平台 →「版本管理与发布」→ 点进审核中那一版的**版本详情**，看审批详情里被卡的项\n`
+          + `2. 修掉不合规项（如把权限的数据范围从「全部」改成「与应用的可用范围一致」）\n`
+          + `3. 在版本详情页点 **Withdraw** 撤回该版本\n`
+          + `4. 执行 \`botmux restart\` —— botmux 会自动补齐权限并重新提交\n\n`
+          + `⚠️ 直接撤回重提**不管用**：不改配置的话同一条规则会再拦一次。\n`
+          + `⚠️ 此时去权限管理页手动点开通也**无效**：审核期间飞书连「申请权限」都拒绝。`,
+          `app under review, ${missingCritical.length} scopes deferred`,
+        );
+        // ⚠️ **发送成功才记账**。反了的话一次网络失败就把这个 versionId 永久节流掉，
+        // 管理员再也收不到提醒，而且是零信号的静默丢失，比刷屏更难发现。
+        if (delivered) {
+          markPendingReviewNotified(config.session.dataDir, larkAppId, autoFixed.inReviewVersionId);
+        }
+      } else if (alreadyNotified) {
+        logger.info(
+          `[${larkAppId}] 待审版本 ${autoFixed.inReviewVersionId} 已通知过管理员，本次不重复打扰`,
+        );
+      }
+      return;
+    }
 
     // Log + DM consolidated message listing all missing critical scopes.
     const summaryLine = missingCritical.map(s => `${s.name} (${s.desc})`).join('、');
@@ -613,15 +813,31 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
     }
     // Automation failed (session expired mid-run / api error). Log; DM the admin
     // once so a bot that genuinely lacks the subscription gets a human nudge.
-    logger.warn(`[${larkAppId}] VC event auto-subscribe failed (${result.reason}): ${result.message}`);
+    //
+    // 「应用正在审核中」要单独说：审核期间开放平台锁配置写入，刷新登录态**没有用**
+    // （不是 session 问题），等审批通过重启即可。给错的操作建议比不给更糟——用户会
+    // 反复 `botmux setup` 却始终不见好。
+    const underReview = !result.ok && result.reason === 'app_under_review';
+    if (underReview) {
+      logger.info(`[${larkAppId}] VC event auto-subscribe deferred (app under review): ${result.message}`);
+    } else {
+      logger.warn(`[${larkAppId}] VC event auto-subscribe failed (${result.reason}): ${result.message}`);
+    }
     const adminOpenId = getAdminOpenId(bot);
     if (adminOpenId) {
       await dmAdmin(
         larkAppId,
         adminOpenId,
         `⚠️ botmux 想在启动时自动为机器人 "${bot.botName ?? larkAppId}" 订阅视频会议事件（vc.bot.meeting_*），以便它被拉进会时能自动进会，但自动配置失败：${result.message}\n\n` +
-        `请运行 \`botmux setup\` 刷新飞书开放平台登录态后重启 daemon，botmux 会自动重试。`,
-        'vc event auto-subscribe failed',
+        (underReview
+          // ⚠️ 别说「等审批通过就好」：触发审批通常意味着有配置不合规，那一版**不会自己
+          // 通过**，说「等」等于让人干等。也别说「刷新登录态」——审核锁住的是配置写入，
+          // 不是 session 问题。
+          ? '该应用有一个版本**卡在飞书审核中**，配置写入被锁（刷新登录态无效）。触发审批通常说明有配置不合规'
+            + '（最常见：权限的「数据范围」默认成「全部/全员」）。需人工处理：开放平台 →「版本管理与发布」→ 该版本详情 → '
+            + '看审批详情修掉不合规项 → 点 **Withdraw** 撤回 → 执行 `botmux restart` 重试。不改配置直接撤回重提会被同一条规则再拦。'
+          : '请运行 `botmux setup` 刷新飞书开放平台登录态后重启 daemon，botmux 会自动重试。'),
+        underReview ? 'vc event auto-subscribe deferred (under review)' : 'vc event auto-subscribe failed',
       );
     }
   } catch (err: any) {
@@ -2053,6 +2269,12 @@ export interface RoutingContext {
   anchor: string;
   /** Chat-scope shared-topic reply target for this turn, if any. */
   replyRootId?: string;
+  /** Set when the turn folded into the group chat-scope session from a Lark
+   *  thread whose root was deliberately NOT used as `replyRootId` (an
+   *  after-the-fact topic). The reply stays flat, but the session must still be
+   *  registered under this root so a later NON-@ message inside that topic
+   *  folds back here instead of forking a new thread-scope session. */
+  foldedRootId?: string;
   /** Command prompt that should be sent to the CLI instead of raw text. */
   promptOverride?: string;
   /** Durable VC routing succeeded but the bounded pre-turn catch-up did not.
@@ -2362,6 +2584,13 @@ export interface EventHandlers {
   isSessionOwner?: (anchor: string, larkAppId: string) => boolean;
   /** Resolve a persisted topic reply alias back to its owning chat-scope session. */
   resolveReplyThreadAlias?: (rootId: string, chatId: string, larkAppId: string) => { chatId: string; sessionId: string; anchor?: string } | null;
+  /** True when this chat's chat-scope session already answered `rootId` as a FLAT
+   *  top-level turn. Identifies the "user @'d at top level, then opened a 话题 on
+   *  that same message" case, where the regular-group fold must keep the turn in
+   *  the group session (as it already does) but must NOT anchor the visible reply
+   *  into the after-the-fact topic. Genuine "@ inside an existing topic" turns
+   *  never match. Best-effort: absent handler ⇒ legacy behavior. */
+  chatSessionAnsweredRootAtTopLevel?: (rootId: string, chatId: string, larkAppId: string) => boolean;
   /** Fired when the dispatcher detects that a chat with a live chat-scope
    *  session has been converted to topic mode (chat_mode 'group' → 'topic'
    *  via Lark group settings). Daemon should evict the stale chat-scope
@@ -2517,7 +2746,7 @@ async function maybeApplySharedTopicSeed(input: {
   // (unconditional) or 'ambient' — but for 'ambient' NOT when the message
   // @mentions another specific member (person/bot) without @ing us: that is a
   // redirect to someone else, so we back off (mentionsAnotherMember).
-  const seedMentionMode = resolveGroupMentionMode(larkAppId);
+  const seedMentionMode = resolveGroupMentionMode(larkAppId, chatId);
   if (!isBotMentioned(larkAppId, message, senderOpenId)
       && !(seedMentionMode === 'never'
         || (seedMentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message)))) return undefined;
@@ -2536,12 +2765,14 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
   chatId: string;
   chatType: 'group' | 'p2p';
   message: any;
-  routing: { scope: 'thread' | 'chat'; anchor: string };
+  routing: { scope: 'thread' | 'chat'; anchor: string; foldedRootId?: string };
   forceTopicApplied?: boolean;
   mentionedThisBot: boolean;
   ownsThreadSession?: boolean;
+  /** See EventHandlers.chatSessionAnsweredRootAtTopLevel. */
+  answeredRootAtTopLevel?: (rootId: string) => boolean;
 }): Promise<string | undefined> {
-  const { larkAppId, chatId, chatType, message, routing, forceTopicApplied, mentionedThisBot, ownsThreadSession } = input;
+  const { larkAppId, chatId, chatType, message, routing, forceTopicApplied, mentionedThisBot, ownsThreadSession, answeredRootAtTopLevel } = input;
   if (forceTopicApplied || ownsThreadSession) return undefined;
   if (!mentionedThisBot) return undefined;
   if (chatType !== 'group') return undefined;
@@ -2578,6 +2809,27 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
   if (freshMode !== 'group') return undefined;
   routing.scope = 'chat';
   routing.anchor = chatId;
+  // 用户先在顶层 @ 了 bot（bot 已按 mode='plain' 平铺答过这条消息），之后才在
+  // **同一条消息上手动开启话题**：飞书把话题内的后续消息投递成
+  // root_id=<那条原顶层消息> + thread_id=<新建 omt_>。会话折叠回群是对的（上面
+  // 已完成），但此时不能再把可见回复钉进这个事后创建的话题 —— 否则用户在顶层
+  // @ 得到的回复会跑进一个他并未在其中 @ 过 bot 的话题里。
+  //
+  // 判据要求 `inThread === false`（答那轮的 inbound 不带 thread_id），所以
+  // 「@ 在既有话题里」不会命中：原生话题的开场消息虽然同样记 mode='plain'，但它
+  // 带 thread_id ⇒ inThread=true。既有的话题锚定契约（chat/shared fold 用例）
+  // 因此保持不变。
+  //
+  // 只抑制**显示锚点**，不抑制**路由归属**：仍把 rootId 作为 foldedRootId 交出去
+  // 登记 alias，否则该话题内后续的非 @ 消息会查不到本会话而另起 thread 会话。
+  if (answeredRootAtTopLevel?.(rootId)) {
+    logger.info(
+      `[reply-mode] thread root=${rootId.substring(0, 12)} was answered flat at top level; ` +
+      `folding into chat=${chatId.substring(0, 12)} WITHOUT anchoring the reply into the after-the-fact topic`,
+    );
+    routing.foldedRootId = rootId;
+    return undefined;
+  }
   logger.info(`[reply-mode] mentioned thread root=${rootId.substring(0, 12)} folds into chat=${chatId.substring(0, 12)}`);
   return rootId;
 }
@@ -3010,7 +3262,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       dispatchPersistedForwardFollowup(record.messageId, payload);
     const remainingMs = record.dueAt - Date.now();
     const isUnpairedSeed = !record.payload.ctx.forwardSeedData;
-    const delayStillEnabled = usesForwardFollowupDelay(resolveGroupMentionMode(larkAppId));
+    const delayStillEnabled = usesForwardFollowupDelay(resolveGroupMentionMode(larkAppId, chatId));
     if (isUnpairedSeed && delayStillEnabled && remainingMs > 0 && forwardFollowups.hold({
       larkAppId,
       chatId,
@@ -3316,6 +3568,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const botTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
         let replyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
           larkAppId, chatId, chatType, message, routing: ctx, forceTopicApplied: forcedTopic, mentionedThisBot: botTalk.allowed, ownsThreadSession,
+          answeredRootAtTopLevel: root => handlers.chatSessionAnsweredRootAtTopLevel?.(root, chatId, larkAppId) ?? false,
         });
         if (!replyRootId) {
           replyRootId = await maybeApplySharedTopicSeed({
@@ -3397,6 +3650,10 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       }
 
       if (await tryHandleReplyModeCommand(larkAppId, message, senderOpenId, isAllowed)) {
+        return;
+      }
+
+      if (await tryHandleMentionModeCommand(larkAppId, message, senderOpenId, isAllowed)) {
         return;
       }
 
@@ -3561,7 +3818,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // that @mentions another specific member (person/bot) is a redirect to
       // someone else → back off, don't fold it in (mentionsAnotherMember).
       // 'never' stays unconditional by design.
-      const mentionModeForAlias = resolveGroupMentionMode(larkAppId);
+      const mentionModeForAlias = resolveGroupMentionMode(larkAppId, chatId);
       if (!explicitlyMentionedThisBot
           && mentionModeForAlias !== 'always'
           && !((mentionModeForAlias === 'topic' || mentionModeForAlias === 'ambient') && mentionsAnotherMember(larkAppId, message))
@@ -3633,6 +3890,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         : false;
       const foldedReplyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
         larkAppId, chatId, chatType, message, routing, forceTopicApplied, mentionedThisBot: explicitlyMentionedThisBot, ownsThreadSession: ownsThreadSessionBeforeFold,
+        answeredRootAtTopLevel: root => handlers.chatSessionAnsweredRootAtTopLevel?.(root, chatId, larkAppId) ?? false,
       });
       if (foldedReplyRootId) {
         replyRootId = foldedReplyRootId;
@@ -3710,7 +3968,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           senderOpenId,
           rootId: message.root_id,
         };
-        const pairingMentionMode = resolveGroupMentionMode(larkAppId);
+        const pairingMentionMode = resolveGroupMentionMode(larkAppId, chatId);
         const ambientRedirect = pairingMentionMode === 'ambient'
           && !explicitlyMentionedThisBot
           && mentionsAnotherMember(larkAppId, message);
@@ -3767,7 +4025,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       //   !ownsSession (group)    → require @mention + allowlist
       //   p2p                     → allowlist only
       if (chatType === 'group') {
-        const mentionMode = resolveGroupMentionMode(larkAppId);
+        const mentionMode = resolveGroupMentionMode(larkAppId, chatId);
         // 消息里 @ 了别的具体成员,就已经证明群不是 1人1bot（只有群成员能被 @）——
         // 此刻末条 solo 放行必然不成立,而 stats 只被末条消费,直接跳过这次（可能
         // 昂贵的）人数查询。这在「刚拉了新 bot、用户 @ 新 bot」窗口里尤为重要：
@@ -3890,7 +4148,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? ownsSession;
       }
       const payload = { data, ctx, ownsSession } satisfies PendingForwardTopicPayload;
-      const groupMentionMode = resolveGroupMentionMode(larkAppId);
+      const groupMentionMode = resolveGroupMentionMode(larkAppId, chatId);
       const shouldDelayTopicSeed = usesForwardFollowupDelay(groupMentionMode)
         && !pairedForwardSeed
         && !isControlCommand

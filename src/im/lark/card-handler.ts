@@ -88,6 +88,8 @@ import { buildClosedSessionCard } from '../../core/closed-session-card.js';
 import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
+import { retryCooldownRemaining, markRetryAttempt } from '../../services/failed-turn-retry.js';
+import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, silentIdleCardFlag, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
@@ -146,6 +148,20 @@ export interface CardHandlerDeps {
   codexNotifierCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
   /** 授权成功后重放之前被拦截的消息，让用户无需再 @ 一遍。 */
   replayGrantedMessage?: (data: any, larkAppId: string) => void;
+  /** 把 passthrough 命令（如 /compact）透传到仍存活的会话。由 daemon 接线到
+   *  deliverPassthroughToExistingSession（raw_input 透传，含完整 turn 绑定/卡片冻结/
+   *  turn-starting 逻辑）。未接线时 compact_session 走 unsupported toast 兜底。 */
+  deliverPassthroughCommand?: (
+    ds: DaemonSession,
+    cmd: string,
+    opts: {
+      anchor: string;
+      senderOpenId?: string;
+      senderIsBot: boolean;
+      messageId: string;
+      replyRootId?: string;
+    },
+  ) => void;
 }
 
 /**
@@ -1961,7 +1977,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     );
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'retry_turn', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'stop_turn', 'compact_session'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -2675,9 +2691,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
             : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
           // Restore the ORIGINAL live streaming card (🖥️ header + usage line +
-          // 显示输出/终端/操作链接/关闭会话) as a WITHDRAW-then-REPOST (old closed card
-          // recalled, fresh card posted at the thread bottom), AND send the
-          // "✅ 会话已恢复…" text follow-up — both are wanted.
+          // 显示输出/终端/操作链接/关闭会话) as a WITHDRAW-then-REPOST when live
+          // cards are enabled. Card-off bots only withdraw the stale closed card
+          // and send the "✅ 会话已恢复…" text follow-up.
           // Ordering is load-bearing for two reasons:
           //   1) ACK the callback FIRST (bare `return` → empty ACK), THEN
           //      post/delete in the background — deleting the just-clicked card
@@ -2687,20 +2703,32 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           //      never briefly shows zero cards (same invariant as park→recall).
           // Skip in private-card mode (clicked card may be an ephemeral snapshot).
           const botCfgResume = getBot(result.ds.larkAppId).config;
+          const shouldRepostStreamingCard = botCfgResume.disableStreamingCard !== true
+            && !botCfgResume.noCardChats?.includes(result.ds.chatId);
           if (cardMessageId && value?.visibility !== 'private' && !botCfgResume.privateCard) {
             const staleCardId = cardMessageId;
             const resumedDs = result.ds;
             void (async () => {
               try {
-                const freshCardId = await sessionReply(rootId, buildStreamingCardJson(resumedDs), 'interactive');
-                resumedDs.streamCardId = freshCardId;
+                if (shouldRepostStreamingCard) {
+                  const freshCardId = await sessionReply(rootId, buildStreamingCardJson(resumedDs), 'interactive');
+                  resumedDs.streamCardId = freshCardId;
+                } else {
+                  resumedDs.streamCardId = undefined;
+                  resumedDs.streamCardNonce = undefined;
+                  resumedDs.streamCardReplyTargetKey = undefined;
+                }
                 persistStreamCardState(resumedDs);
                 await deleteMessage(resumedDs.larkAppId, staleCardId).catch(() => { /* already withdrawn/expired */ });
-                // Also send the "✅ 会话已恢复…" text follow-up (the original resume
-                // behavior). Both are wanted: the live streaming card AND the text
-                // prompt telling the user to send a message to continue.
+                // Also send the "✅ 会话已恢复…" text follow-up (the original
+                // resume behavior) telling the user to send a message to continue.
                 await deliverEphemeralOrReply(resumedDs, operatorOpenId, resumeMsg, 'text', () => sessionReply(rootId, resumeMsg));
-                logger.info(`[${targetSessionId.substring(0, 8)}] Resumed via card button (withdraw + repost streaming card + text)`);
+                logger.info(
+                  `[${targetSessionId.substring(0, 8)}] Resumed via card button `
+                  + (shouldRepostStreamingCard
+                    ? '(withdraw + repost streaming card + text)'
+                    : '(withdraw card + text; streaming card disabled)'),
+                );
               } catch (err) {
                 logger.warn(`[${targetSessionId.substring(0, 8)}] resume card repost failed: ${err instanceof Error ? err.message : String(err)}`);
               }
@@ -2855,6 +2883,121 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }
       return;
+    }
+
+    // 失败卡的重试按钮。刻意不复用上面的 `retry_last_task`：那颗按钮的
+    // `ds.usageLimit` 条件同时充当它的一次性安全阀（成功后 clearUsageLimitState
+    // 消费掉，所以连点第二次自然失效）。失败场景没有那个状态，于是这里换成两道
+    // 独立的门——注意**两道都不是一次性的**，`lastFailedTurn` 只写不删：
+    //   - turnId pin：卡上的 turn_id 必须与当前记录的失败轮次逐字相同。它挡的是
+    //     **历史卡片**——会话后来又失败过、记录被新的覆盖，旧卡就永久失效；同一
+    //     张卡在记录没被覆盖前，pin 一直是满足的。
+    //   - 10s cooldown（markRetryAttempt 盖 lastRetryAt）：挡的是**连点**。
+    //     冷却过后同一张卡可以再次提交，这是刻意的（与 `/retry` 同款，
+    //     failed-turn-retry.test 有用例钉住），因为一次重试也可能再失败。
+    // 两道都 fail-closed：宁可让用户多发一条消息，也不重复提交可能带外部副作用
+    // 的任务。
+    if (actionType === 'retry_turn' && ds) {
+      const locDs = localeForBot(ds.larkAppId);
+      if (isSessionTransferring(ds)) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('cmd.session.transfer_in_progress', undefined, locDs),
+          },
+        };
+      }
+      const failedTurn = ds.session.lastFailedTurn;
+      if (!failedTurn) {
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_missing', undefined, locDs) } };
+      }
+      // 轮次校验：卡片只对它自己那一轮有效。会话后来又失败过、记录被新的覆盖，
+      // 这张旧卡就永久失效。（「刚点过」不在这里挡，由下面的 cooldown 负责。）
+      const clickedTurnId = value?.turn_id;
+      if (!clickedTurnId || clickedTurnId !== failedTurn.turnId) {
+        logger.info(
+          `[${tag(ds)}] retry_turn from stale card (clicked=${clickedTurnId?.slice(0, 8) ?? 'none'} `
+          + `current=${failedTurn.turnId.slice(0, 8)}) — refused`,
+        );
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_stale', undefined, locDs) } };
+      }
+      const cooldownMs = retryCooldownRemaining(failedTurn);
+      if (cooldownMs > 0) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('card.action.retry_turn_cooldown', { seconds: Math.ceil(cooldownMs / 1000) }, locDs),
+          },
+        };
+      }
+      if ((!ds.worker || ds.worker.killed) && hasProtectedSessionMutationOwnership(ds)) {
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
+      }
+      // Strip clientUserMessageId to avoid dedup conflicts (same as /retry).
+      const retryCodexAppInput = failedTurn.codexAppInput
+        ? (({ clientUserMessageId: _prior, ...input }) => input)(failedTurn.codexAppInput)
+        : undefined;
+      // 提交什么由卡上的 mode 决定，而 mode 由渲染时的 retryOffer 决定，所以
+      // 「卡上写的语义」与「实际发生的事」永远一致：
+      //   resend   —— 输入证明没送达 CLI，零副作用，重发原话最干净可靠；
+      //   continue —— 可能已执行一部分，原样重发会重复副作用，改发续跑指令
+      //               （读现场 → 从 checkpoint 接着做 → 判断不了就交回人工）。
+      // 旧卡片没有 mode 字段：按 continue 处理（fail-safe —— 宁可让模型先看
+      // 现场，也不要在可能已执行过的轮次上闷头重发一遍）。
+      const continueMode = value?.mode !== 'resend';
+      // 续跑不带原任务文本：这个 fork 走 resume（下面 ds.hasHistory），CLI 自己
+      // 就能读到原任务和它已经做过的事，重复一遍纯属浪费 token。
+      const submittedContent = continueMode
+        ? buildTurnContinuePrompt()
+        : failedTurn.cliInput;
+      const retryInput = {
+        content: submittedContent,
+        // codexAppInput 描述的是「原样重发那条结构化输入」。续跑发的是一条新指令，
+        // 带上旧 sidecar 会让 CLI 收到与正文不符的结构化载荷。
+        ...(!continueMode && retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
+      };
+      let accepted = false;
+      try {
+        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput);
+        else {
+          forkWorker(ds, retryInput, ds.hasHistory);
+          accepted = true;
+        }
+      } catch (err) {
+        logger.warn(
+          `[${tag(ds)}] retry_turn failed before acceptance: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (!accepted) {
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
+      }
+      // Start the cooldown only after acceptance: a rejected click must not
+      // burn it (same post-acceptance ordering as /retry and retry_last_task).
+      markRetryAttempt(ds.session);
+      rememberLastCliInput(ds, failedTurn.userPrompt, retryInput);
+      sessionStore.updateSession(ds.session);
+      ds.lastScreenStatus = 'working';
+      ds.streamCardPending = true;
+      ds.currentTurnTitle = (failedTurn.userPrompt || ds.currentTurnTitle || ds.session.title
+        || getCliDisplayName(sessionCliId(ds))).substring(0, 50);
+      ds.currentImageKey = undefined;
+      persistStreamCardState(ds);
+      logger.info(
+        `[${tag(ds)}] retry_turn re-injected turn ${failedTurn.turnId.slice(0, 8)} `
+        + `mode=${continueMode ? 'continue' : 'resend'} `
+        + `(attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`,
+      );
+      return {
+        toast: {
+          type: 'success',
+          content: t(
+            continueMode ? 'card.action.continue_turn_success' : 'card.action.retry_turn_success',
+            undefined,
+            locDs,
+          ),
+        },
+      };
     }
 
     if (actionType === 'tui_keys' && ds) {
@@ -3415,6 +3558,96 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }
       return;
+    }
+
+    // 「⏹ 停止」：中断当前 turn 但保留会话（不是 /close——turn 跑飞时折叠态用户此前
+    // 唯一手段是杀整个会话丢上下文）。走已有的 term_action ctrlc IPC 链路
+    // （sendWorkerSessionInput → worker.handleTermAction → sendCriticalControlKey
+    // 带重试注入 ^C），与展开态 ^C 快捷键完全同款。中断后把卡片重渲染为 transient
+    // 'interrupted' 状态（橙色 header + 已中断文案），~2s 后被下一次 screen_update
+    // patch 覆盖为真实 idle 态。
+    if (actionType === 'stop_turn') {
+      const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
+      }
+      if (isSessionTransferring(ds)) {
+        return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, locDs) } };
+      }
+      // RPC 输入模式下 ^C 到不了 app-server（pane 只是 viewer）；codex-app（App Runner）
+      // 无 PTY 输入通道。两者都降级为明确拒绝，提示用 /close。
+      if (ds.initConfig?.codexRpcInput === true || sessionCliId(ds) === 'codex-app') {
+        return { toast: { type: 'warning', content: t('card.action.stop_unsupported', undefined, locDs) } };
+      }
+      if (!ds.worker || ds.worker.killed) {
+        return { toast: { type: 'warning', content: t('card.action.stop_no_worker', undefined, locDs) } };
+      }
+      sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' });
+      logger.info(`[${tag(ds)}] stop_turn: ^C sent (session kept alive)`);
+      // 重渲染为 'interrupted' transient 状态——与 term_action 重渲染完全同款模式，
+      // 唯一差异是 status 参数传 'interrupted' 而非 ds.lastScreenStatus。
+      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
+        const effectiveCliId = sessionCliId(ds);
+        const readUrl = readableTerminalUrlFor(ds);
+        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+        const cardJson = buildStreamingCard(
+          ds.session.sessionId,
+          sessionAnchorId(ds),
+          readUrl,
+          turnTitle,
+          ds.lastScreenContent || '',
+          'interrupted',
+          effectiveCliId,
+          ds.displayMode ?? 'screenshot',
+          ds.streamCardNonce,
+          ds.currentImageKey,
+          !!ds.adoptedFrom,
+          false,
+          localeForBot(ds.larkAppId),
+          cardUsageLimit(ds),
+          writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+          getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+          sessionRuntimeDisplayName(ds),
+          codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+          silentIdleCardFlag(ds),
+        );
+        return {
+          toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) },
+          card: { type: 'raw' as const, data: JSON.parse(cardJson) },
+        };
+      }
+      return { toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) } };
+    }
+
+    // 「🗜️ 压缩」：等价于用户在话题里发 /compact——通过 deps.deliverPassthroughCommand
+    // 复用 daemon 的 deliverPassthroughToExistingSession（raw_input 透传，含完整 turn
+    // 绑定/卡片冻结/turn-starting 逻辑），不新造压缩逻辑。daemon 未接线时走 unsupported
+    // toast 兜底。与 daemon passthrough 路径一致，不用 withBotTurnMutation
+    // （deliverPassthroughToExistingSession 内部自己管 turn 绑定）。
+    if (actionType === 'compact_session') {
+      const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
+      }
+      if (isSessionTransferring(ds)) {
+        return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, locDs) } };
+      }
+      if (!ds.worker || ds.worker.killed) {
+        return { toast: { type: 'warning', content: t('card.action.compact_no_worker', undefined, locDs) } };
+      }
+      if (!deps.deliverPassthroughCommand) {
+        return { toast: { type: 'warning', content: t('card.action.compact_unsupported', undefined, locDs) } };
+      }
+      deps.deliverPassthroughCommand(ds, '/compact', {
+        anchor: sessionAnchorId(ds),
+        senderOpenId: operatorOpenId,
+        senderIsBot: false,
+        messageId: cardMessageId ?? `compact-${Date.now()}`,
+        replyRootId: rootId,
+      });
+      logger.info(`[${tag(ds)}] compact_session: /compact passthrough sent`);
+      return { toast: { type: 'success', content: t('card.action.compact_sent', { cliName: sessionCliDisplayName(ds) }, locDs) } };
     }
 
     // Quick-action keys (Esc, ^C, Tab, Space, Enter, ←↑↓→, ½ page) — forward to worker.

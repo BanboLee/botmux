@@ -13,6 +13,10 @@ import {
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import type { PricingOverrides } from './services/model-pricing.js';
+import type { BudgetConfig } from './services/budget-tracker.js';
+import { normalizePricingOverrides } from './services/model-pricing.js';
+import { parseBudgetConfig } from './services/budget-tracker.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
@@ -168,6 +172,8 @@ export function larkUploadHttpInstance(): unknown {
 }
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
+/** 普通群 @ 策略：always=必须 @｜topic=话题内免 @｜never=免 @｜ambient=免 @ 但 @ 别人时安静。 */
+export type GroupMentionMode = 'always' | 'topic' | 'never' | 'ambient';
 /** Where a bot shows native Context / Token usage on its Session cards. */
 export type UsageDisplayMode = 'streaming' | 'footer' | 'off';
 /** Default when a bot sets nothing: usage rides the live streaming card. */
@@ -305,6 +311,13 @@ function normalizeChatReplyModeConfig(raw: unknown): ChatReplyMode | undefined {
   if (v === 'chat-topic' || v === 'chattopic' || v === 'chat_topic') return 'chat-topic';
   if (v === 'new-topic' || v === 'newtopic' || v === 'thread') return 'new-topic';
   if (v === 'topic' || v === 'shared' || v === 'share' || v === 'alias' || v === 'topic-alias' || v === 'topic_alias') return 'shared';
+  return undefined;
+}
+
+function normalizeGroupMentionModeConfig(raw: unknown): GroupMentionMode | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const v = raw.trim().toLowerCase();
+  if (v === 'always' || v === 'topic' || v === 'never' || v === 'ambient') return v;
   return undefined;
 }
 
@@ -1603,6 +1616,8 @@ export interface BotConfig {
   defaultOncallAutoboundChats?: string[];
   /** Per-chat reply mode: chat_id → 普通群 @bot 后回复形态。缺省为 chat（保持现状）。 */
   chatReplyModes?: { [chatId: string]: ChatReplyMode };
+  /** Per-chat @ 策略：chat_id → 该群的 mention 模式，覆盖 per-bot `regularGroupMentionMode`。由 /mention-mode 写入。 */
+  chatMentionModes?: { [chatId: string]: GroupMentionMode };
   /** Per-chat per-user grants: chat_id → 被授权的 open_id 列表。仅放行 canTalk，不给管理命令权。 */
   chatGrants?: { [chatId: string]: string[] };
   /**
@@ -1861,6 +1876,15 @@ export interface BotConfig {
    */
   autoStartOnGroupJoinPrompt?: string;
   /**
+   * 主动开工 — 场景①自定义入群 seed 消息文案（该消息同时是话题根/共享会话锚点，
+   * 只在话题群 / 普通群 new-topic / shared 模式下发送；普通群顶层平铺入群静默）。
+   * 缺省/空白 → 按 bot locale 回退内置 i18n 文案（daemon.auto_start_join_seed）。
+   * bots.json 手配 + dashboard「Bot 默认设置」可编辑（card-prefs 链路，清空保存即
+   * 恢复默认）。注意 forcePrompt（Issue Board 领取）路径会跳过
+   * {@link autoStartOnGroupJoin} 开关检查，开关关闭时 seed 仍可能发出。
+   */
+  autoStartOnGroupJoinSeed?: string;
+  /**
    * 进群自动拉 owner。Default (undefined) = ON：本 bot 被加进任何群时，自动把
    * 自己的 owner（resolvedAllowedUsers 首个 ou_ 用户）拉进群——bot 应始终处于
    *  owner 可见的群里（不打黑工）。显式 false 关闭（如告警/oncall 类 bot 被
@@ -1962,6 +1986,16 @@ export interface BotConfig {
    * cards render the "🔊 语音总结" button. See services/voice/types.ts.
    */
   voice?: VoiceConfig;
+  /**
+   * Per-bot pricing overrides for cost estimation. Merged over the built-in
+   * model price table. See services/model-pricing.ts.
+   */
+  pricing?: PricingOverrides;
+  /**
+   * Per-bot monthly budget config. When set, the daemon tracks spend and
+   * alerts/blocks at thresholds. See services/budget-tracker.ts.
+   */
+  budget?: BudgetConfig;
 }
 
 export interface BotState {
@@ -2063,6 +2097,16 @@ function shortLarkPath(url: unknown): string {
  * access token can't leak.
  */
 export function formatLarkError(v: any): string | null {
+  // The SDK logger calls logger.error(formatErrors(error)), so its first
+  // argument is an array containing the already-sanitized Axios shape. Accept
+  // that wrapper here as well as the raw error received by CLI callers.
+  if (Array.isArray(v)) {
+    for (const item of v) {
+      const formatted = formatLarkError(item);
+      if (formatted) return formatted;
+    }
+    return null;
+  }
   if (!v || typeof v !== 'object') return null;
   const isAxios = v.isAxiosError === true || v.name === 'AxiosError' || (v.config && (v.response || v.status != null));
   if (!isAxios) return null;
@@ -2082,6 +2126,12 @@ export function formatLarkError(v: any): string | null {
   if (typeof code === 'number') parts.push(`code=${code}`);
   if (typeof msg === 'string' && msg) parts.push(`"${msg}"`);
   if (logId) parts.push(`log_id=${logId}`);
+  // Without an HTTP response, the transport code/message is the only useful
+  // signal. Keep it while still excluding config, headers, and stack.
+  if (httpStatus == null && typeof code !== 'number') {
+    if (typeof v.code === 'string' && v.code) parts.push(v.code);
+    if (typeof v.message === 'string' && v.message) parts.push(`"${v.message}"`);
+  }
   if (!parts.length) return null;
   return parts.join(' ');
 }
@@ -2918,6 +2968,20 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (Object.keys(out).length > 0) chatReplyModes = out;
     }
 
+    // chatMentionModes：只保留每群显式设置，非法值丢弃。四态 always｜topic｜
+    // never｜ambient 都保留解析；写入路径会删除「与 per-bot 默认相同」的条目
+    // 以保持 bots.json 干净（见 chat-reply-mode-store.setChatMentionMode）。
+    let chatMentionModes: { [chatId: string]: GroupMentionMode } | undefined;
+    if (entry.chatMentionModes && typeof entry.chatMentionModes === 'object' && !Array.isArray(entry.chatMentionModes)) {
+      const out: { [chatId: string]: GroupMentionMode } = {};
+      for (const [cid, mode] of Object.entries(entry.chatMentionModes)) {
+        if (typeof cid !== 'string' || !cid.trim()) continue;
+        const normalizedMode = normalizeGroupMentionModeConfig(mode);
+        if (normalizedMode) out[cid] = normalizedMode;
+      }
+      if (Object.keys(out).length > 0) chatMentionModes = out;
+    }
+
     // chatGrants：只保留 { [chatId:string]: string[] }，逐项校验 typeof === 'string'，
     // 丢弃空列表。未配置或全部非法 → undefined。
     let chatGrants: { [chatId: string]: string[] } | undefined;
@@ -3057,8 +3121,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
 
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
-    // 为对象，speaker/rate 透传）；非对象或 engine 非法 → undefined。深度校验
-    // （凭证是否可用）在 resolveVoiceConfig 做，这里只挡明显垃圾。
+    // 为对象，speaker/rate 透传，asr 为对象）；非对象或 engine 非法 → undefined。
+    // 深度校验（凭证是否可用 / asr 是否 enabled）在 resolveVoiceConfig /
+    // resolveAsrConfig 做，这里只挡明显垃圾。
     let voice: VoiceConfig | undefined;
     const rawVoice = entry.voice;
     if (rawVoice && typeof rawVoice === 'object' && !Array.isArray(rawVoice)) {
@@ -3072,9 +3137,26 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         if (s && typeof s === 'object') v.sami = { accessKey: s.accessKey, secretKey: s.secretKey, appkey: s.appkey, tokenUrl: s.tokenUrl, wsUrl: s.wsUrl };
         const o = (rawVoice as any).openai;
         if (o && typeof o === 'object') v.openai = { baseUrl: o.baseUrl, apiKey: o.apiKey, model: o.model };
-        if (v.engine || v.sami || v.openai || v.speaker) voice = v;
+        const a = (rawVoice as any).asr;
+        if (a && typeof a === 'object') v.asr = {
+          enabled: a.enabled === true,
+          baseUrl: typeof a.baseUrl === 'string' ? a.baseUrl : undefined,
+          apiKey: typeof a.apiKey === 'string' ? a.apiKey : undefined,
+          model: typeof a.model === 'string' ? a.model : undefined,
+          ...(typeof a.timeoutMs === 'number' ? { timeoutMs: a.timeoutMs } : {}),
+          ...(typeof a.language === 'string' ? { language: a.language } : {}),
+        };
+        if (v.engine || v.sami || v.openai || v.speaker || v.asr) voice = v;
       }
     }
+
+    // pricing：per-bot 定价覆盖。normalizePricingOverrides 做宽松校验，
+    // 非法项丢弃，全空返回 undefined。
+    const pricing = normalizePricingOverrides(entry.pricing);
+
+    // budget：per-bot 月度预算。parseBudgetConfig 做宽松校验，
+    // 非法/缺字段返回 null。
+    const budget = parseBudgetConfig(entry.budget);
 
     configs.push({
       larkAppId: entry.larkAppId,
@@ -3174,6 +3256,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // true is persisted (undefined = off) so bots.json stays clean.
       defaultWorkingDirAutoWorktree: entry.defaultWorkingDirAutoWorktree === true || undefined,
       chatReplyModes,
+      chatMentionModes,
       chatGrants,
       globalGrants,
       // 只落显式 true（undefined = 关），与 restrictGrantCommands 同款，保持 bots.json 干净。
@@ -3244,6 +3327,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' && entry.autoStartOnGroupJoinPrompt.trim()
         ? entry.autoStartOnGroupJoinPrompt
         : undefined,
+      // Preserve the configured seed verbatim; trim-to-undefined when blank
+      // so an empty string doesn't linger in bots.json.
+      autoStartOnGroupJoinSeed: typeof entry.autoStartOnGroupJoinSeed === 'string' && entry.autoStartOnGroupJoinSeed.trim()
+        ? entry.autoStartOnGroupJoinSeed
+        : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
       messageListeners,
       worktreeMultiPicker: entry.worktreeMultiPicker === true || undefined,
@@ -3280,6 +3368,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       summaryMemoryPath,
       contentTriggers,
       voice,
+      pricing,
+      budget: budget ?? undefined,
     });
   }
 

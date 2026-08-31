@@ -27,6 +27,10 @@ export const messages: Record<string, string> = {
   'card.btn.half_page_down': '⇟ Page ½ Down',
   'card.btn.send_custom': '📝 Send Custom Reply',
   'card.btn.retry_last_task': '🔁 Retry Last Task',
+  'card.btn.retry_turn': '🔁 Retry This Turn',
+  'card.btn.continue_turn': '▶️ Continue This Turn',
+  'card.btn.stop': '⏹ Stop',
+  'card.btn.compact': '🗜️ Compact',
 
   // ─── Card status ─────────────────────────────────────────────────────────
   'card.status.starting': 'Starting…',
@@ -36,6 +40,7 @@ export const messages: Record<string, string> = {
   'card.status.dormant': 'Dormant',
   'card.status.analyzing': 'Analyzing…',
   'card.status.stalled': 'No recent progress',
+  'card.status.interrupted': 'Interrupted',
   'card.status.limited': 'Limit reached',
   'card.status.retry_ready': 'Ready to retry',
   'card.status.executing': 'Executing…',
@@ -64,6 +69,10 @@ export const messages: Record<string, string> = {
   'worker.rate_limit_notify.usage': '⚠️ {cliName} hit its usage limit — this turn is paused. Once the quota resets ({retryLabel}), resend the last task or send a new message to continue.',
   'card.private.snapshot_note': '🔒 Private static snapshot (visible only to you, not live-updating). Tap Open Web Terminal for the live view.',
   'card.private.snapshot_note_no_terminal': '🔒 Private static snapshot (visible only to you, not live-updating). This backend does not provide a Web Terminal.',
+
+  // ─── Context headroom indicator ──────────────────────────────────────────
+  'card.context.indicator': 'Context {pct}%',
+  'card.context.over_threshold': 'Context {pct}% · compact recommended',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 Project Repository',
@@ -286,6 +295,12 @@ export const messages: Record<string, string> = {
   'cmd.reply_mode.dm_updated': '✅ DM session mode updated to: {mode}',
   'cmd.reply_mode.dm_usage': 'Usage (DM): /reply-mode chat | topic | group\nchat = the whole DM shares one continuous session (default); topic = each message starts its own session; group = each message births a dedicated session group and the conversation continues there.',
   'cmd.reply_mode.dm_shared_unsupported': '⚠️ shared / chat-topic only make sense in regular groups; DMs support chat | topic only.',
+  'cmd.mention_mode.status': 'Current group @-mention policy: {mode}\nCommands: /mention-mode always | topic | never | ambient',
+  'cmd.mention_mode.updated': '✅ Group @-mention policy updated to: {mode}',
+  'cmd.mention_mode.unsupported': '⚠️ /mention-mode only works in regular groups; DMs and topic groups need no setting.',
+  'cmd.mention_mode.owner_only': '⚠️ Only owner/allowedUsers can change the @-mention policy.',
+  'cmd.mention_mode.usage': 'Usage: /mention-mode always | topic | never | ambient\nalways = @ required to reply (default); topic = @ required at top level, non-@ continues inside topics; never = no @ required, answers all group messages; ambient = like never, but stays quiet when the message @mentions someone else.',
+  'cmd.mention_mode.failed': '⚠️ Failed to update @-mention policy: {reason}',
   'cmd.substitute.status_on': 'Current substitute mode for this group: ON (default). When a configured substitute target is @mentioned, I will answer on their behalf.',
   'cmd.substitute.status_off': 'Current substitute mode for this group: OFF. Use @me /substitute on to enable it again.',
   'cmd.substitute.updated_on': '✅ Substitute mode enabled for this group.',
@@ -626,6 +641,12 @@ export const messages: Record<string, string> = {
   'help.repo_wt': '/repo wt <N|name> [branch] - Create a worktree off the remote default branch and open it (auto semantic name when branch is omitted)',
   'help.rename': '/rename <title> - Rename this Botmux session and sync the running Codex/Claude session name',
   'help.status': '/status     - Show current session status (incl. terminal URL)',
+  'help.retry': '/retry      - Retry the most recent failed or interrupted turn (10s cooldown)',
+  'cmd.retry.no_session': 'No active session in this topic to retry.',
+  'cmd.retry.no_failed_turn': 'No recent failed or interrupted turn to retry.',
+  'cmd.retry.cooldown': '⏳ Retry cooldown active. Try again in {seconds}s.',
+  'cmd.retry.success': '🔁 Re-submitted the last failed task (error: {errorCode}). Waiting for execution.',
+  'cmd.retry.submit_failed': '⚠️ Retry submission failed: worker is not accepting input. Try again later.',
   'help.card': '/card       - Manually post the streaming card for this session (summons it even when streaming is off, and resumes live updates; with private-card mode on, sends a static snapshot visible only to authorized users instead)',
   'help.term': '/term       - Get the operable (write-enabled) terminal link for this session, delivered privately to the owner (visible-to-you in-chat, falling back to DM in topic/p2p — never exposed in the group)',
   'help.dashboard': '/dashboard [module] - Open Dashboard control cards in Feishu (sessions/schedules/groups/settings/help, etc.)',
@@ -701,7 +722,7 @@ export const messages: Record<string, string> = {
   'slashlist.col_desc': 'Description',
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
-  'ai.routing.intro': 'You are in a Lark (Feishu) topic group. The user cannot see terminal output — you MUST reply via `botmux send`.',
+  'ai.routing.intro': 'You are in a Lark (Feishu) conversation. The user cannot see terminal output — you MUST reply via `botmux send`.',
   'ai.routing.usage_send': '- Send: `botmux send "message"`',
   'ai.routing.usage_mention_gate': '- Every send MUST pick one: `--mention <open_id>` / `--mention-back` / `--no-mention` — pick by VALUE: substantive conclusions the other party should read/confirm/decide → @; pure record / low-priority progress / short ack → --no-mention; a contentless "got it" is better not sent',
   'ai.routing.usage_attachments': '- Attachments: `--images`, `--files`, `--videos` (see `botmux send --help`)',
@@ -723,7 +744,7 @@ export const messages: Record<string, string> = {
 
   // ─── AI hints (BOTMUX_SHELL_HINTS for non-injecting CLIs; multiline_heredoc /
   // heredoc_example are also reused by the system-prompt path — keep both locales aligned) ──
-  'ai.shell.intro': 'You are running inside a Lark (Feishu) topic group. The user reads on Lark and cannot see your terminal output.',
+  'ai.shell.intro': 'You are running inside a Lark (Feishu) conversation. The user reads on Lark and cannot see your terminal output.',
   'ai.shell.commands_are_shell': 'IMPORTANT: `botmux send` / `botmux history` / `botmux quoted` / `botmux bots` are SHELL commands (CLI programs installed in $PATH), NOT MCP tools. Run them via the Bash tool — don\'t look for them in the MCP tool list.',
   'ai.shell.how_to_send': 'To send a message to the user (the only way): run `botmux send "your message"` via Bash. Attach images with `--images /path`, files with `--files /path`, video previews with `--videos /path.mp4 --video-covers /cover.png`.',
   'ai.shell.multiline_heredoc': 'Multi-line body text MUST use a quoted heredoc / stdin (or a UTF-8 `--content-file`). Never write `botmux send "line1\\nline2"` or pass `JSON.stringify` / JSON-escaped text as a positional argument; shell / botmux do not turn literal `\\n` back into newlines.',
@@ -740,8 +761,15 @@ export const messages: Record<string, string> = {
   'ai.available_bots.hint_collapsed': 'To communicate or collaborate with another bot, first run `botmux bots list` to get its open_id, then --mention it. Without --mention the other bot receives nothing.',
   'ai.available_bots.collapsed_line': 'There are {count} collaborator bots in this chat: {names}.',
   'ai.followup.reminder': 'Respond to messages addressed to you at least once via `botmux send`, never stay silent; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND.',
-  'ai.followup.reminder_hook': 'This session is bridged to Lark via botmux; terminal output is not visible to the user. Session convention: send replies to the Lark topic via `botmux send`; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND.',
+  'ai.followup.reminder_hook': 'This session is bridged to Lark via botmux; terminal output is not visible to the user. Session convention: send replies to the Lark conversation via `botmux send`; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND.',
   'ai.followup.reminder_no_resend': 'Respond to messages addressed to you at least once via `botmux send`, never stay silent; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND. A successful send is already delivered; ending a turn with no visible text is normal, so do not resend on a "no visible output" nudge.',
+  // No-transport follow-up (apiOnly bot / HTTP virtual session): a program-driven
+  // request/response turn with no Lark conversation, no sibling bots, and no
+  // `botmux send`. The nothing-to-send sentinel appears exactly once, in this
+  // turn's <botmux_http_response_mode> (migrated, not deleted — #808 async settle
+  // depends on it); this reminder MUST NOT carry send/@/BOTMUX_NOTHING_TO_SEND,
+  // or it would conflict with http_response_mode again.
+  'ai.followup.reminder_no_transport': 'This turn is a program-driven request/response: your entire reply is returned verbatim to the caller, not shown in any chat. Just follow the <botmux_http_response_mode> instructions in this turn\'s content; do not call botmux send, do not post to Feishu/Lark.',
   'ai.cursor.sender_note': 'The sender tag is metadata identifying the current speaker — never copy its open_id or name (e.g. ou_xxx:Alice) into your botmux send body or opening line; to @ the triggerer use botmux send --mention-back.',
   'ai.bridge.attachments_label': '[Attachments]',
   'ai.bridge.mentions_label': '[@Mentions]',
@@ -838,6 +866,12 @@ export const messages: Record<string, string> = {
   'card.action.write_link_sent': '🔑 The action link has been sent to you privately — please check your messages.',
   'card.action.write_link_no_permission': '🔒 You do not have operate permission, so you cannot get the action link.',
   'card.action.session_gone': '⚠️ This session is no longer active; the action was not completed.',
+  'card.action.stop_sent': '⏹ Stop signal sent (^C), session kept alive',
+  'card.action.stop_unsupported': '⚠️ Card stop is not supported for this CLI mode (experimental RPC input / App Runner). Use /close to end the session.',
+  'card.action.stop_no_worker': '⚠️ CLI is not running; nothing to stop',
+  'card.action.compact_sent': '🗜️ /compact sent to {cliName}',
+  'card.action.compact_no_worker': '⚠️ CLI is not running; cannot compact',
+  'card.action.compact_unsupported': '⚠️ Card compact is not supported here; send /compact directly',
   'card.action.close_refused': 'Could not close the session because remote cancellation was not proven ({error}). The session was kept for retry and the remote may still be running. Retry later.',
   'card.action.close_refused_with_task': 'Could not close the session because remote cancellation was not proven ({error}). The session was kept for retry. Remote session id: {taskId}. The remote may still be running; retry later.',
   'card.action.no_output': '(no output yet)',
@@ -859,7 +893,10 @@ export const messages: Record<string, string> = {
   'worker.mojo_lineage_quarantined': '⚠️ This session was created before botmux recorded which mojo control plane (endpoint / workspace) it ran on, so its earlier remote session cannot be verified.\nIt has been parked rather than discarded — the previous context will NOT continue, and your next message starts a fresh mojo session on the current configuration. The parked id is kept on the session for manual cleanup: {lineage}',
   'worker.mojo_legacy_pinned': '⚠️ This mojo session predates the host-execution upgrade, so it is pinned to the legacy sandbox-fallback mode — tools and replies will mostly NOT work here. This is deliberate (an upgrade must never silently move a live session onto the host).\nPlease close this session (❌ button or /close) and send a new message to start a fresh session on the new behaviour.',
   'worker.start_failed': '⚠️ The {cliName} session failed to start: {reason}\nCheck the Agent/backend settings in Dashboard and the installation environment on the daemon host, then resend your message to retry.',
-  'worker.input_delivery_failed': '⚠️ The Worker could not receive this message. Botmux retried on the same Worker but delivery still did not complete; it stopped before a cross-process retry to avoid duplicate execution. Please resend the message.\nturn: {turnId}',
+  'worker.input_delivery_failed': '⚠️ Botmux could not confirm whether this message entered the Worker execution queue. It stopped delivery to avoid duplicate execution. Check the session status first; do not resend immediately.\nturn: {turnId}',
+  'worker.input_delivery_delayed': '⏳ The message entered the Worker IPC queue, but the Worker has not acknowledged it yet. The machine may be busy; the message can still execute later, so do not resend it.\nturn: {turnId}',
+  'worker.input_commit_delayed': '⏳ The Worker received this message, but has not confirmed that it entered the execution queue yet. The machine may be busy; the message can still execute later, so do not resend it.\nturn: {turnId}',
+  'worker.input_retired_unconfirmed': '⚠️ The session was deliberately suspended or replaced while this message was in flight, and Botmux could not confirm whether it entered the execution queue. Check the session history first; resend the message only if it did not run.\nturn: {turnId}',
   'worker.start_exited_early': 'The worker exited before becoming ready (exit code: {code}); see the Botmux logs for details.',
   'worker.tui_submit_failed': '⚠️ The TUI answer could not be confirmed as delivered to {cliName}. The CLI may still be waiting for input; open the local terminal or send a new message to recover.',
   'worker.raw_input_failed': '⚠️ The slash command could not be confirmed as delivered to {cliName}, so the follow-up text in the same message was not submitted. Check the terminal state, then resend.',
@@ -881,6 +918,26 @@ export const messages: Record<string, string> = {
   'worker.ordinary_recovery_dispatch_interrupted': '⚠️ Botmux restarted while an automatic Claude continuation was being handed off, so its execution state is unknown. To avoid repeating external side effects, Botmux did not replay it. Check the Web Terminal, then send a message to continue.',
   'worker.ordinary_recovery_non_retryable': '⚠️ This Claude turn failed, and the current error cannot be retried safely. Botmux stopped automatic processing to avoid repeating external side effects. Check the Web Terminal and model-service status, then send a message to continue.',
   'worker.claude_terminal_failure_unrecovered': '⚠️ This Claude turn stopped with a model-service error ({errorCode}). This delivery channel did not start an automatic continuation. Check the Web Terminal, then retry or send a message to continue.',
+
+  // ─── Turn-failure card (generic failure card: @mention + retry button) ────
+  'card.turn_failed.title': '⚠️ {cliName} turn failed',
+  'card.turn_failed.title_ambiguous': '⚠️ {cliName} turn stopped unexpectedly',
+  'card.turn_failed.field_error': '**Error code**: {errorCode}',
+  'card.turn_failed.field_when': '**Failed at**: {when}',
+  'card.turn_failed.field_task': '**Task**: {task}',
+  'card.turn_failed.field_continuations': '**Auto-continuations**: {count} (still not recovered)',
+  'card.turn_failed.reason': '**Reason**: {reason}',
+  'card.turn_failed.retry_safe': 'This turn\'s input never reached the CLI, so **nothing was executed**. Retrying is safe.',
+  'card.turn_failed.retry_caveated': '⚠️ This turn **may have partially executed** (edited files, commits, messages sent). Continue does NOT replay it verbatim: the CLI is asked to **inspect the current state first**, work out how far it got, and resume from there — stopping and handing back to you if it cannot tell. Still worth a glance at the Web Terminal.',
+  'card.turn_failed.no_retry': 'Re-sending the same input cannot succeed for this error. Check the cause, then send a new message.',
+  'card.turn_failed.no_input': 'No re-sendable input was recorded for this turn (it stopped before submission). Send a new message instead.',
+
+  'card.action.retry_turn_missing': '⚠️ No input record found for this turn, so it cannot be retried. Send a new message instead.',
+  'card.action.retry_turn_stale': '⚠️ This card is out of date (the session failed again or was already retried). Use the latest card, or send a new message.',
+  'card.action.retry_turn_cooldown': '⏳ Retry is cooling down. Try again in {seconds}s.',
+  'card.action.retry_turn_submit_failed': '⚠️ Retry submission failed: the worker is not accepting input right now. Try again shortly.',
+  'card.action.retry_turn_success': '🔁 This turn has been resubmitted. Waiting for execution.',
+  'card.action.continue_turn_success': '▶️ Asked the CLI to inspect the current state and resume from where it stopped. Waiting for execution.',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': 'First create a Lark app at: https://open.feishu.cn/app',
@@ -929,7 +986,7 @@ export const messages: Record<string, string> = {
   'start.daemon_started_suffix': ' ({count} bots, each in its own process)',
   'start.logs_hint': '   Logs: botmux logs',
   'start.status_hint': '   Status: botmux status',
-  'start.autostart_synced': '   autostart unit synced to current Node/cli.js paths',
+  'start.autostart_synced': '   autostart unit synced to current launch path',
 
   // ─── Daemon runtime notices ──────────────────────────────────────────────
   'daemon.auto_start_join_title': 'Proactive start (joined chat)',

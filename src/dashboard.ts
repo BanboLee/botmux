@@ -11,6 +11,8 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
+import { isStandaloneBinary } from './core/self-spawn.js';
+import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-self-update.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
@@ -40,6 +42,7 @@ import { reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
 import {
   compactGroupsMatrix,
+  groupsNamesMatrix,
   createGroupsMatrixSnapshot,
   enrichSessionsWithGroupNames,
   roleWriteShouldInvalidate,
@@ -159,7 +162,7 @@ import { parseCloseResidual, type ParsedCloseResidual } from './core/close-resid
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { getGitRepoInfo } from './core/session-row-enrichment.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
-import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxCliEntry, botmuxCliEntryAt, botmuxInstallRoot } from './utils/install-info.js';
+import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, diskVersionAt, botmuxCliEntry, botmuxCliEntryAt, botmuxInstallRoot, bakedBinaryVersion } from './utils/install-info.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion, resolveCurrentVersionAt } from './utils/install-diagnostics.js';
 import {
   fetchLatestVersion,
@@ -187,6 +190,7 @@ import {
   formatGlobalInstallCommand,
   resolveGlobalInstallPlan,
   tryResolveGlobalInstallPlan,
+  isAutoUpdateSupportedInstall,
   withGlobalInstallRegistry,
   UnsupportedGlobalInstallError,
   type GlobalInstallPlan,
@@ -241,6 +245,7 @@ import {
 } from './services/skill-registry-store.js';
 import { readSkillPackRegistry } from './services/skill-pack-store.js';
 import { dashboardSessionActionTimeoutMs, type DashboardSessionAction } from './dashboard/session-action-timeout.js';
+import { loopbackFetch } from './core/loopback-fetch.js';
 import {
   cloneSkillPack,
   createSkillPack,
@@ -1380,9 +1385,17 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
         logger.warn(`[vc-agent] open-platform automation failed for ${targetAppId}: ${reason}: ${result.message}`);
         const scopeCheck = await validateVcMeetingScopesForBot(bot);
         if (!scopeCheck.ok) {
+          // 「应用正在审核中」时**手动也开不了**：审核期间开放平台锁定配置写入，连
+          // scope/update 都拒（实测 code=10046）。给「请手动开通」这种做不到的建议
+          // 比不给更糟，所以这条单独措辞成「等审批通过」。
+          // ⚠️ 不说「等审批通过」：触发审批通常意味着有配置不合规，那一版不会自己通过。
+          const advice = reason === 'app_under_review'
+            ? '该应用有一个版本卡在飞书审核中，配置写入被锁（手动开通同样会被拒）。触发审批通常说明有配置不合规'
+              + '（最常见：权限的数据范围默认成「全部/全员」）；需人工到开放平台看审批详情、修掉不合规项后撤回该版本重提，再重试。'
+            : '请手动开通后重试。';
           return {
             ok: false,
-            error: `vcMeetingBot_preflight_missing_scopes: ${scopeCheck.error}。自动化配置失败(${reason})且权限未满足，请手动开通后重试。`,
+            error: `vcMeetingBot_preflight_missing_scopes: ${scopeCheck.error}。自动化配置失败(${reason})且权限未满足，${advice}`,
           };
         }
         const eventGateError = vcListenerEventGateError(result);
@@ -1482,7 +1495,11 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     repoPickerMode: global.repoPickerMode ?? 'all',
     maintenance: global.maintenance ?? {},
     localDevInstall: isLocalDevInstall(),
-    autoUpdateSupported: lastSuccessfulUpdatePlan !== undefined || tryResolveGlobalInstallPlan() !== null,
+    // Same predicate the save-time validation uses (resolveAutoUpdateSupport), so
+    // the UI can never render the toggle disabled while the backend would accept
+    // it — or the reverse. A plain `tryResolveGlobalInstallPlan()` here reported
+    // false for every compiled binary, because its package root is "/".
+    autoUpdateSupported: lastSuccessfulUpdatePlan !== undefined || isAutoUpdateSupportedInstall(),
     whiteboard: { enabled: global.whiteboard?.enabled === true },
     workflow: { enabled: global.workflow?.enabled === true }, // default OFF
     remoteAccess: global.remoteAccess === true,
@@ -1859,6 +1876,92 @@ const WEB_DIR = join(__dirname, 'dashboard-web');
 const DEV_RELOAD_MARKER = join(WEB_DIR, '.botmux-dashboard-dev');
 const DEV_RELOAD_VERSION = join(WEB_DIR, '.botmux-dashboard-reload');
 
+/**
+ * Request-relative asset path → on-disk path to read, or null when we have no
+ * such asset. The ONE place that knows whether the frontend lives on disk
+ * (source/npm) or inside the compiled binary's virtual filesystem.
+ *
+ * WHY: `WEB_DIR` is derived from `__dirname`, which in the compiled single binary
+ * is the virtual `/$bunfs/root` — a path that does not exist on disk (the
+ * documented CLAUDE.md `__dirname` hazard). Every asset request therefore missed
+ * and fell through to the catch-all 404: the login redirect landed on `/` and
+ * returned `{"error":"not_found_yet","path":"/"}`, so the Dashboard was entirely
+ * unreachable from a compiled binary while working fine from npm/source.
+ *
+ * In compiled mode the assets are embedded instead (see
+ * scripts/generate-dashboard-embed.mjs) and Bun renames each one with a content
+ * hash, so the request path cannot address them directly — the generated manifest
+ * supplies the mapping. Extensions are preserved, so MIME lookup is unaffected.
+ *
+ * Path traversal is handled differently per mode, and both are closed:
+ *  • Embedded: the manifest is a build-time allowlist, so a traversal string
+ *    simply misses. The lookup still goes through `hasOwnProperty` and a string
+ *    check — a plain `map[rel]` answers `__proto__`/`constructor`/`toString` with
+ *    inherited objects and functions (MEASURED), and handing one of those onward
+ *    would only be stopped by a downstream throw. A security property should not
+ *    rest on that.
+ *  • On disk: the resolved path must stay inside WEB_DIR.
+ *
+ * Returns null (→ caller 404s) rather than throwing: an asset genuinely absent
+ * from the bundle must stay a 404, exactly as a missing file on disk does.
+ */
+function resolveWebAsset(rel: string): string | null {
+  const embedded = embeddedDashboardAssets();
+  if (embedded) {
+    if (!Object.prototype.hasOwnProperty.call(embedded, rel)) return null;
+    const fp = embedded[rel];
+    return typeof fp === 'string' && fp.length > 0 ? fp : null;
+  }
+  // Source / npm install: real directory on disk. Keep the path-traversal guard
+  // here — `rel` is derived from the request.
+  const fp = resolve(WEB_DIR, rel);
+  const relToRoot = relative(resolve(WEB_DIR), fp);
+  if (relToRoot === '..' || relToRoot.startsWith('..\\') || relToRoot.startsWith('../') || isAbsolute(relToRoot)) return null;
+  return fp;
+}
+
+/**
+ * The compiled binary's embedded-asset manifest, or null when running from
+ * source/npm (where the frontend is a real directory on disk). Resolved once and
+ * cached — including the null.
+ *
+ * HOW IT GETS HERE: the compiled build's plugin (scripts/bun-native-embed-plugin.mjs)
+ * prepends a generated block of `import … with { type: 'file' }` statements to
+ * this module and assigns the map to `globalThis.__BOTMUX_DASHBOARD_ASSETS__`.
+ *
+ * It has to arrive by build-time injection rather than an ordinary import:
+ *  • A static `import './dashboard-web-embedded.js'` would make `tsc` (and a
+ *    plain source checkout) demand a generated artifact that only exists after
+ *    `bun run dashboard:bundle`.
+ *  • A runtime `require()` of it does NOT work: Bun only embeds what it can trace
+ *    statically, and MEASURED, a `createRequire` require of the manifest bundled
+ *    1 module and embedded zero assets — the binary would still 404 everything.
+ */
+let embeddedAssetsCache: Record<string, string> | null | undefined;
+function embeddedDashboardAssets(): Record<string, string> | null {
+  if (embeddedAssetsCache !== undefined) return embeddedAssetsCache;
+  const injected = (globalThis as Record<string, unknown>).__BOTMUX_DASHBOARD_ASSETS__;
+  if (injected && typeof injected === 'object') {
+    embeddedAssetsCache = injected as Record<string, string>;
+  } else {
+    embeddedAssetsCache = null;
+    // A compiled binary with no injected manifest is a BUILD regression, not a
+    // runtime condition to paper over. Say it loudly: the symptom is a 404 on
+    // every page, which otherwise reads as a routing or auth bug.
+    if (isStandaloneBinary()) {
+      logger.error('[dashboard] compiled binary has no embedded frontend — every asset will 404');
+    }
+  }
+  return embeddedAssetsCache;
+}
+
+/** Cache-busting stamp for embedded assets, whose `mtimeMs` is 0 (MEASURED).
+ *  The baked release version changes with every binary, so it invalidates a
+ *  browser's cached copy exactly when the binary changes. */
+function embeddedAssetStamp(): string {
+  return (bakedBinaryVersion() ?? 'embedded').replace(/[^\w.-]/g, '');
+}
+
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'application/javascript',
@@ -1926,11 +2029,14 @@ function serveStatic(
   options: { injectHtml?: (html: string) => string } = {},
 ): boolean {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
-  const fp = resolve(WEB_DIR, rel);
-  const webRoot = resolve(WEB_DIR);
-  const relToRoot = relative(webRoot, fp);
-  // Path-traversal guard: resolved path must stay inside WEB_DIR.
-  if (relToRoot === '..' || relToRoot.startsWith('..\\') || relToRoot.startsWith('../') || isAbsolute(relToRoot)) return false;
+  const fp = resolveWebAsset(rel);
+  if (!fp) return false;
+  // Asset-identity decisions below key off the REQUEST path, not `fp`: in the
+  // compiled binary `fp` is a content-hash-renamed file in the virtual fs
+  // (`chunks/x.js` → `/$bunfs/root/x-<hash>.js`), so `relative(WEB_DIR, fp)`
+  // would classify every embedded asset wrongly — no chunk would be immutable
+  // and index.html would never get its CSRF shell injected.
+  const relToRoot = rel;
   try {
     const st = statSync(fp);
     if (!st.isFile()) return false;
@@ -1938,7 +2044,11 @@ function serveStatic(
     // a deploy never serves new JS with old CSS. Lazy chunks are content-hashed
     // and can be cached immutably once the current app.js points at them.
     const immutableChunk = relToRoot.startsWith('chunks/') || relToRoot.startsWith('chunks\\');
-    const etag = `W/"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
+    // `mtimeMs` is 0 for an embedded file (MEASURED), so the ETag would collapse
+    // to size alone across a whole compiled release. Fold in the baked build
+    // identity so a new binary always invalidates the browser's cache.
+    const etagStamp = st.mtimeMs > 0 ? Math.floor(st.mtimeMs).toString(16) : embeddedAssetStamp();
+    const etag = `W/"${st.size.toString(16)}-${etagStamp}"`;
     const isIndex = relToRoot === 'index.html';
     const devIndex = isIndex && dashboardDevReloadEnabled();
     // 注入 CSRF 票据的壳是每次请求现生成的：ETag 只反映磁盘文件，走 304 会让浏览
@@ -2351,7 +2461,7 @@ async function proxyToDaemon(
   for (const [key, value] of Object.entries(authHeaders)) {
     headers.set(key, value);
   }
-  const upstream = await fetch(
+  const upstream = await loopbackFetch(
     `http://127.0.0.1:${d.ipcPort}${daemonPath}`,
     { ...init, headers },
   );
@@ -3957,9 +4067,24 @@ const server = createServer(async (req, res) => {
     // `authed` guards on the two mutations are defense-in-depth for host actions.
     if (req.method === 'GET' && url.pathname === '/api/update/status') {
       const current = currentInstalledVersion();
-      const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
-      const installManager = detectGlobalInstallManager(packageRoot);
-      const installPlan = tryResolveGlobalInstallPlan(packageRoot);
+      // Display/classification only — deliberately NOT a plan root. It feeds
+      // `currentUpdateStrategy` (which handles the compiled binary's "/" correctly)
+      // and the manager label shown when nothing else resolves. Named distinctly from
+      // the `packageRoot` variables that DO reach resolveGlobalInstallPlan, so the two
+      // uses cannot be confused (and so the source guard in
+      // test/binary-self-update.test.ts can tell them apart).
+      const classifyRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
+      const installManager = detectGlobalInstallManager(classifyRoot);
+      // A compiled binary has no package.json, so `classifyRoot` is "/" and the
+      // plan resolution always fails — which used to grey out the update button
+      // and tell an npm user their install method is unsupported. Resolve the
+      // strategy by BINARY LOCATION first; only fall back to the package-root
+      // classification for the Node path (unchanged there).
+      const updateStrategy = currentUpdateStrategy(classifyRoot);
+      const installPlan = updateStrategy.kind === 'package-manager'
+        ? tryResolveGlobalInstallPlan(updateStrategy.packageRoot)
+        : null;
+      const selfReplace = updateStrategy.kind === 'self-replace';
       // Compare against the npm `latest` dist-tag (always stable; the update
       // button installs `@latest`). isNewerVersion uses semver precedence, so a
       // canary running AHEAD of the latest stable (e.g. 2.87.0-canary.0 vs
@@ -4006,9 +4131,19 @@ const server = createServer(async (req, res) => {
         // the wrapper points at is a real git worktree; otherwise the button
         // stays disabled (there is nothing to pull).
         localDevUpdatable: localDev && isGitWorktree(resolveLocalDevCheckoutDir()),
-        updateSupported: installPlan !== null,
-        updateManager: installPlan?.manager ?? installManager,
-        updateCommand: installPlan ? formatGlobalInstallCommand(installPlan) : null,
+        updateSupported: installPlan !== null || selfReplace,
+        // Rollback is a SEPARATE capability from update. The web UI used to derive
+        // it from `updateSupported`, which now includes the self-replacing binary —
+        // but /api/update/rollback only knows how to drive a package manager, so a
+        // curl-installed binary would be offered a button that always fails.
+        // Report it explicitly instead of letting the UI infer it.
+        rollbackSupported: installPlan !== null,
+        // The standalone binary is not owned by a package manager; report it as
+        // its own kind rather than letting the UI claim "npm/pnpm/Bun only".
+        updateManager: selfReplace ? 'binary' : (installPlan?.manager ?? installManager),
+        updateCommand: selfReplace
+          ? `botmux update（下载并替换 ${updateStrategy.target}）`
+          : installPlan ? formatGlobalInstallCommand(installPlan) : null,
         node: checkNode(),
         installs: detectBotmuxInstalls(),
       });
@@ -4088,9 +4223,58 @@ const server = createServer(async (req, res) => {
           localDev: true,
         });
       }
+      // 编译版独立二进制（install.sh 形态）：没有包管理器拥有这个文件，改为下载
+      // 对应平台的 release 资产、校验 SHA-256 后原子替换自身。npm 子包形态不走
+      // 这里 —— 那棵树归 npm 所有，交回 npm 更新（见 binary-self-update.ts 头部）。
+      const runStrategy = currentUpdateStrategy(botmuxInstallRoot());
+      if (runStrategy.kind === 'self-replace') {
+        if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        updateInFlight = true;
+        let acquired = false;
+        let blockedByRestart = false;
+        let oldVersion = '';
+        let newVersion = '';
+        try {
+          const latest = await cachedLatestVersion(false);
+          if (!latest.value) {
+            return jsonRes(res, 503, { ok: false, error: 'version_lookup_failed' });
+          }
+          oldVersion = currentInstalledVersion();
+          newVersion = latest.value;
+          await withFileLock(globalInstallUpdateLockTarget(), async () => {
+            acquired = true;
+            if (hasActiveRestartLease()) { blockedByRestart = true; return; }
+            await replaceStandaloneBinary(newVersion, runStrategy.target);
+          }, { maxWaitMs: 2_000 });
+        } catch (e) {
+          if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+          return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e) });
+        } finally {
+          updateInFlight = false;
+        }
+        if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
+        return jsonRes(res, 200, {
+          ok: true,
+          oldVersion,
+          newVersion,
+          // The swapped binary is on disk but THIS process still runs (and reports)
+          // the old baked version, so `changed` cannot be derived by re-reading —
+          // it is the version comparison that decided to update at all.
+          changed: newVersion !== oldVersion,
+          restartRequired: true,
+          manager: 'binary',
+        });
+      }
       let installPlan: GlobalInstallPlan;
       try {
-        const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
+        // ⚠️ NOT `botmuxInstallRoot()`: for a compiled binary that is "/" and the
+        // resolve below throws, which is the very defect this PR fixes. The
+        // strategy resolved above already carries the right root (the sibling main
+        // package for an npm/pnpm/Bun subpackage; the running install root under
+        // Node). `lastSuccessfulUpdatePlan` still wins so a pnpm update keeps using
+        // the stable symlink it resolved last time.
+        const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot
+          ?? (runStrategy.kind === 'package-manager' ? runStrategy.packageRoot : botmuxInstallRoot());
         installPlan = resolveGlobalInstallPlan(packageRoot);
       } catch (error) {
         if (error instanceof UnsupportedGlobalInstallError) {
@@ -4131,7 +4315,11 @@ const server = createServer(async (req, res) => {
         updateInFlight = false;
       }
       if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
-      const newVersion = botmuxVersionAt(installPlan.activePackageRoot);
+      // Read the DISK, not `botmuxVersionAt`: for a compiled binary the baked
+      // version takes priority and would report this process's OLD version even
+      // though npm just rewrote package.json (measured) — making `changed` always
+      // false and the "restart to apply" prompt never appear.
+      const newVersion = diskVersionAt(installPlan.activePackageRoot);
       lastSuccessfulUpdatePlan = installPlan;
       return jsonRes(res, 200, {
         ok: true,
@@ -4167,9 +4355,22 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'not_rollback_target' });
       }
 
+      // Rollback only knows how to drive a package manager. Resolve the strategy
+      // first so a compiled binary uses its MAPPED root: on a fresh process there
+      // is no `lastSuccessfulUpdatePlan` yet and `botmuxInstallRoot()` is "/", which
+      // made the very first rollback throw `unsupported_install_method` even though
+      // /api/update/status had just reported `rollbackSupported: true`.
+      const rollbackStrategy = currentUpdateStrategy(botmuxInstallRoot());
+      if (rollbackStrategy.kind !== 'package-manager') {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'unsupported_install_method',
+          manager: rollbackStrategy.kind === 'self-replace' ? 'binary' : 'unknown',
+        });
+      }
       let installPlan: GlobalInstallPlan;
       try {
-        const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
+        const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? rollbackStrategy.packageRoot;
         installPlan = withGlobalInstallRegistry(
           resolveGlobalInstallPlan(packageRoot, process.platform, `botmux@${targetVersion}`),
         );
@@ -4211,7 +4412,10 @@ const server = createServer(async (req, res) => {
           }
 
           await runGlobalInstall(installPlan);
-          const newVersion = botmuxVersionAt(installPlan.activePackageRoot);
+          // diskVersionAt, not botmuxVersionAt: the baked version of a compiled
+          // binary would never equal the rollback target, so this verification
+          // would report a spurious `installed_version_mismatch` on every rollback.
+          const newVersion = diskVersionAt(installPlan.activePackageRoot);
           lastSuccessfulUpdatePlan = installPlan;
           if (newVersion !== targetVersion) {
             installedVersionMismatch = newVersion;
@@ -4715,7 +4919,27 @@ const server = createServer(async (req, res) => {
     // 含 aiden×claude / aiden×codex 网关项——前端打开"添加机器人"表单时拉取填充下拉.
     // id 既可能是普通 cliId, 也可能是 'aiden-x-claude' 这类选择键, 由 resolveCliSelection 解析.
     if (req.method === 'GET' && url.pathname === '/api/cli-options') {
-      const webSession = await botOnboarding.sessionStatus();
+      // `webSession` 是「开放平台登录态」实时探测: sessionStatus() 一路走到
+      // inspectCachedFeishuOpenPlatformSession(), 对飞书做一次真实网络往返
+      // (MEASURED: 1004 / 1091 / 2530ms; 端点 p50 1282ms / max 4402ms)。而同一
+      // 个 handler 里真正要算的东西只要 13ms (39 个 CLI 的 checkCliAvailability
+      // 12ms + staticModelChoices 1ms)——99% 的时间花在那一次外网调用上。
+      //
+      // 只有「添加机器人」弹窗消费它 (bot-onboarding.tsx 用来决定 reuse/qr 登录
+      // 模式并展示"将使用 …"账号)。Bot 配置页的 CliOptionsState (bot-defaults.ts)
+      // 类型里根本没有这个字段——付了 1-4s 的钱, 拿到就丢, 首屏白等。
+      //
+      // ⚠️ 兼容性决定了这里为什么是 opt-OUT 而不是 opt-IN:
+      // 路由 chunk 带 `immutable` 长缓存, 而 stale-chunk 自愈只在**动态 import
+      // 失败**时触发 —— dashboard 重启后, 已经加载好的旧 Bot 配置 chunk 会继续
+      // 活着并请求**裸** `/api/cli-options`。若裸端点默认不再探测, 旧 chunk 会在
+      // `body?.webSession?.status === 'ready'` 处把「字段缺席」判成 scan_required,
+      // 把登录态明明正常的用户**推去扫码**。新增 `not_probed` 状态也救不了它
+      // (旧代码不认识新状态)。
+      // 所以: 裸端点**保留旧语义**(照旧探测), 新的 Bot 配置页显式带
+      // `?probe=none` 走快路径。旧配置页最坏只是慢一次, 没有功能退化。
+      const probe = url.searchParams.get('probe');
+      const webSession = probe === 'none' ? undefined : await botOnboarding.sessionStatus();
       return jsonRes(res, 200, {
         options: CLI_SELECT_OPTIONS.map((o) => {
           // Keep the all-options scan shell-free so opening the form remains
@@ -4751,7 +4975,10 @@ const server = createServer(async (req, res) => {
         ttadkModelDefault: TTADK_DEFAULT_MODEL,
         ttadkModelSuggestions: TTADK_MODEL_SUGGESTIONS,
         suggestedAppName: botOnboarding.suggestedAppName(),
-        webSession,
+        // 未探测时整个字段缺席 (而不是 webSession: undefined)——JSON 里两者都不
+        // 出现, 但显式写清意图: 调用方拿不到就该自己带 ?probe=session 再要一次,
+        // 不会把「没探测」误读成「探测结果是未登录」而把用户推去扫码。
+        ...(webSession ? { webSession } : {}),
       });
     }
 
@@ -4770,6 +4997,7 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
       let parsed: {
         appName?: unknown;
+        cloneSourceAppId?: unknown;
         registrationMode?: unknown;
         sessionMode?: unknown;
         expectedIdentity?: unknown;
@@ -4861,6 +5089,9 @@ const server = createServer(async (req, res) => {
       }
       const job = botOnboarding.start({
         appName,
+        ...(typeof parsed.cloneSourceAppId === 'string' && parsed.cloneSourceAppId.trim()
+          ? { cloneSourceAppId: parsed.cloneSourceAppId.trim() }
+          : {}),
         registrationMode,
         ...(registrationMode === 'web' ? { sessionMode, expectedIdentity } : {}),
         cliId,
@@ -5340,6 +5571,21 @@ const server = createServer(async (req, res) => {
       });
       if (url.searchParams.get('view') === 'compact') {
         return jsonRes(res, 200, compactGroupsMatrix(matrix));
+      }
+      // `?view=names` — 名称/头像专用轻量视图。完整矩阵实测 12.59MB，其中
+      // chats[].memberBots 独占 12341KB；而 loadNameMaps()（web/ui.ts）只用
+      // bots 的名称/头像 + chats 的 chatId/name/avatar。摘掉 memberBots 后
+      // 372KB 级别，同时省掉主线程 38-70ms 的 JSON.parse。
+      //
+      // 不复用 `?view=compact`：那个投影没有 `bots`，名称/头像会全丢（见
+      // GroupsNamesSnapshot 的注释）。
+      //
+      // 公开只读边界：本投影的 chats 只有 chatId/name/avatar，比
+      // redactGroupsForPublic 的输出更窄（它还会保留 chatMode/memberBots），
+      // 且 `bots` 在下面的默认分支对未认证访客也是原样下发的——所以这里
+      // 无需按 authed 分叉，不存在新增暴露面。
+      if (url.searchParams.get('view') === 'names') {
+        return jsonRes(res, 200, groupsNamesMatrix(matrix));
       }
       return jsonRes(res, 200, {
         chats: authed ? matrix.chats : redactGroupsForPublic(matrix.chats),

@@ -8,6 +8,17 @@ import { t } from './ui.js';
 
 export const OPEN_BOT_ONBOARDING_EVENT = 'botmux:open-bot-onboarding';
 
+/** 克隆源 Bot 里会被 cloneBotConfig 带过去、且表单里也有对应项的字段。 */
+export type CloneSourceDefaults = {
+  cliId?: string;
+  workingDir?: string;
+  dirMode?: 'card' | 'fixed';
+  model?: string;
+};
+
+let cloneSourceAppId: string | undefined;
+let cloneSourceDefaults: CloneSourceDefaults | undefined;
+
 type OnboardingStatus =
   | 'starting'
   | 'waiting_for_scan'
@@ -172,6 +183,11 @@ function statusText(job: OnboardingJob): string {
 
 async function fetchCliOptions(): Promise<CliOptionsState> {
   try {
+    // 裸端点保留「探测登录态」的旧语义，本弹窗正是要那个 webSession（决定
+    // sessionMode 走 reuse 还是 qr，并展示"将使用 …"的账号），所以不带任何
+    // probe 参数。反过来 Bot 配置页显式带 `?probe=none` 跳过探测。
+    // 为什么是 opt-out 而非 opt-in：见 dashboard.ts /api/cli-options 的注释
+    // （immutable chunk 长缓存 + stale-chunk 自愈只覆盖 import 失败）。
     const res = await fetch('/api/cli-options');
     const body = await res.json();
     if (res.ok && Array.isArray(body?.options)) {
@@ -248,7 +264,61 @@ function normalizeFormForOptions(form: OnboardingFormState, cliState: CliOptions
   }, cliId, cliState);
 }
 
-export async function openBotOnboarding(): Promise<void> {
+/**
+ * 从克隆源 Bot 的配置行推出表单预填值。
+ *
+ * 目录必须按**源自己的形态**映射，不能一律 fixed：源只有 workingDir 时若按
+ * fixed 预填，目标会带上 defaultWorkingDir，而后端取目录是
+ * `defaultWorkingDir ?? workingDir` —— 目标那个 '~' 会反过来把源目录遮蔽掉，
+ * 新会话直接在 ~ 起，源的仓库目录静默丢失。
+ */
+export function cloneSourceDefaultsFrom(source: {
+  cliId?: string | null;
+  defaultWorkingDir?: string | null;
+  workingDir?: string | null;
+  model?: string | null;
+} | undefined): CloneSourceDefaults | undefined {
+  if (!source) return undefined;
+  return {
+    ...(source.cliId ? { cliId: source.cliId } : {}),
+    ...(source.defaultWorkingDir
+      ? { workingDir: source.defaultWorkingDir, dirMode: 'fixed' as const }
+      : source.workingDir
+        ? { workingDir: source.workingDir, dirMode: 'card' as const }
+        : {}),
+    ...(source.model ? { model: source.model } : {}),
+  };
+}
+
+/**
+ * 把克隆源的配置铺进表单初值。只覆盖源上确实有值的项，其余保持普通新建的默认，
+ * 这样表单展示的就是克隆真正会用的配置（cloneBotConfig 之后仍以源为准）。
+ */
+export function applyCloneDefaults(
+  form: OnboardingFormState,
+  defaults: CloneSourceDefaults | undefined,
+): OnboardingFormState {
+  if (!defaults) return form;
+  return {
+    ...form,
+    ...(defaults.cliId ? { cliId: defaults.cliId } : {}),
+    ...(defaults.workingDir ? { workingDir: defaults.workingDir } : {}),
+    ...(defaults.dirMode ? { dirMode: defaults.dirMode } : {}),
+    ...(defaults.model ? { model: defaults.model } : {}),
+  };
+}
+
+/**
+ * 克隆时用源 Bot 的配置预填表单：后端 cloneBotConfig 会用源 Bot 的
+ * cliId / 目录 / model 覆盖表单值，所以表单必须显示**真正会被使用的**那份，
+ * 否则用户填了却被静默丢弃（看到 claude-code，建出来却是源 Bot 的 codex）。
+ */
+export async function openBotOnboarding(
+  sourceAppId?: string,
+  sourceDefaults?: CloneSourceDefaults,
+): Promise<void> {
+  cloneSourceAppId = sourceAppId;
+  cloneSourceDefaults = sourceAppId ? sourceDefaults : undefined;
   window.dispatchEvent(new Event(OPEN_BOT_ONBOARDING_EVENT));
 }
 
@@ -661,6 +731,8 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
 
   const close = useCallback(() => {
     stopPolling();
+    cloneSourceAppId = undefined;
+    cloneSourceDefaults = undefined;
     props.onClose();
   }, [props, stopPolling]);
 
@@ -697,7 +769,9 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     loadSeqRef.current = seq;
     const initialCliState = defaultCliOptionsState();
     setCliState(initialCliState);
-    setForm(defaultFormState());
+    // 克隆模式下用源 Bot 的值开局，让表单显示真正会生效的配置（后端克隆会用
+    // 源 Bot 覆盖这几项）；普通新建仍是原来的默认值。
+    setForm(applyCloneDefaults(defaultFormState(), cloneSourceDefaults));
     setSessionMode('checking');
     setView({ kind: 'form' });
     setSubmitting(false);
@@ -760,6 +834,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
           workingDir: form.workingDir.trim(),
           dirMode: form.dirMode,
           model: form.model.trim() || undefined,
+          cloneSourceAppId,
         }),
       });
       const body = await res.json();

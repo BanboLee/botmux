@@ -35,6 +35,7 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
   deleteFrozenCards: (...args: any[]) => mockDeleteFrozenCards(...args),
 }));
 
+import { chatSessionAnsweredRootAtTopLevel } from '../src/core/reply-target.js';
 import {
   __testOnly_setSqliteUnavailable,
   assertSqliteSupported,
@@ -105,8 +106,14 @@ describe('first-start JSON import', () => {
     expect(imported.legacyCard).not.toHaveProperty('pendingResponseCardState');
     // repairMissingChatScope 发生在导入期
     expect(imported.broken.scope).toBe('chat');
-    // .db 落位，JSON 原地冻结（一个字节都不动）
-    expect(existsSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'))).toBe(true);
+    // .db 落位后可由另一连接重新读取；导入临时库不能留下 basename
+    // 仍为 `.tmp` 的日志 sidecar，否则 Bun 会把已提交内容留在孤儿日志中。
+    const storeDir = join(tempDir, 'session-stores', 'appA');
+    expect(existsSync(join(storeDir, 'sessions.db'))).toBe(true);
+    expect(existsSync(join(storeDir, 'sessions.db.tmp-journal'))).toBe(false);
+    expect(existsSync(join(storeDir, 'sessions.db.tmp-wal'))).toBe(false);
+    expect(existsSync(join(storeDir, 'sessions.db.tmp-shm'))).toBe(false);
+    expect(imported.live.title).toBe('live');
     expect(readFileSync(jsonFp, 'utf-8')).toBe(jsonBefore);
   });
 
@@ -399,6 +406,34 @@ describe('first-load serialization against an in-flight offline writer', () => {
       try { child.kill('SIGKILL'); } catch { /* already gone */ }
     }
   }, 20_000);
+
+  it('per-turn inThread 三态(false/true/缺失)完整穿过持久层往返', () => {
+    // chatSessionAnsweredRootAtTopLevel 靠 `inThread === false` 与
+    // `inThread === true` / 字段缺失(老行)三者的区别来判「顶层 @ 之后才被开成
+    // 话题」——三个值的 target 都是 mode='plain'。任何一环把 false 与 undefined
+    // 混同（比如序列化时按 falsy 丢字段），判据就会把老行误判成顶层、或把真话题
+    // 里的回复平铺出去。所以往返要读**真正落盘的行**，而不是进程内缓存。
+    init('appA', { owner: true });
+    const s = createSession('oc_group', 'oc_group', 'title', 'group', 'chat');
+    s.larkAppId = 'appA';
+    s.turnReplyContexts = {
+      om_top: { target: { mode: 'plain', chatId: 'oc_group' }, inThread: false },
+      om_seed: { target: { mode: 'plain', chatId: 'oc_group' }, inThread: true },
+      om_legacy: { target: { mode: 'plain', chatId: 'oc_group' } },
+    };
+    updateSession(s);
+
+    const persisted = readPersistedSessionRows(tempDir, 'appA')[s.sessionId];
+    expect(persisted.turnReplyContexts.om_top)
+      .toEqual({ target: { mode: 'plain', chatId: 'oc_group' }, inThread: false });
+    expect(persisted.turnReplyContexts.om_seed.inThread).toBe(true);
+    expect(persisted.turnReplyContexts.om_legacy.inThread).toBeUndefined();
+
+    // 判据跑在真正从盘上读回来的行上。
+    expect(chatSessionAnsweredRootAtTopLevel(persisted, 'om_top')).toBe(true);
+    expect(chatSessionAnsweredRootAtTopLevel(persisted, 'om_seed')).toBe(false);
+    expect(chatSessionAnsweredRootAtTopLevel(persisted, 'om_legacy')).toBe(false);
+  });
 });
 
 // ─── Node 能力探测 ───────────────────────────────────────────────────────────

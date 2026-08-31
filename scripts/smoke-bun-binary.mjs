@@ -191,6 +191,33 @@ try {
   fail('version', err instanceof Error ? err.message : String(err));
 }
 
+// ── 1c. selfcheck: setup-time lark-scopes.json load works in the binary ──────
+// The compiled binary keeps its module graph in the read-only virtual /$bunfs,
+// so setup code that loaded lark-scopes.json via readFileSync/copyFileSync of a
+// __dirname-relative path threw "找不到 botmux lark-scopes.json" — the first
+// `botmux setup ... --create-app` from a fresh curl install died right here.
+// npm/Node unit tests can't see it (dist/ physically exists there). The hidden
+// `__selfcheck` entry runs readDefaultScopeManifest() + writeScopesJsonToConfigDir()
+// and prints `{"ok":true,...}`; a non-zero exit or missing ok flag = the /$bunfs
+// regression is back. Runs in the scratch HOME, no credentials needed.
+try {
+  const out = execFileSync(binary, ['__selfcheck'], {
+    cwd: home, env: childEnv, encoding: 'utf-8', timeout: 60_000,
+  });
+  let parsed;
+  try { parsed = JSON.parse(out.trim().split('\n').pop()); }
+  catch { parsed = null; }
+  if (!parsed?.ok || !(parsed.tenant > 0) || !(parsed.user > 0)) {
+    fail('selfcheck', `__selfcheck did not confirm the manifest loaded: ${out.slice(0, 300)}`);
+  }
+  if (!existsSync(join(home, '.botmux', 'lark-scopes.json'))) {
+    fail('selfcheck', 'writeScopesJsonToConfigDir did not produce ~/.botmux/lark-scopes.json');
+  }
+  console.log(`smoke: ✅ selfcheck — lark-scopes manifest loads + writes in the binary (tenant=${parsed.tenant}, user=${parsed.user})`);
+} catch (err) {
+  fail('selfcheck', err instanceof Error ? err.message : String(err));
+}
+
 // ── 2/3. self-spawn + dashboard boots and reaches online ─────────────────────
 // `__supervisor` is the hidden self-re-exec entry: under a compiled binary this
 // takes the /$bunfs argv[1] detection path, so a broken isStandaloneBinary() or
@@ -274,6 +301,38 @@ for (;;) {
   await delay(250);
 }
 console.log(`smoke: ✅ http — dashboard is serving (status ${served})`);
+
+// ── 4b. the embedded frontend must actually be there ─────────────────────────
+// REGRESSION GUARD for a shipped bug this smoke test walked straight past.
+//
+// Check 4 accepts ANY status, on the reasoning that an unauthenticated `/`
+// legitimately 404s. True — but it made the check blind to a 404 with a
+// completely different cause: the Dashboard resolves its frontend as
+// `join(__dirname, 'dashboard-web')`, which in a compiled binary points inside
+// the virtual /$bunfs/ and does not exist, and `bun --compile` embeds nothing it
+// cannot trace statically. So EVERY asset 404'd, the post-login redirect to `/`
+// answered `{"error":"not_found_yet","path":"/"}`, and the Dashboard was
+// unreachable from any compiled binary — while npm/source installs were fine, and
+// while this smoke test reported ✅.
+//
+// Distinguish the two 404s by CAUSE rather than status: `not_found_yet` is the
+// server's catch-all miss (no asset), whereas an auth rejection carries the token
+// gate's own shape. Asserting on the body is what makes an empty-frontend binary
+// fail the build instead of shipping.
+const assetProbe = await fetch(`http://127.0.0.1:${PORTS.dashboard}/`, {
+  signal: AbortSignal.timeout(5_000),
+});
+const assetBody = await assetProbe.text();
+if (assetBody.includes('not_found_yet')) {
+  fail(
+    'frontend',
+    `dashboard answered its catch-all miss for \`/\` (${assetProbe.status}: ${assetBody.slice(0, 120)}).\n`
+    + 'The compiled binary has no embedded Dashboard frontend, so every page and asset 404s.\n'
+    + 'Expected the build plugin to inject dist/dashboard-web (scripts/generate-dashboard-embed.mjs) — '
+    + 'run `bun run build` before compiling, and check that hook still matches dist/dashboard.js.',
+  );
+}
+console.log(`smoke: ✅ frontend — embedded Dashboard assets resolve (no catch-all miss on /)`);
 
 // ── 5. the wrapper write must NOT destroy an install.sh-style binary ─────────
 // REGRESSION GUARD for a shipped bug this smoke test used to walk straight past.

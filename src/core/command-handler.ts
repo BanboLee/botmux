@@ -27,7 +27,7 @@ import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-host
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, type WorkerSessionReplyOptions } from './worker-pool.js';
+import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, sendWorkerInput, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -91,7 +91,7 @@ import {
   readRoleProfileEntry,
   writeRoleProfileEntry,
 } from '../services/role-profile-store.js';
-import type { LarkMessage, DaemonToWorker, CodexAppTurnInput, FrozenSessionReplyTarget, ScheduleExecutionPosition, SessionCliLaunchSnapshotV1 } from '../types.js';
+import type { LarkMessage, DaemonToWorker, CodexAppTurnInput, FrozenSessionReplyTarget, ScheduleExecutionPosition, SessionCliLaunchSnapshotV1, CliTurnPayload } from '../types.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
 import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId, markRepoCardConsumed, claimCurrentRepoCard } from './types.js';
 import type { DaemonSession } from './types.js';
@@ -110,6 +110,7 @@ import {
 } from './cli-runtime-display.js';
 import { isSessionGroup } from '../services/session-groups-store.js';
 import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
+import { retryCooldownRemaining, markRetryAttempt } from '../services/failed-turn-retry.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -227,11 +228,11 @@ export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string, cli
  * App Server rather than an interactive TUI; slash-looking text must use the
  * structured turn lane. Unknown / no bot → falls back to the builtin set.
  */
-/** Runner adapters speak a framed stdin protocol, not an interactive TUI:
- * raw slash passthrough would bypass the turn ledger and the runner rejects
- * non-frame input. Both the routing and the /list-slash-command display must
- * agree on this set. */
-const NO_RAW_PASSTHROUGH_CLI_IDS = new Set(['codex-app', 'mira', 'mir', 'dsh']);
+/** Runner adapters speak a framed stdin protocol, not an interactive TUI; ebsd
+ * requires every user message to pass through its service-user envelope and
+ * structured turn ledger. Both the routing and /list-slash-command display must
+ * agree on CLIs with no raw passthrough surface. */
+const NO_RAW_PASSTHROUGH_CLI_IDS = new Set(['codex-app', 'mira', 'mir', 'dsh', 'ebsd']);
 
 export function cliHasNoRawPassthroughSurface(cliId: string | undefined): boolean {
   return !!cliId && NO_RAW_PASSTHROUGH_CLI_IDS.has(cliId);
@@ -261,7 +262,9 @@ export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: s
   // Runner adapters (codex-app/mira/mir/dsh) speak a framed stdin protocol,
   // not an interactive TUI: a slash command through raw_input bypasses the
   // turn ledger and the runner rejects non-frame input, wedging the session.
-  // Keep these messages on the normal structured turn path.
+  // ebsd is interactive but still has no raw surface: service mode requires the
+  // service-user envelope and its own writer/terminal-marker ledger for every
+  // external message. Keep all of these on the normal structured turn path.
   if (cliHasNoRawPassthroughSurface(effectiveCliId)) return new Set();
   for (const c of resolveAdapterDefaultPassthroughCommands(larkAppId, effectiveCliId)) {
     effective.add(c);
@@ -2500,6 +2503,54 @@ export async function handleCommand(
         break;
       }
 
+      case '/retry': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.retry.no_session', undefined, loc));
+          break;
+        }
+        const failedTurn = ds.session.lastFailedTurn;
+        if (!failedTurn) {
+          await sessionReply(rootId, t('cmd.retry.no_failed_turn', undefined, loc));
+          break;
+        }
+        const cooldownMs = retryCooldownRemaining(failedTurn);
+        if (cooldownMs > 0) {
+          await sessionReply(rootId, t('cmd.retry.cooldown', { seconds: Math.ceil(cooldownMs / 1000) }, loc));
+          break;
+        }
+        // Strip clientUserMessageId to avoid dedup conflicts (same as retry_last_task)
+        const retryCodexAppInput = failedTurn.codexAppInput
+          ? (({ clientUserMessageId: _prior, ...input }) => input)(failedTurn.codexAppInput)
+          : undefined;
+        const retryInput: CliTurnPayload = {
+          content: failedTurn.cliInput,
+          ...(retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
+        };
+        let accepted = false;
+        try {
+          if (ds.worker && !ds.worker.killed) {
+            accepted = sendWorkerInput(ds, retryInput);
+          } else {
+            forkWorker(ds, retryInput, ds.hasHistory);
+            accepted = true;
+          }
+        } catch (err) {
+          logger.warn(`[${logTag}] /retry failed before acceptance: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        if (!accepted) {
+          await sessionReply(rootId, t('cmd.retry.submit_failed', undefined, loc));
+          break;
+        }
+        // Update retry state + record the input as the session's last CLI turn
+        // (same post-acceptance pattern as the daemon's live-worker path).
+        markRetryAttempt(ds.session);
+        rememberLastCliInput(ds, failedTurn.userPrompt, retryInput);
+        sessionStore.updateSession(ds.session);
+        logger.info(`[${logTag}] /retry re-injected turn ${failedTurn.turnId.slice(0, 8)} (attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`);
+        await sessionReply(rootId, t('cmd.retry.success', { errorCode: failedTurn.errorCode ?? 'unknown' }, loc));
+        break;
+      }
+
       case '/status': {
         if (ds) {
           const alive = ds.worker && !ds.worker.killed;
@@ -4387,11 +4438,10 @@ export async function handleCommand(
           ? sessionCliDisplayName(ds)
           : configuredRuntimeDisplayName(botCfg?.cliRuntime) ?? getCliDisplayName(effectiveCliId);
         const workingDir = getSessionWorkingDir(ds);
-        // Runner adapters route everything through the structured turn lane,
-        // so they have NO passthrough surface at all — mirror
-        // resolvePassthroughCommands's early empty return here and skip
-        // filesystem discovery (their PTY is the runner, not an interactive
-        // TUI that would honor those).
+        // CLIs without a raw input surface route everything through their
+        // structured/service turn lane, so mirror resolvePassthroughCommands's
+        // early empty return here and skip filesystem discovery (the runner
+        // protocols reject raw input; ebsd requires its service-user envelope).
         const noPassthrough = cliHasNoRawPassthroughSurface(effectiveCliId);
         const builtin = noPassthrough ? [] : [...PASSTHROUGH_COMMANDS];
         const adapterDefaults = noPassthrough ? [] : resolveAdapterDefaultPassthroughCommands(larkAppId, effectiveCliId);
@@ -4450,6 +4500,7 @@ export async function handleCommand(
           t('help.repo_wt', undefined, loc),
           t('help.rename', undefined, loc),
           t('help.status', undefined, loc),
+          t('help.retry', undefined, loc),
           t('help.card', undefined, loc),
           t('help.cot', undefined, loc),
           t('help.term', undefined, loc),
