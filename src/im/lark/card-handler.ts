@@ -92,7 +92,7 @@ import { retryCooldownRemaining, markRetryAttempt } from '../../services/failed-
 import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
-import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, silentIdleCardFlag, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
+import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, canCommitStreamingCardPublication, continuePublishedStreamingCardPinChain, silentIdleCardFlag, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
@@ -2708,10 +2708,23 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           if (cardMessageId && value?.visibility !== 'private' && !botCfgResume.privateCard) {
             const staleCardId = cardMessageId;
             const resumedDs = result.ds;
+            const resumedSession = resumedDs.session;
+            const resumedAppId = resumedDs.larkAppId;
+            const priorCardId = resumedDs.streamCardId;
+            const resumePostFence = {
+              session: resumedSession,
+              larkAppId: resumedAppId,
+              anchorId: sessionAnchorId(resumedDs),
+              expectedPriorCardId: priorCardId,
+            };
             void (async () => {
               try {
                 if (shouldRepostStreamingCard) {
                   const freshCardId = await sessionReply(rootId, buildStreamingCardJson(resumedDs), 'interactive');
+                  if (!canCommitStreamingCardPublication(resumedDs, resumePostFence)) {
+                    void deleteMessage(resumedAppId, freshCardId).catch(() => { /* stale repost */ });
+                    return;
+                  }
                   resumedDs.streamCardId = freshCardId;
                 } else {
                   resumedDs.streamCardId = undefined;
@@ -2719,6 +2732,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
                   resumedDs.streamCardReplyTargetKey = undefined;
                 }
                 persistStreamCardState(resumedDs);
+                if (shouldRepostStreamingCard) {
+                  // Pin is a QoL side effect, never a resume-commit barrier. Its
+                  // detached chain re-checks ownership and compensates a late
+                  // Pin; the committed card may immediately withdraw its sole
+                  // predecessor and emit the user receipt.
+                  continuePublishedStreamingCardPinChain(resumedDs, resumedDs.streamCardId!, priorCardId ? [priorCardId] : []);
+                }
                 await deleteMessage(resumedDs.larkAppId, staleCardId).catch(() => { /* already withdrawn/expired */ });
                 // Also send the "✅ 会话已恢复…" text follow-up (the original
                 // resume behavior) telling the user to send a message to continue.

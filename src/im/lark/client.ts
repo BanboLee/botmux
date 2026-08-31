@@ -932,6 +932,48 @@ export async function deleteMessage(larkAppId: string, messageId: string): Promi
   });
 }
 
+/**
+ * Pin a message in a chat (best-effort QoL). Returns `true` only when Lark
+ * explicitly confirms success (`code === 0`); any other outcome returns `false`
+ * and must not affect session behavior.
+ */
+export async function pinMessage(larkAppId: string, messageId: string): Promise<boolean> {
+  assertLarkTransport(larkAppId, 'pinMessage');
+  const c = getBotClient(larkAppId);
+  try {
+    const res: any = await c.im.v1.pin.create({ data: { message_id: messageId } });
+    if (res?.code !== 0) {
+      logger.debug(`[pin:${larkAppId}] failed message=${messageId} code=${res?.code ?? 'missing'}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    logger.debug(`[pin:${larkAppId}] failed message=${messageId}: ${formatLarkError(err) ?? (err instanceof Error ? err.message : 'unknown error')}`);
+    return false;
+  }
+}
+
+/**
+ * Unpin a message in a chat (best-effort QoL). Returns `true` only when Lark
+ * explicitly confirms success (`code === 0`); any other outcome returns `false`
+ * and must not affect session behavior.
+ */
+export async function unpinMessage(larkAppId: string, messageId: string): Promise<boolean> {
+  assertLarkTransport(larkAppId, 'unpinMessage');
+  const c = getBotClient(larkAppId);
+  try {
+    const res: any = await c.im.v1.pin.delete({ path: { message_id: messageId } });
+    if (res?.code !== 0) {
+      logger.debug(`[unpin:${larkAppId}] failed message=${messageId} code=${res?.code ?? 'missing'}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    logger.debug(`[unpin:${larkAppId}] failed message=${messageId}: ${formatLarkError(err) ?? (err instanceof Error ? err.message : 'unknown error')}`);
+    return false;
+  }
+}
+
 /** Error code Feishu returns from `ephemeral/v1/send` when the target chat is a
  *  topic / thread chat. Ephemeral cards only work in plain `group` chats (see
  *  /tmp design notes: empirically code 18053 `chat can not be thread`). */
