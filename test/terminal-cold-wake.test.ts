@@ -182,4 +182,35 @@ describe('ensureTerminalWorkerPort — the cold path gets its own budget', () =>
     await vi.advanceTimersByTimeAsync(45_000);
     expect(await pending).toBe(expected);
   });
+
+  // The budget comes from what ACTUALLY happened (`forkedCold`), not from what
+  // the probe said (`coldWake`). The two disagree in exactly one state, and it
+  // is a real window rather than a contrived one: the message path assigns
+  // `ds.worker` synchronously when it forks, and the worker child creates the
+  // pane only afterwards — a terminal opened in between sees a live worker and
+  // a missing pane. Nothing here cold-starts: we are waiting for a worker that
+  // is already booting, which is the re-attach case.
+  //
+  // Without this cell the distinction has no guard at all. Both reviewers
+  // independently changed `forkedCold` back to `coldWake` and got 11/11 green,
+  // i.e. the trap the PR description names ("that would hand the 40s budget to
+  // a session that never cold-started") was untested. Under that mutant this
+  // case returns 47_111 instead of undefined.
+  it('worker 已在（非本函数 fork）+ probe=missing → 仍走 re-attach 预算', async () => {
+    vi.useFakeTimers();
+    state.probe = 'missing';
+    // The port is scheduled by the test, not by the forkWorker mock: the whole
+    // point is that this call must NOT fork.
+    state.portAfterMs = null;
+    const ds = makeDs({ worker: {} as DaemonSession['worker'] });
+    setTimeout(() => { ds.workerPort = 47_111; }, BETWEEN);
+
+    const pending = ensureTerminalWorkerPort(ds);
+    await vi.advanceTimersByTimeAsync(45_000);
+
+    expect(await pending).toBeUndefined();
+    // Load-bearing: if this ever forks, `forkedCold` would legitimately be true
+    // and the case would be asserting something else entirely.
+    expect(state.forkCalls.length).toBe(0);
+  });
 });
