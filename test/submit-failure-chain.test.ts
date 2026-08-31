@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  cancelSubmitFailureChainForTerminal,
   createSubmitFailureChainController,
   submitFailureChainKeyOf,
   type SubmitFailureChainKey,
@@ -124,6 +125,45 @@ describe('createSubmitFailureChainController', () => {
 
     await vi.advanceTimersByTimeAsync(20_000);
     expect(warnings).toBe(1);
+    expect(controller.size()).toBe(0);
+  });
+
+  it('cancels an ordinary completed transcript turn before its warning timer fires', async () => {
+    const controller = createSubmitFailureChainController();
+    const warning = vi.fn();
+    controller.schedule(key({ dispatchAttempt: undefined }), 20_000, warning);
+
+    expect(cancelSubmitFailureChainForTerminal(
+      controller,
+      { turnId: 'turn-1', dispatchAttempt: undefined },
+      3,
+    )).toBe(true);
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(warning).not.toHaveBeenCalled();
+    expect(controller.size()).toBe(0);
+  });
+
+  it('cancels only the exact durable attempt when a completed turn is drained', async () => {
+    const controller = createSubmitFailureChainController();
+    const attemptOneWarning = vi.fn();
+    const attemptTwoWarning = vi.fn();
+    const unrelatedWarning = vi.fn();
+    controller.schedule(key({ dispatchAttempt: 1 }), 20_000, attemptOneWarning);
+    controller.schedule(key({ dispatchAttempt: 2 }), 20_000, attemptTwoWarning);
+    controller.schedule(key({ turnId: 'turn-2', dispatchAttempt: 1 }), 20_000, unrelatedWarning);
+
+    expect(cancelSubmitFailureChainForTerminal(
+      controller,
+      { turnId: 'turn-1', dispatchAttempt: 1 },
+      3,
+    )).toBe(true);
+    expect(controller.size()).toBe(2);
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(attemptOneWarning).not.toHaveBeenCalled();
+    expect(attemptTwoWarning).toHaveBeenCalledTimes(1);
+    expect(unrelatedWarning).toHaveBeenCalledTimes(1);
     expect(controller.size()).toBe(0);
   });
 });

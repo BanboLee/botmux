@@ -24,6 +24,19 @@ export function submitFailureChainKeyOf(key: SubmitFailureChainKey): string {
   return `${key.turnId ?? '-'}|${key.dispatchAttempt ?? '-'}|${key.cliGeneration}`;
 }
 
+export function cancelSubmitFailureChainForTerminal(
+  controller: SubmitFailureChainController,
+  identity: Pick<SubmitFailureChainKey, 'turnId' | 'dispatchAttempt'>,
+  cliGeneration: number,
+): boolean {
+  if (!identity.turnId) return false;
+  return controller.cancel({
+    turnId: identity.turnId,
+    dispatchAttempt: identity.dispatchAttempt,
+    cliGeneration,
+  });
+}
+
 export interface SubmitFailureChainController {
   /** Arm a deferred recheck for a key. If a live chain already exists for the
    *  same key its timer is replaced (returned as `replaced: true`) so the

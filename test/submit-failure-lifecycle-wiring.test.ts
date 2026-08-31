@@ -99,4 +99,14 @@ describe('worker submit-failure lifecycle wiring', () => {
     expect(source).toContain('selectSubmitActivityEvidence({');
     expect(source).toContain('target: identity');
   });
+
+  it('cancels the exact deferred chain from the shared terminal boundary', () => {
+    const terminal = functionSlice('emitTurnTerminal', 'workerIpcPayload');
+    const cancel = terminal.indexOf('cancelSubmitFailureChainForTerminal(');
+    const dedupe = terminal.indexOf('emittedTurnTerminals.claim(');
+    expect(cancel).toBeGreaterThanOrEqual(0);
+    expect(cancel).toBeLessThan(dedupe);
+    expect(terminal).toContain('{ turnId, dispatchAttempt }');
+    expect(terminal).toContain('cliSpawnGeneration');
+  });
 });

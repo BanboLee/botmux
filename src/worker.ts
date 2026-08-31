@@ -372,6 +372,7 @@ import {
   type SubmitActivityEvidence,
 } from './services/submit-confirmation.js';
 import {
+  cancelSubmitFailureChainForTerminal,
   createSubmitFailureChainController,
   submitFailureChainKeyOf,
   type SubmitFailureChainKey,
@@ -18035,6 +18036,11 @@ function emitTurnTerminal(
   retryable?: boolean,
 ): void {
   if (!sessionId || !turnId) return;
+  cancelSubmitFailureChainForTerminal(
+    submitFailureChains,
+    { turnId, dispatchAttempt },
+    cliSpawnGeneration,
+  );
   if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt)) return;
   if (status !== 'completed') {
     const dropped = codexBridgeQueue.dropPendingTurn(turnId, dispatchAttempt, true);
