@@ -252,13 +252,31 @@ try {
 // only way this launcher becomes a command; we now write the right startup file
 // for the user's actual shell (bash/zsh/fish/other) and tell them what we did.
 //
+// ⚠️ DO NOT GATE THIS ON `process.env.PATH`. It used to be wrapped in
+// `if (!process.env.PATH.split(':').includes(binDir))`, which asks "is binDir on
+// the PATH of the process running the install?" — the wrong question. What decides
+// whether `botmux` works is whether the user's FUTURE shells get it, i.e. whether a
+// startup file says so. The two come apart whenever the installing shell has binDir
+// on PATH transiently, and botmux itself creates that situation: the daemon
+// prepends `~/.botmux/bin` to every CLI session's PATH (five `prependBotmuxBin`
+// call sites in worker.ts / worker-pool.ts). So `npm i -g botmux` run from inside a
+// botmux session — or any shell that merely exported the dir — wrote NO startup
+// file, printed NO hint, and exited 0; the next terminal then had no `botmux` at
+// all, because there is no `bin` field to fall back on. MEASURED with the real
+// script against an isolated HOME, changing only PATH:
+//   PATH without binDir → writes ~/.zshenv + "open a new terminal" hint
+//   PATH with    binDir → zero files, zero output, exit 0   ← the reported bug
+// `ensurePathEntry` already asks the right question per file (`fileAlreadyHasEntry`,
+// which also recognises a line the user wrote by hand) and reports those as
+// `skipped`, so this outer check was redundant as well as wrong.
+//
 // ⚠️ FAIL-SOFT, and never `fail()`: the launcher is already installed and working
 // at this point, so a PATH edit that cannot happen must degrade to the printed
 // hint — not abort a successful install. That includes the sibling module simply
 // not being there: it ships via package.json `files`, and if a future edit drops
 // it (or a mirror repacks the tarball without it) the import throws. Guarding it
 // keeps `npm i -g botmux` succeeding either way.
-if (!(process.env.PATH ?? '').split(':').includes(binDir)) {
+{
   let ensurePathEntry = null;
   try {
     ({ ensurePathEntry } = await import('./install-path-entry.mjs'));
