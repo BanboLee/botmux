@@ -82,4 +82,10 @@ describe('worker submit-failure lifecycle wiring', () => {
     expect(armStart).toBeGreaterThan(callbackStart);
     expect(schedule.slice(callbackStart, armStart)).not.toContain('submitFailureChains.cancel(');
   });
+
+  it('passes the Promise-returning settlement callback to the controller', () => {
+    const schedule = functionSlice('scheduleSubmitFailureNotify', 'detectBareShellLaunch');
+    expect(schedule).toContain('runDeferredRecheck,');
+    expect(schedule).not.toContain('() => { void runDeferredRecheck(); }');
+  });
 });

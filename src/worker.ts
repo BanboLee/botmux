@@ -10805,7 +10805,7 @@ function scheduleSubmitFailureNotify(
     const { replaced } = submitFailureChains.schedule(
       chainKey,
       SUBMIT_DEFERRED_RECHECK_MS,
-      () => { void runDeferredRecheck(); },
+      runDeferredRecheck,
     );
     if (replaced) {
       log(`Deferred recheck already live for this attempt — replaced timer instead of stacking. preview="${preview}"`);
