@@ -31,28 +31,6 @@ function normaliseText(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
-/** 提取预期文本里的 BotMux 信封稳定标记（<session_id>…</session_id> 块与
- *  <user_message>…</user_message> 块），并校验它们按顺序都出现在存储行内。
- *  只用这些标记做包含匹配，不做任意子串匹配——标记里的 session_id 唯一，
- *  不会把其它会话/其它轮次的 user 行误认成本条投递。 */
-function envelopeMarkersIn(actual: string, expected: string): boolean {
-  const markers: Array<{ index: number; text: string }> = [];
-  for (const match of expected.matchAll(/<session_id>[^<]+<\/session_id>/g)) {
-    if (match.index !== undefined) markers.push({ index: match.index, text: match[0] });
-  }
-  const userMessage = /<user_message>[\s\S]*?<\/user_message>/.exec(expected);
-  if (markers.length === 0 || !userMessage || userMessage.index === undefined) return false;
-  markers.push({ index: userMessage.index, text: userMessage[0] });
-  markers.sort((a, b) => a.index - b.index);
-  let pos = 0;
-  for (const marker of markers) {
-    const idx = actual.indexOf(marker.text, pos);
-    if (idx === -1) return false;
-    pos = idx + marker.text.length;
-  }
-  return true;
-}
-
 function textMatches(actual: string, expected: string): boolean {
   if (actual === expected) return true;
   const na = normaliseText(actual);
@@ -61,10 +39,10 @@ function textMatches(actual: string, expected: string): boolean {
   // 宽容前缀匹配：多行内容在 TUI 里可能被嵌入换行提前提交（只提交了第一段），
   // 或 DB 侧截断。宁可认作已提交，也不误报"未确认"（与旧盲发行为对齐，不回退）。
   if (na.length > 0 && (ne.startsWith(na) || na.startsWith(ne.slice(0, na.length)))) return true;
-  // OpenCode 会把 [Directory Context: …/AGENTS.md] 等系统上下文前置到用户消息
-  // 前再落库，前缀匹配必然失败。若预期文本带 BotMux 信封标记，改按这些稳定标记
-  // 在存储行内按序匹配，既不退化成任意子串匹配，也能确认这一行就是本条投递。
-  return envelopeMarkersIn(na, ne);
+  // OpenCode 只会在原始输入前加 Directory Context；BotMux 信封本身必须作为
+  // 完整、不变的后缀落库。把 user_message 内容视为不透明文本，不解析其中可能
+  // 出现的 XML-looking 字符串。
+  return ne.length > 0 && na.endsWith(ne);
 }
 
 // -- SQLite helpers (node:sqlite, Node 22+ experimental) -----------------

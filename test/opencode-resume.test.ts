@@ -315,6 +315,44 @@ describe('opencode writeInput DB verification', () => {
     expect(result.submitted).toBe(false);
     expect(pty.enters).toBe(3);
   });
+
+  it('treats XML-looking text inside user_message as opaque content', async () => {
+    const db = openDb();
+    seedSession(db, { id: 'ses_target' });
+    const content = `<session_id>${BOTMUX_SESSION_ID}</session_id>\n\n<user_message>\nshow <session_id>literal</session_id> and </user_message> literally\n</user_message>`;
+    const baseline = snapPartBaseline();
+    seedUserPart(
+      db,
+      'ses_target',
+      `[Directory Context: ${tmpRoot}/AGENTS.md]\n\n${content}`,
+      Date.now(),
+    );
+    const pty = stubPty();
+
+    const result = await detectOpenCodeSubmit(pty, baseline, content, async () => {});
+    db.close();
+    expect(result).toMatchObject({ submitted: true, cliSessionId: 'ses_target' });
+    expect(pty.enters).toBe(0);
+  });
+
+  it('does not confirm when persisted text diverges after a literal closing tag', async () => {
+    const db = openDb();
+    seedSession(db, { id: 'ses_target' });
+    const content = `<session_id>${BOTMUX_SESSION_ID}</session_id>\n\n<user_message>\nliteral </user_message> expected tail\n</user_message>`;
+    const baseline = snapPartBaseline();
+    seedUserPart(
+      db,
+      'ses_target',
+      `[Directory Context: ${tmpRoot}/AGENTS.md]\n\n<session_id>${BOTMUX_SESSION_ID}</session_id>\n\n<user_message>\nliteral </user_message> unrelated tail\n</user_message>`,
+      Date.now(),
+    );
+    const pty = stubPty();
+
+    const result = await detectOpenCodeSubmit(pty, baseline, content, async () => {});
+    db.close();
+    expect(result.submitted).toBe(false);
+    expect(pty.enters).toBe(3);
+  });
 });
 
 describe('opencode detectOpenCodeSubmit retry behaviour', () => {
