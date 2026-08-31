@@ -317,7 +317,7 @@ describe('opencode2 writeInput DB verification', () => {
   it('recognizes the submission when OpenCode2 prepends a Directory Context block to the stored user part', async () => {
     const db = openDb();
     seedSession(db, { id: 'ses_target' });
-    const content = `<session_id>${BOTMUX_SESSION_ID}</session_id>\n\nhello from lark`;
+    const content = `<session_id>${BOTMUX_SESSION_ID}</session_id>\n\n<user_message>\nhello from lark\n</user_message>`;
     const storedText = `[Directory Context: ${tmpRoot}/AGENTS.md]\n\n${content}`;
     const pty = stubPty(() => {
       if (pty.enters === 1) seedUserPart(db, 'ses_target', storedText, Date.now());
@@ -328,6 +328,25 @@ describe('opencode2 writeInput DB verification', () => {
     db.close();
     expect(result).toMatchObject({ submitted: true, cliSessionId: 'ses_target' });
   }, 15_000);
+
+  it('does not confirm an unrelated same-session row when the expected text lacks a user-message section', async () => {
+    const db = openDb();
+    seedSession(db, { id: 'ses_target' });
+    const content = `<session_id>${BOTMUX_SESSION_ID}</session_id>\n\nexpected payload`;
+    const baseline = snapPartBaseline('v2');
+    seedUserPart(
+      db,
+      'ses_target',
+      `[Directory Context: ${tmpRoot}/AGENTS.md]\n\n<session_id>${BOTMUX_SESSION_ID}</session_id>\n\nunrelated payload`,
+      Date.now(),
+    );
+    const pty = stubPty();
+
+    const result = await detectOpenCodeSubmit(pty, baseline, content, async () => {}, 'v2');
+    db.close();
+    expect(result.submitted).toBe(false);
+    expect(pty.enters).toBe(3);
+  });
 });
 
 describe('opencode2 detectOpenCodeSubmit retry behaviour', () => {
@@ -347,7 +366,7 @@ describe('opencode2 detectOpenCodeSubmit retry behaviour', () => {
   it('does not send a retry Enter when the record lands during the 800ms wait', async () => {
     const db = openDb();
     seedSession(db, { id: 'ses_target' });
-    const content = `<session_id>${BOTMUX_SESSION_ID}</session_id>\n\nhello from lark`;
+    const content = `<session_id>${BOTMUX_SESSION_ID}</session_id>\n\n<user_message>\nhello from lark\n</user_message>`;
     let waits = 0;
     const pty = stubPty();
     const delayFn = async () => {

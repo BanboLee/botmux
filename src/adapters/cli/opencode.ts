@@ -36,16 +36,19 @@ function normaliseText(text: string): string {
  *  只用这些标记做包含匹配，不做任意子串匹配——标记里的 session_id 唯一，
  *  不会把其它会话/其它轮次的 user 行误认成本条投递。 */
 function envelopeMarkersIn(actual: string, expected: string): boolean {
-  const markers: string[] = [];
-  for (const m of expected.matchAll(/<session_id>[^<]+<\/session_id>/g)) markers.push(m[0]);
+  const markers: Array<{ index: number; text: string }> = [];
+  for (const match of expected.matchAll(/<session_id>[^<]+<\/session_id>/g)) {
+    if (match.index !== undefined) markers.push({ index: match.index, text: match[0] });
+  }
   const userMessage = /<user_message>[\s\S]*?<\/user_message>/.exec(expected);
-  if (userMessage) markers.push(userMessage[0]);
-  if (markers.length === 0) return false;
+  if (markers.length === 0 || !userMessage || userMessage.index === undefined) return false;
+  markers.push({ index: userMessage.index, text: userMessage[0] });
+  markers.sort((a, b) => a.index - b.index);
   let pos = 0;
   for (const marker of markers) {
-    const idx = actual.indexOf(marker, pos);
+    const idx = actual.indexOf(marker.text, pos);
     if (idx === -1) return false;
-    pos = idx + marker.length;
+    pos = idx + marker.text.length;
   }
   return true;
 }
