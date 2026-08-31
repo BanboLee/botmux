@@ -5893,7 +5893,12 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
         targetAppIds: stringArray(body?.targetAppIds),
         title,
         bots: stringArray(body?.bots),
+        status: 'dispatched',
+        transportState: 'dispatched',
+        acceptanceState: 'requested',
+        errorCode: null,
         createdAt: issuedAt,
+        updatedAt: issuedAt,
         reportBinding,
       },
     );
