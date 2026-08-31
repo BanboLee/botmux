@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 
-import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
+import { createOpenCodeAdapter, detectOpenCodeSubmit, snapPartBaseline } from '../src/adapters/cli/opencode.js';
 import { opencodeDbPath } from '../src/services/opencode-paths.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
 
@@ -279,5 +279,53 @@ describe('opencode writeInput DB verification', () => {
 
     expect(result).toMatchObject({ submitted: true, cliSessionId: 'ses_target' });
     expect(events).toEqual([`paste:${content.length}`, 'key:Enter']);
+  });
+
+  it('recognizes the submission when OpenCode prepends a Directory Context block to the stored user part', async () => {
+    const db = openDb();
+    seedSession(db, { id: 'ses_target' });
+    const content = `<session_id>${BOTMUX_SESSION_ID}</session_id>\n\nhello from lark`;
+    // OpenCode 会把 [Directory Context: …/AGENTS.md] 系统块前置到用户消息前再落库
+    const storedText = `[Directory Context: ${tmpRoot}/AGENTS.md]\n\n${content}`;
+    const pty = stubPty(() => {
+      if (pty.enters === 1) seedUserPart(db, 'ses_target', storedText, Date.now());
+    });
+
+    const adapter = createOpenCodeAdapter();
+    const result = await adapter.writeInput(pty, content);
+    db.close();
+    expect(result).toMatchObject({ submitted: true, cliSessionId: 'ses_target' });
+  }, 15_000);
+});
+
+describe('opencode detectOpenCodeSubmit retry behaviour', () => {
+  function stubPty(onEnter?: () => void): PtyHandle & { enters: number } {
+    const handle = {
+      enters: 0,
+      write(_data: string) { /* raw pty path unused in this stub */ },
+      sendText(_text: string) { /* typed */ },
+      sendSpecialKeys(..._keys: string[]) {
+        handle.enters++;
+        onEnter?.();
+      },
+    };
+    return handle;
+  }
+
+  it('does not send a retry Enter when the record lands during the 800ms wait', async () => {
+    const db = openDb();
+    seedSession(db, { id: 'ses_target' });
+    const content = `<session_id>${BOTMUX_SESSION_ID}</session_id>\n\nhello from lark`;
+    let waits = 0;
+    const pty = stubPty();
+    const delayFn = async () => {
+      waits++;
+      if (waits === 1) seedUserPart(db, 'ses_target', content, Date.now());
+    };
+    const baseline = snapPartBaseline();
+    const result = await detectOpenCodeSubmit(pty, baseline, content, delayFn);
+    db.close();
+    expect(result).toMatchObject({ submitted: true, cliSessionId: 'ses_target' });
+    expect(pty.enters).toBe(0);  // 等待期间已确认，不再补发重试 Enter
   });
 });
