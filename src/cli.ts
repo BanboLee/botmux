@@ -42,6 +42,13 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
+import {
+  persistDispatchLifecycle as persistDispatchLifecycleRecord,
+  type DispatchAcceptanceState,
+  type DispatchLifecycleStatus,
+  type DispatchReceiptState,
+  type DispatchTransportState,
+} from './core/dispatch-lifecycle.js';
 import { withBotSteerDirective } from './core/bot-steer-directive.js';
 import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
 import {
@@ -7285,6 +7292,18 @@ async function relaySend(
   rest: string[],
   relayDir: string,
 ): Promise<void> {
+  const unsupportedRouting = ['--chat-id', '--into', '--top-level']
+    .filter(flag => rest.some(token => token === flag || token.startsWith(`${flag}=`)));
+  if (unsupportedRouting.length > 0) {
+    console.error(JSON.stringify({
+      success: false,
+      transportState: 'failed',
+      acceptanceState: 'not_requested',
+      errorCode: 'ROUTING_NOT_SUPPORTED',
+      detail: `sandbox send does not support routing flags: ${unsupportedRouting.join(', ')}; use botmux dispatch --bot-app for cross-bot delivery`,
+    }));
+    process.exit(2);
+  }
   const sid = argValue(rest, '--session-id') ?? process.env.BOTMUX_SESSION_ID;
   if (!sid) { console.error('relay: 无法确定 session-id'); process.exit(1); }
   const cardJsonArg = argValue(rest, '--card-json');
@@ -7419,6 +7438,125 @@ async function relaySend(
   }
   console.error('relay: 等待 daemon 投递超时（120s）');
   process.exit(1);
+}
+
+/**
+ * Relay a sandboxed cross-bot dispatch to the owning worker. The sandbox only
+ * contributes a bounded target app/chat plus task text; the watcher forces the
+ * live source session id and re-runs this exact build outside bwrap. This avoids
+ * reading a file bind that can become stale after the session store's atomic
+ * rename, without exposing the store or any bot credentials to the sandbox.
+ */
+async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
+  const requestedSid = argValue(rest, '--session-id');
+  const sid = process.env.BOTMUX_SESSION_ID;
+  if (!sid) {
+    console.error(JSON.stringify({ success: false, errorCode: 'SOURCE_SESSION_NOT_FOUND' }));
+    process.exit(1);
+  }
+  if (requestedSid && requestedSid !== sid) {
+    console.error(JSON.stringify({
+      success: false,
+      sourceSessionId: sid,
+      transportState: 'failed',
+      acceptanceState: 'not_requested',
+      errorCode: 'SOURCE_SESSION_NOT_AUTHORIZED',
+      detail: 'sandbox dispatch can only use the worker-bound source session',
+    }));
+    process.exit(2);
+  }
+  const allowedFlags = new Set([
+    '--title', '--bot-app', '--chat-id', '--steer',
+    '--brief', '--brief-file', '--session-id',
+  ]);
+  const unsupportedFlags = [...new Set(rest
+    .filter(token => token.startsWith('--'))
+    .map(token => token.split('=', 1)[0]!)
+    .filter(flag => !allowedFlags.has(flag)))];
+  if (unsupportedFlags.length > 0) {
+    console.error(JSON.stringify({
+      success: false,
+      sourceSessionId: sid,
+      transportState: 'failed',
+      acceptanceState: 'not_requested',
+      errorCode: 'ROUTING_NOT_SUPPORTED',
+      detail: `sandbox dispatch does not support: ${unsupportedFlags.join(', ')}; use --bot-app with a stable Lark App ID`,
+    }));
+    process.exit(2);
+  }
+  const briefFile = argValue(rest, '--brief-file');
+  let brief = argValue(rest, '--brief') ?? '';
+  if (briefFile) {
+    if (!existsSync(briefFile)) {
+      console.error(JSON.stringify({ success: false, sourceSessionId: sid, errorCode: 'BRIEF_FILE_NOT_FOUND', detail: `brief file not found: ${briefFile}` }));
+      process.exit(1);
+    }
+    brief = readFileSync(briefFile, 'utf8');
+  }
+  const flags: string[] = [];
+  for (const flag of ['--title', '--bot-app', '--chat-id'] as const) {
+    for (const value of argValues(rest, flag)) flags.push(flag, value);
+  }
+  if (rest.includes('--steer')) flags.push('--steer');
+  const id = randomBytes(8).toString('hex');
+  const contentBase = `${id}.content`;
+  const contentPath = join(relayDir, contentBase);
+  writeFileSync(contentPath, brief);
+  const originCapability = readManagedOriginCapability(
+    resolveDataDir(), sid, relayDir, process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+  )?.capability;
+  atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({
+    command: 'dispatch',
+    contentFile: contentBase,
+    flags,
+    ...(originCapability ? { originCapability } : {}),
+  }));
+  const resPath = join(relayDir, `${id}.res.json`);
+  const deadlineMs = Date.now() + 120_000;
+  while (Date.now() < deadlineMs) {
+    if (existsSync(resPath)) {
+      try {
+        const res = JSON.parse(readFileSync(resPath, 'utf8')) as { code?: number; stdout?: string; stderr?: string };
+        try { unlinkSync(resPath); } catch { /* */ }
+        try { unlinkSync(contentPath); } catch { /* */ }
+        if (res.stdout) process.stdout.write(res.stdout);
+        if (res.stderr) process.stderr.write(res.stderr);
+        process.exit(res.code ?? 1);
+      } catch { /* atomic response should be complete; retry defensively */ }
+    }
+    await new Promise(resolve => setTimeout(resolve, 150));
+  }
+  console.error(JSON.stringify({
+    success: false,
+    sourceSessionId: sid,
+    transportState: 'failed',
+    acceptanceState: 'not_requested',
+    errorCode: 'TRANSPORT_FAILED',
+    detail: 'daemon relay response timed out after 120s',
+  }));
+  process.exit(1);
+}
+
+async function persistDispatchLifecycle(input: {
+  dispatchRoot: string;
+  sourceSessionId: string;
+  status: DispatchLifecycleStatus;
+  transportState: DispatchTransportState;
+  acceptanceState: DispatchAcceptanceState;
+  errorCode?: string | null;
+  acceptedBotAppIds?: readonly string[];
+  missingBotAppIds?: readonly string[];
+}): Promise<DispatchReceiptState> {
+  try {
+    return await persistDispatchLifecycleRecord({ dataDir: resolveDataDir(), ...input });
+  } catch (error) {
+    console.error(`dispatch lifecycle persistence failed: ${error instanceof Error ? error.message : String(error)}`);
+    return {
+      transportState: input.transportState,
+      acceptanceState: input.acceptanceState,
+      errorCode: input.errorCode ?? null,
+    };
+  }
 }
 
 /** True if the running bot (by daemon-injected larkAppId) is core-only
@@ -9817,6 +9955,11 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --session-id <id>     指定来源会话（默认自动推断）`);
     return;
   }
+  const dispatchRelayDir = process.env.BOTMUX_SEND_RELAY;
+  if (dispatchRelayDir) {
+    await relayDispatch(rest, dispatchRelayDir);
+    return;
+  }
   // dispatch opens a real Feishu topic + pulls bots into a chat (a write). A
   // no-transport turn has no Feishu chat to dispatch into — central hard gate.
   assertTurnTransportOrExit('dispatch');
@@ -9982,6 +10125,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     ? JSON.stringify({ zh_cn: { title: '', content: built.threadContent } })
     : undefined;
 
+  let dispatchRootForLifecycle = intoRoot;
   try {
     // --into: append into an existing thread (activate standby bots / coordinate).
     if (intoRoot) {
@@ -9997,8 +10141,27 @@ async function cmdDispatch(rest: string[]): Promise<void> {
           })
         : undefined;
       const accepted = !acceptance || acceptance.missingBotAppIds.length === 0;
+      const acceptanceState: DispatchAcceptanceState = !acceptance
+        ? 'not_requested'
+        : accepted ? 'accepted' : 'timed_out';
+      const lifecycleStatus: DispatchLifecycleStatus = !acceptance
+        ? 'dispatched'
+        : accepted ? 'accepted' : 'timed_out';
+      const errorCode = !acceptance || accepted ? null : 'ACCEPTANCE_TIMEOUT';
+      const receiptState = await persistDispatchLifecycle({
+        dispatchRoot: intoRoot,
+        sourceSessionId: sid,
+        status: lifecycleStatus,
+        transportState: 'dispatched',
+        acceptanceState,
+        errorCode,
+        acceptedBotAppIds: acceptance?.acceptedBotAppIds,
+        missingBotAppIds: acceptance?.missingBotAppIds,
+      });
       console.log(JSON.stringify({
-        success: accepted, taskSent: true, mode: 'into', threadRootId: intoRoot,
+        success: accepted, taskSent: true, mode: 'into', sourceSessionId: sid,
+        targetAppIds: parsedBotApps.map(item => item.appId),
+        ...receiptState, threadRootId: intoRoot,
         kickoffMessageId: kickoffId, chatId: targetChatId, bots: built.mentionedOpenIds,
         collaborationReady: parsedBotApps.length > 0,
         ...(acceptance ? {
@@ -10023,6 +10186,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         seedText: built.seedText,
         targetChatId,
         targetAppIds: parsedBotApps.map(item => item.appId),
+        acceptanceRequested: !standby && parsedBotApps.length > 0,
         title: title.trim(),
         bots: built.mentionedOpenIds,
       },
@@ -10037,6 +10201,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     if (typeof seedId !== 'string' || !seedId) {
       throw new Error('dispatch report binding registration did not return a seed id');
     }
+    dispatchRootForLifecycle = seedId;
 
     // 2. Optional repo prime — a plain TEXT message "@bot /repo <path>" (like a
     //    human types) so each sub-bot spawns idle in that dir (no repo-select
@@ -10077,8 +10242,28 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     }
 
     const accepted = !acceptance || acceptance.missingBotAppIds.length === 0;
+    const acceptanceState: DispatchAcceptanceState = standby || !acceptance
+      ? 'not_requested'
+      : accepted ? 'accepted' : 'timed_out';
+    const lifecycleStatus: DispatchLifecycleStatus = standby || !acceptance
+      ? 'dispatched'
+      : accepted ? 'accepted' : 'timed_out';
+    const errorCode = !acceptance || accepted ? null : 'ACCEPTANCE_TIMEOUT';
+    const receiptState = await persistDispatchLifecycle({
+      dispatchRoot: seedId,
+      sourceSessionId: sid,
+      status: lifecycleStatus,
+      transportState: 'dispatched',
+      acceptanceState,
+      errorCode,
+      acceptedBotAppIds: acceptance?.acceptedBotAppIds,
+      missingBotAppIds: acceptance?.missingBotAppIds,
+    });
     console.log(JSON.stringify({
       success: accepted,
+      sourceSessionId: sid,
+      targetAppIds: parsedBotApps.map(item => item.appId),
+      ...receiptState,
       taskSent: !standby,
       mode: standby ? 'standby' : 'dispatch',
       seedMessageId: seedId,
@@ -10097,7 +10282,30 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     }));
     if (!accepted) process.exitCode = 1;
   } catch (err: any) {
-    console.error(`dispatch 失败: ${err.message}`);
+    let receiptState: DispatchReceiptState = {
+      transportState: 'failed',
+      acceptanceState: 'failed',
+      errorCode: 'TRANSPORT_FAILED',
+    };
+    if (dispatchRootForLifecycle) {
+      receiptState = await persistDispatchLifecycle({
+        dispatchRoot: dispatchRootForLifecycle,
+        sourceSessionId: sid,
+        status: 'failed',
+        transportState: 'failed',
+        acceptanceState: 'failed',
+        errorCode: 'TRANSPORT_FAILED',
+      });
+    }
+    console.error(JSON.stringify({
+      success: false,
+      sourceSessionId: sid,
+      targetAppIds: parsedBotApps.map(item => item.appId),
+      chatId: targetChatId,
+      threadRootId: dispatchRootForLifecycle ?? null,
+      ...receiptState,
+      detail: err?.message ?? String(err),
+    }));
     process.exit(1);
   }
 }

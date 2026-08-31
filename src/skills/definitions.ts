@@ -518,6 +518,19 @@ botmux send --top-level "📢 重要更新：xxx"
 botmux send --top-level --chat-id oc_xxxxxxxxxxxx "📦 自动推送内容..."
 \`\`\`
 
+文件 sandbox 内不会把跨群/顶层路由静默降级：上述
+\`send --chat-id/--top-level\` 会明确返回
+\`ROUTING_NOT_SUPPORTED\`。跨 Bot 投递请改用稳定 App ID 的受管派单：
+
+\`\`\`bash
+botmux dispatch --chat-id oc_xxxxxxxxxxxx --bot-app cli_xxxxxxxxxxxx \\
+  --title "子任务" --brief "任务内容"
+\`\`\`
+
+sandbox dispatch 暂不支持
+\`--into\`；需要追加既有话题时由宿主侧会话执行，避免把已校验群与实际
+\`om_\` 线程拆成两个独立授权目标。
+
 \`--top-level\` 模式下不会附加"发送给：@xxx / cc：xxx" 那行 footer（顶层广播没有特定收件人）。oncall 寻址也会跳过。
 
 ## 参数
