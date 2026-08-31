@@ -2,7 +2,7 @@ import { describe, expect, it, afterEach } from 'vitest';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 /**
  * Pins the npm single-version binary distribution (PR #873).
@@ -233,6 +233,14 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     brokenBinary?: boolean;
     /** Existing shared launcher that a rejected update must preserve byte-for-byte. */
     existingLauncher?: string;
+    /**
+     * Place the fake package at this path RELATIVE to the tmp base, instead of
+     * `pkg/`. Used to reproduce a package-manager global layout (bun/pnpm), which
+     * is the only signal available when no `npm_config_*` is set at all.
+     */
+    pkgRelPath?: string;
+    /** Ship dist/utils/global-install.js, which guard 1's location check imports. */
+    withDistPredicate?: boolean;
     /** Run against an EXISTING home from a previous call, the way an upgrade does.
      *  Needed to exercise idempotence across two installs (the startup file has to
      *  survive between them, which a fresh tmp home cannot show). */
@@ -240,10 +248,27 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
   }) {
     const base = tmp();
     const home = opts.reuseHome ?? join(base, 'home');
-    const pkg = join(base, 'pkg');
+    const pkg = join(base, opts.pkgRelPath ?? 'pkg');
     mkdirSync(home, { recursive: true });
     mkdirSync(join(pkg, 'scripts'), { recursive: true });
     writeFileSync(join(pkg, 'scripts', 'postinstall-bin.mjs'), readFileSync(POSTINSTALL));
+    // Guard 1's location check imports the repo's own layout classifier from
+    // `dist/` (it ships via package.json `files`). That module has a small import
+    // graph, so the fixture must carry ALL of it — a partial copy fails CLOSED and
+    // would make this test pass for the wrong reason. Verified against a real
+    // `bun add -g botmux` tree: all four files are present in the published package.
+    if (opts.withDistPredicate) {
+      for (const rel of [
+        join('utils', 'global-install.js'),
+        join('core', 'binary-install-shape.js'),
+        join('core', 'self-spawn.js'),
+        join('utils', 'install-info.js'),
+      ]) {
+        const dest = join(pkg, 'dist', rel);
+        mkdirSync(dirname(dest), { recursive: true });
+        writeFileSync(dest, readFileSync(join(__dirname, '..', 'dist', rel)));
+      }
+    }
     // postinstall imports this sibling to write the PATH entry. It ships via
     // package.json `files`, so the fixture must carry it too — otherwise this
     // exercises a package layout we never publish. (`opts.withoutPathHelper`
@@ -429,6 +454,51 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     expect(r.wrote).toBe(false);
   });
 
+  it('THE bun/pnpm BUG: a global LAYOUT with no npm_config_* still writes the launcher', () => {
+    // REGRESSION for a shipped defect: bun (and pnpm) pass NO `npm_config_*` to
+    // lifecycle scripts, so `npm_config_global` is absent for a perfectly real
+    // `bun add -g botmux`. The env-only guard exited 0 silently and wrote nothing —
+    // MEASURED end to end on a real `bun add -g botmux@3.18.8`: `.bun/bin/` empty,
+    // no launcher, the platform binary only in the download cache, so the user had
+    // NO `botmux` command at all. And `bun pm -g trust botmux` did NOT rescue it:
+    // bun reported `1 script ran` while this script still wrote nothing.
+    //
+    // Note `global` is deliberately NOT set — that is the whole point.
+    const r = runPostinstall({
+      pkgRelPath: join('home', '.bun', 'install', 'global', 'node_modules', 'botmux'),
+      withDistPredicate: true,
+    });
+    expect(r.status).toBe(0);
+    expect(r.wrote, r.stderr).toBe(true);
+    expect(readFileSync(r.launcher, 'utf-8')).toBe(`#!/bin/sh\nexec "${realpathSync(r.binary)}" "$@"\n`);
+  });
+
+  it('SAFETY: a LOCAL dependency install is not mistaken for a global one', () => {
+    // The counterweight to the case above. `node_modules/botmux` in someone's
+    // project must never repoint the shared launcher — that is the hijack the
+    // strict env guard existed to prevent, and the location check must not reopen
+    // it. The classifier requires a RECOGNISED GLOBAL layout, not merely a
+    // `/node_modules/botmux` suffix.
+    const r = runPostinstall({
+      pkgRelPath: join('proj', 'node_modules', 'botmux'),
+      withDistPredicate: true,
+    });
+    expect(r.status).toBe(0);
+    expect(r.wrote).toBe(false);
+  });
+
+  it('the location check is fail-CLOSED when dist/ is missing', () => {
+    // If the predicate cannot be loaded we must fall back to "not global", never to
+    // "assume global": a load failure has to make us MORE conservative. Same global
+    // layout as the bun case, minus the shipped classifier.
+    const r = runPostinstall({
+      pkgRelPath: join('home', '.bun', 'install', 'global', 'node_modules', 'botmux'),
+      withDistPredicate: false,
+    });
+    expect(r.status).toBe(0);
+    expect(r.wrote).toBe(false);
+  });
+
   it('inside a source checkout (.git + src/) → writes nothing even when global', () => {
     const r = runPostinstall({ global: 'true', sourceCheckout: true });
     expect(r.status).toBe(0);
@@ -594,5 +664,22 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     const src = readFileSync(POSTINSTALL, 'utf-8');
     expect(src).toContain("process.env.npm_config_global !== 'true'");
     expect(src).not.toContain("!== 'false'");
+  });
+
+  it('SOURCE PIN: the location check reuses the repo classifier, not a hand-rolled matcher', () => {
+    // The env check alone cannot see a `bun add -g` (no npm_config_* at all), so the
+    // guard also consults the install LOCATION. Pin that it goes through
+    // `detectGlobalInstallManager` — the repo's own already-tested classifier — and
+    // is compared against 'unknown'. A second hand-rolled path matcher here is how
+    // the two answers drift apart, which is the bug class this whole area keeps
+    // hitting. Comments are stripped so the docblock cannot satisfy the assertion.
+    const code = readFileSync(POSTINSTALL, 'utf-8')
+      .split('\n')
+      .filter(l => !/^\s*(\*|\/\/|\/\*)/.test(l))
+      .join('\n');
+    expect(code).toContain('detectGlobalInstallManager');
+    expect(code).toContain("!== 'unknown'");
+    // …and that it is actually consulted by guard 1, not merely defined.
+    expect(code).toMatch(/npm_config_global !== 'true'[\s\S]{0,80}locationSaysGlobal/);
   });
 });
