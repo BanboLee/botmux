@@ -8,10 +8,10 @@
  *
  * This controller keeps at most ONE live chain per (turnId, dispatchAttempt,
  * cliGeneration): scheduling again for the same key REPLACES the existing
- * timer instead of stacking a second one. A fired timer is forgotten before
- * its callback runs, so terminal/success/stale callbacks cannot cancel a newer
- * replacement for the same key. Weak activity explicitly re-arms that key;
- * every other outcome leaves no live timer behind.
+ * timer instead of stacking a second one. A fired timer remains the active
+ * identity until its callback settles; if that callback re-arms the key, its
+ * completion cannot delete the newer replacement. Weak activity explicitly
+ * re-arms that key; every other outcome leaves no live timer behind.
  */
 
 export interface SubmitFailureChainKey {
@@ -31,7 +31,7 @@ export interface SubmitFailureChainController {
   schedule(
     key: SubmitFailureChainKey,
     delayMs: number,
-    fn: () => void,
+    fn: () => void | Promise<void>,
   ): { armed: boolean; replaced: boolean };
   /** Cancel and forget any live chain for the key. Returns true when one was
    *  cancelled. */
@@ -45,20 +45,24 @@ export interface SubmitFailureChainController {
 }
 
 export function createSubmitFailureChainController(): SubmitFailureChainController {
-  const chains = new Map<string, ReturnType<typeof setTimeout>>();
+  type Chain = {
+    readonly token: symbol;
+    readonly timer: ReturnType<typeof setTimeout>;
+  };
+  const chains = new Map<string, Chain>();
 
   return {
     schedule(key, delayMs, fn) {
       const encoded = submitFailureChainKeyOf(key);
       const existing = chains.get(encoded);
-      if (existing !== undefined) clearTimeout(existing);
+      if (existing !== undefined) clearTimeout(existing.timer);
+      const token = Symbol(encoded);
       const timer = setTimeout(() => {
-        // The chain fires exactly once; forget it before running the callback
-        // so a re-arm inside the callback starts from a clean slate.
-        chains.delete(encoded);
-        fn();
+        void Promise.resolve(fn()).finally(() => {
+          if (chains.get(encoded)?.token === token) chains.delete(encoded);
+        });
       }, delayMs);
-      chains.set(encoded, timer);
+      chains.set(encoded, { token, timer });
       return { armed: existing === undefined, replaced: existing !== undefined };
     },
 
@@ -66,7 +70,7 @@ export function createSubmitFailureChainController(): SubmitFailureChainControll
       const encoded = submitFailureChainKeyOf(key);
       const existing = chains.get(encoded);
       if (existing === undefined) return false;
-      clearTimeout(existing);
+      clearTimeout(existing.timer);
       chains.delete(encoded);
       return true;
     },
@@ -80,7 +84,7 @@ export function createSubmitFailureChainController(): SubmitFailureChainControll
     },
 
     clear() {
-      for (const timer of chains.values()) clearTimeout(timer);
+      for (const chain of chains.values()) clearTimeout(chain.timer);
       chains.clear();
     },
   };

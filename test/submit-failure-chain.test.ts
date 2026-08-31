@@ -26,12 +26,12 @@ describe('createSubmitFailureChainController', () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
-  it('arms a chain that fires after the delay and forgets the key', () => {
+  it('arms a chain that fires after the delay and forgets the key', async () => {
     const controller = createSubmitFailureChainController();
     const fn = vi.fn();
     expect(controller.schedule(key(), 20_000, fn)).toEqual({ armed: true, replaced: false });
     expect(controller.has(key())).toBe(true);
-    vi.advanceTimersByTime(20_000);
+    await vi.advanceTimersByTimeAsync(20_000);
     expect(fn).toHaveBeenCalledTimes(1);
     expect(controller.has(key())).toBe(false);
   });
@@ -46,6 +46,29 @@ describe('createSubmitFailureChainController', () => {
     vi.advanceTimersByTime(20_000);
     expect(first).not.toHaveBeenCalled();
     expect(second).toHaveBeenCalledTimes(1);
+  });
+
+  it('tracks an in-flight callback and preserves a replacement scheduled before it settles', async () => {
+    const controller = createSubmitFailureChainController();
+    let finishFirst: (() => void) | undefined;
+    const first = vi.fn(() => new Promise<void>((resolve) => {
+      finishFirst = resolve;
+    }));
+    const second = vi.fn();
+
+    controller.schedule(key(), 20_000, first);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(controller.has(key())).toBe(true);
+
+    expect(controller.schedule(key(), 20_000, second)).toEqual({ armed: false, replaced: true });
+    finishFirst?.();
+    await Promise.resolve();
+    expect(controller.has(key())).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(second).toHaveBeenCalledTimes(1);
+    expect(controller.has(key())).toBe(false);
   });
 
   it('keeps independent chains for distinct keys', () => {
