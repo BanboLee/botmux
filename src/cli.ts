@@ -6174,7 +6174,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON
        --card-json <json>              直接发送飞书/Lark interactive 卡片 JSON 字符串
        --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈
-       --mention <open_id:name>        @提及（可重复）
+       --mention <id:name>             @提及（可重复）。id 默认是 open_id；bot 配置开启
+                                       allowArbitraryMention 后也可传完整邮箱/手机号/union_id，
+                                       自动解析并校验其为目标群成员，否则拒发
        --mention-back                  @回本轮触发消息的发送者（open_id 自动取自会话）
        --no-mention                    明确声明本条不@任何人
        --quote <message_id>            指定引用某条消息（普通群，默认引用本轮触发消息）
@@ -7269,6 +7271,8 @@ import {
   resolveQuoteTarget,
   shouldDropAfterTheFactTopicQuote,
   validateMentionDecision,
+  classifyMentionIdentifiers,
+  outsidersForMembership,
   mentionBackAmbiguity,
   mentionBackAmbiguityError,
   parseAttentionFlag,
@@ -8765,6 +8769,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     try {
       // @ 落点：--mention-back → 回 @ 原评论人；--mention <open_id[:name]> → @ 指定人；
       // 否则（--no-mention / 无）不 @。文档评论里靠 person 元素渲染 @，仅首块加。
+      //
+      // 注意：这条文档评论路径在 allowArbitraryMention 闸之外（闸在下方 group
+      // 发送分支里）。这里直接取 mentionArgs[0] 冒号前的原文当 open_id 用，不做
+      // 解析/群成员校验。风险较低：文档评论的权限模型是文档权限而非群成员，且
+      // 传非 open_id（邮箱等）进去会被飞书侧拒绝渲染 person 元素（fail-closed）。
+      // 但「默认关」这个开关在此路径上不生效，若将来放开需一并过 gate。
       let docMentionOpenId: string | undefined;
       if (mentionBack) docMentionOpenId = exactDocTarget.replyToOpenId;
       else if (mentionArgs.length > 0) {
@@ -8816,17 +8826,24 @@ async function cmdSend(rest: string[]): Promise<void> {
     return;
   }
 
-  // Parse mentions: "open_id:Display Name" or bare "open_id"
-  // Bare form appends a trailing <at id=...> to the message and still writes
-  // a bot-mention signal — useful when the sender doesn't know the target's
-  // display name or just wants to notify without inline substitution.
+  // Parse mentions: "identifier:Display Name" or bare "identifier".
+  // `identifier` is a literal open_id (ou_…) by default. When the bot config
+  // enables `allowArbitraryMention`, it may also be a full email / union_id
+  // (on_…) / mobile — those are resolved to this app's open_id after bot
+  // registration (see the resolve block below), then gated against the target
+  // chat's membership so an agent can only @ people who are actually in the
+  // group. With the switch off, non-open_id identifiers are rejected
+  // (default-deny: the model can't @ arbitrary people).
+  // Splitting on the FIRST ':' is safe: open_id / union_id / email / mobile
+  // never contain ':', only the optional trailing Display Name might.
   const mentions: Array<{ open_id: string; name: string }> = [];
+  const rawMentions: Array<{ identifier: string; name: string }> = [];
   for (const m of mentionArgs) {
     const idx = m.indexOf(':');
     if (idx > 0) {
-      mentions.push({ open_id: m.slice(0, idx), name: m.slice(idx + 1) });
+      rawMentions.push({ identifier: m.slice(0, idx).trim(), name: m.slice(idx + 1) });
     } else if (m.trim()) {
-      mentions.push({ open_id: m.trim(), name: '' });
+      rawMentions.push({ identifier: m.trim(), name: '' });
     }
   }
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
@@ -8862,6 +8879,81 @@ async function cmdSend(rest: string[]): Promise<void> {
   const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
+
+  // ── --mention resolution + group-membership gate ──────────────────────────
+  // Turn each raw --mention identifier into a { open_id, name } entry.
+  //   • Literal open_id (ou_…): kept as-is, always allowed (pre-existing
+  //     behavior — an agent that already has an app-scoped open_id is trusted).
+  //   • Anything else (email / union_id / mobile): only when the bot config
+  //     sets `allowArbitraryMention: true`. Resolve via the existing
+  //     resolveAllowedUsersWithMap (email→open_id etc.), then require the
+  //     resolved open_id to be a member of the destination chat. This is the
+  //     safety gate: default-deny, and even when opened, an agent can only @
+  //     people who are actually in the group.
+  {
+    const mentionChatId = overrideChatId ?? s.chatId;
+    const arbitraryAllowed = (() => {
+      try { return getBot(s.larkAppId).config.allowArbitraryMention === true; }
+      catch { return false; }
+    })();
+    const classified = classifyMentionIdentifiers(rawMentions, arbitraryAllowed);
+    if (!classified.ok) { console.error(classified.error); process.exit(2); }
+
+    // Resolved open_id per non-open_id identifier, filled by the block below.
+    // Kept separate from the push loop so we can emit `mentions` in the ORIGINAL
+    // command-line order (rawMentions) rather than "open_ids first, resolved
+    // second" — that order leaks into atPrefix / atSummary / mentioned[] / the
+    // footer, so a mixed `--mention email:A --mention ou_b --mention email:C`
+    // must stay A, b, C.
+    const resolvedOpenId = new Map<string, string>();
+
+    const nonOpenId = classified.toResolve;
+    if (nonOpenId.length > 0) {
+      const { resolveAllowedUsersWithMap, listChatMemberOpenIds } = await import('./im/lark/client.js');
+      const { map, errored } = await resolveAllowedUsersWithMap(
+        s.larkAppId, nonOpenId.map(r => r.identifier),
+      );
+      const unresolved = nonOpenId.filter(r => !map.get(r.identifier));
+      if (unresolved.length > 0) {
+        console.error(
+          `--mention 无法解析这些标识为群内 open_id：${unresolved.map(r => r.identifier).join(', ')}` +
+          (errored ? `（部分为临时失败，可稍后重试）` : `（不存在或本 bot 不可见）`),
+        );
+        process.exit(2);
+      }
+      // Membership gate: only @ people actually in the destination chat.
+      let memberIds: Set<string>;
+      try {
+        memberIds = new Set(await listChatMemberOpenIds(s.larkAppId, mentionChatId));
+      } catch (err: any) {
+        console.error(
+          `--mention 群成员校验失败（无法读取群 ${mentionChatId} 成员，可能缺 im:chat 成员读取权限）：` +
+          `${err?.message ?? err}`,
+        );
+        process.exit(2);
+      }
+      const outsiders = outsidersForMembership(
+        nonOpenId.map(r => ({ identifier: r.identifier, openId: map.get(r.identifier)! })),
+        memberIds,
+      );
+      if (outsiders.length > 0) {
+        console.error(
+          `--mention 拒绝：以下用户不在目标群里，不能 @：` +
+          outsiders.map(o => `${o.identifier}→${o.openId}`).join(', '),
+        );
+        process.exit(2);
+      }
+      for (const r of nonOpenId) resolvedOpenId.set(r.identifier, map.get(r.identifier)!);
+    }
+
+    // Emit in original command-line order: literal open_ids pass through, the
+    // rest use their resolved open_id.
+    for (const r of rawMentions) {
+      const openId = r.identifier.startsWith('ou_') ? r.identifier : resolvedOpenId.get(r.identifier);
+      if (openId) mentions.push({ open_id: openId, name: r.name });
+    }
+  }
+  // ───────────────────────────────────────────────────────────────────────────
   let feedbackPolicy: ReturnType<typeof resolveFeedbackPolicyForDelivery>;
   let feedbackWebhookDestinations: import('./services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
   try {
