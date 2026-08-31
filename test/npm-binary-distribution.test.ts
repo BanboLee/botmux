@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, 
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { detectGlobalInstallManager } from '../src/utils/global-install.js';
 
 /**
  * Pins the npm single-version binary distribution (PR #873).
@@ -487,16 +488,21 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     expect(r.wrote).toBe(false);
   });
 
-  it('the location check is fail-CLOSED when dist/ is missing', () => {
-    // If the predicate cannot be loaded we must fall back to "not global", never to
-    // "assume global": a load failure has to make us MORE conservative. Same global
-    // layout as the bun case, minus the shipped classifier.
+  it('THE PUBLISHED SHAPE: works with NO dist/ present, because that is what npm ships', () => {
+    // This case previously asserted the opposite ("fail-closed when dist/ is
+    // missing"), which encoded the very defect: the check imported
+    // `dist/utils/global-install.js`, #1115 removed `dist/` from package.json
+    // `files`, so in the real published package the import ENOENTed and the guard
+    // fell back to env-only — `bun add -g botmux` stayed broken while the suite was
+    // green. The layout list is inlined now, so the published shape (no dist/ at
+    // all) MUST work. Verified end to end against a real `npm pack` tarball
+    // installed with `bun add -g`.
     const r = runPostinstall({
       pkgRelPath: join('home', '.bun', 'install', 'global', 'node_modules', 'botmux'),
-      withDistPredicate: false,
+      withDistPredicate: false, // ← exactly what the registry serves
     });
     expect(r.status).toBe(0);
-    expect(r.wrote).toBe(false);
+    expect(r.wrote, r.stderr).toBe(true);
   });
 
   it('inside a source checkout (.git + src/) → writes nothing even when global', () => {
@@ -666,20 +672,89 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     expect(src).not.toContain("!== 'false'");
   });
 
-  it('SOURCE PIN: the location check reuses the repo classifier, not a hand-rolled matcher', () => {
-    // The env check alone cannot see a `bun add -g` (no npm_config_* at all), so the
-    // guard also consults the install LOCATION. Pin that it goes through
-    // `detectGlobalInstallManager` — the repo's own already-tested classifier — and
-    // is compared against 'unknown'. A second hand-rolled path matcher here is how
-    // the two answers drift apart, which is the bug class this whole area keeps
-    // hitting. Comments are stripped so the docblock cannot satisfy the assertion.
+  it('SOURCE PIN: the location check is SELF-CONTAINED (no dist/ import — it is not published)', () => {
+    // The first version of this guard imported `dist/utils/global-install.js` to
+    // reuse the repo classifier. That was DEAD CODE in the published package: #1115
+    // removed `dist/` from package.json `files`, so the import always ENOENTed, the
+    // catch returned false, and the guard fell back to env-only — leaving
+    // `bun add -g` exactly as broken as before. Pin that this file never again
+    // depends on anything outside its own published set.
     const code = readFileSync(POSTINSTALL, 'utf-8')
       .split('\n')
       .filter(l => !/^\s*(\*|\/\/|\/\*)/.test(l))
       .join('\n');
-    expect(code).toContain('detectGlobalInstallManager');
-    expect(code).toContain("!== 'unknown'");
-    // …and that it is actually consulted by guard 1, not merely defined.
-    expect(code).toMatch(/npm_config_global !== 'true'[\s\S]{0,80}locationSaysGlobal/);
+    // `./install-path-entry.mjs` is the ONLY sibling it may import — that one ships.
+    const imports = [...code.matchAll(/import\s*\(?\s*['"]([^'"]+)['"]/g)].map(m => m[1]);
+    for (const spec of imports) {
+      if (spec.startsWith('node:')) continue;
+      expect(spec, `postinstall must not import ${spec} — check package.json files`)
+        .toBe('./install-path-entry.mjs');
+    }
+    expect(code).not.toContain('dist/');
+    // …and the guard actually consults the location check, not merely defines it.
+    expect(code).toMatch(/npm_config_global !== 'true'[\s\S]{0,60}locationSaysGlobal/);
+  });
+
+  it('PARITY: the inlined layout list agrees with detectGlobalInstallManager on real global paths', () => {
+    // The inlined copy is a SECOND implementation of the same rules, which is how
+    // two answers drift apart. Rather than trusting a comment, execute both over a
+    // matrix of layouts that actually occur and require the same verdict.
+    //
+    // Extract the inlined predicate from the shipped script and run it for real, so
+    // this cannot pass by merely finding similar-looking source text.
+    const src = readFileSync(POSTINSTALL, 'utf-8');
+    const fn = src.match(/function locationSaysGlobal\(root\) \{[\s\S]*?\n\}/)?.[0];
+    expect(fn, 'locationSaysGlobal not found in postinstall').toBeTruthy();
+    // eslint-disable-next-line no-new-func
+    const inlined = new Function(`${fn}; return locationSaysGlobal;`)() as (r: string) => boolean;
+
+    const GLOBAL_LAYOUTS = [
+      '/usr/lib/node_modules/botmux',
+      '/usr/local/lib/node_modules/botmux',
+      '/root/.bun/install/global/node_modules/botmux',
+      '/root/.local/share/pnpm/global/5/.pnpm/botmux@3.18.9/node_modules/botmux',
+      '/root/.local/share/pnpm/global/5/node_modules/botmux',
+      '/root/.local/share/pnpm/global/v11/abc/node_modules/botmux',
+      '/root/.local/share/pnpm/store/v11/links/@/botmux/3.18.9/x/node_modules/botmux',
+    ];
+    for (const p of GLOBAL_LAYOUTS) {
+      expect(inlined(p), `inlined said NOT global: ${p}`).toBe(true);
+      expect(detectGlobalInstallManager(p, 'linux'), `classifier said unknown: ${p}`)
+        .not.toBe('unknown');
+    }
+
+    const NON_GLOBAL = [
+      '/app/node_modules/botmux',                  // a local dependency
+      '/root/iserver/botmux',                      // a source checkout
+      '/app/node_modules/other/node_modules/botmux',
+      '/home/u/.botmux/bin',                       // the launcher dir, not a package
+    ];
+    for (const p of NON_GLOBAL) {
+      expect(inlined(p), `inlined claimed global: ${p}`).toBe(false);
+      expect(detectGlobalInstallManager(p, 'linux'), `classifier claimed known: ${p}`)
+        .toBe('unknown');
+    }
+  });
+
+  it('STRICTER THAN THE CLASSIFIER: a Windows LOCAL dependency must not count as global', () => {
+    // `detectGlobalInstallManager` ends with `platform === 'win32' ? 'npm' : 'unknown'`,
+    // so on Windows it cannot distinguish a global install from a local dependency —
+    // MEASURED: detectGlobalInstallManager('C:/projects/myapp/node_modules/botmux',
+    // 'win32') === 'npm'. That is harmless where it is used today (a wrong
+    // `npm i -g` just reinstalls), but in postinstall it would let a Windows LOCAL
+    // dependency repoint the shared ~/.botmux/bin/botmux — the exact hijack guard 1
+    // exists to prevent. So the inlined version has NO platform fallback.
+    const src = readFileSync(POSTINSTALL, 'utf-8');
+    const fn = src.match(/function locationSaysGlobal\(root\) \{[\s\S]*?\n\}/)?.[0]!;
+    // eslint-disable-next-line no-new-func
+    const inlined = new Function(`${fn}; return locationSaysGlobal;`)() as (r: string) => boolean;
+
+    const winLocal = 'C:/projects/myapp/node_modules/botmux';
+    // The divergence is deliberate: document it by asserting BOTH sides.
+    expect(detectGlobalInstallManager(winLocal, 'win32')).toBe('npm'); // the hazard
+    expect(inlined(winLocal)).toBe(false);                             // we refuse it
+    expect(inlined('C:\\projects\\myapp\\node_modules\\botmux')).toBe(false); // backslashes too
+    // A real Windows npm global is unaffected: it arrives with npm_config_global=true
+    // and never reaches this check, which the behavioural test above covers.
   });
 });

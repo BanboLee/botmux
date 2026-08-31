@@ -53,12 +53,11 @@
  * that needs approve-builds/onlyBuiltDependencies or a different mechanism.
  *
  * So the global check is: the env says global (npm/yarn), OR THE INSTALL LOCATION
- * ITSELF says global. The location test reuses `detectGlobalInstallManager` —
- * the repo's own classifier for these layouts, already unit-tested, and shipped in
- * `dist/` (see package.json `files`) so the published package can import it. Do NOT
- * hand-roll a second path matcher here: that is how the two answers drift apart.
- * A source checkout classifies as `unknown` (verified), so this cannot reopen the
- * repo-local hijack that guard 2 also covers.
+ * ITSELF says global. The layout list is INLINED in `locationSaysGlobal` below —
+ * see the ⚠️ notes there for why importing the repo's classifier from `dist/` was
+ * dead code in the published package, and why the inlined version is deliberately
+ * stricter on Windows. A source checkout matches no global layout (verified), so
+ * this cannot reopen the repo-local hijack that guard 2 also covers.
  *
  * ── FAIL HARD WHEN THERE IS NO BINARY ──────────────────────────────────────────
  * This used to warn and exit 0, because `bin: {botmux: "dist/cli.js"}` gave every
@@ -79,7 +78,7 @@ import { dirname, join, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 /** Abort the install with a reason. There is no Node fallback any more (see header). */
 function fail(reason, hint) {
@@ -142,23 +141,53 @@ const pkgRoot = dirname(here); // scripts/ -> package root
 
 /**
  * Does the install LOCATION say this is a package-manager-owned global tree?
- * Reuses the repo's own classifier rather than a second hand-rolled path matcher.
- * Returns false on any failure (missing dist/, an older layout, a load error) so a
- * problem here can only make us MORE conservative, never less.
+ *
+ * ⚠️ WHY THIS IS INLINED INSTEAD OF IMPORTING THE REPO'S CLASSIFIER. The first
+ * version did `await import('./dist/utils/global-install.js')` to reuse
+ * `detectGlobalInstallManager`. That was DEAD CODE in the published package: #1115
+ * removed `dist/` from `package.json` `files`, so the import always ENOENTs, the
+ * catch returned false, and the guard silently fell back to env-only — leaving
+ * `bun add -g botmux` exactly as broken as before. MEASURED, not reasoned:
+ *
+ *   git archive origin/master | tar x && npm pack
+ *   tar tzf botmux-*.tgz | grep -c '^package/dist/'    → 0
+ *
+ * and end to end, a real `bun add -g <that tarball>` then running this script the
+ * way bun does: exit 0, no launcher. This file is a standalone script with no build
+ * step, and neither `dist/` nor `src/` is published, so being SELF-CONTAINED is its
+ * natural form — inlining is not a compromise here.
+ *
+ * ⚠️ AND IT IS DELIBERATELY STRICTER THAN `detectGlobalInstallManager`. That
+ * function ends with `platform === 'win32' ? 'npm' : 'unknown'`, so on Windows it
+ * cannot tell a global install from a LOCAL dependency — MEASURED:
+ *
+ *   detectGlobalInstallManager('C:/projects/myapp/node_modules/botmux', 'win32') → 'npm'
+ *
+ * Harmless where it is used today (a wrong `npm i -g` merely reinstalls), but in
+ * THIS file it would mean a Windows local dependency repoints the shared
+ * `~/.botmux/bin/botmux` — the exact hijack guard 1 exists to prevent. So the list
+ * below recognises only KNOWN GLOBAL layouts and has no platform fallback. Windows
+ * npm globals are unaffected: they arrive with `npm_config_global=true` and never
+ * reach this check.
+ *
+ * The layout patterns mirror `detectGlobalInstallManager`'s; a source guard in
+ * test/npm-binary-distribution.test.ts pins the two in agreement over a matrix of
+ * real global paths, so the duplication cannot drift unnoticed.
  */
-async function locationSaysGlobal(root) {
-  try {
-    const { detectGlobalInstallManager } = await import(
-      pathToFileURL(join(root, 'dist', 'utils', 'global-install.js')).href
-    );
-    // A source checkout classifies as `unknown`, so this cannot fire in the repo.
-    return detectGlobalInstallManager(root) !== 'unknown';
-  } catch {
-    return false;
-  }
+function locationSaysGlobal(root) {
+  const r = root.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  // Every global layout below ends at the main package; anything else is not ours.
+  if (!r.endsWith('/node_modules/botmux')) return false;
+  return r.endsWith('/lib/node_modules/botmux')                    // npm, POSIX
+    || r.includes('/.bun/install/global/node_modules/botmux')      // bun
+    || r.includes('/bun/install/global/node_modules/botmux')       // bun, custom BUN_INSTALL
+    || r.includes('/.pnpm/')                                       // pnpm virtual store
+    || /\/pnpm\/global\/[^/]+\/node_modules\/botmux$/.test(r)      // pnpm 9 global
+    || /\/pnpm\/global\/v\d+\/[^/]+\/node_modules\/botmux$/.test(r) // pnpm 11 global
+    || /\/pnpm\/store\/v\d+\/links\/@\/botmux\//.test(r);          // pnpm 11 store links
 }
 
-if (process.env.npm_config_global !== 'true' && !(await locationSaysGlobal(pkgRoot))) {
+if (process.env.npm_config_global !== 'true' && !locationSaysGlobal(pkgRoot)) {
   // Silent: this is the overwhelmingly common case (dev installs, transitive
   // installs). Noise here would appear on every `bun install` in the repo.
   process.exit(0);
