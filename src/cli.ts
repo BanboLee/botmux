@@ -6173,6 +6173,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）
        --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON
        --card-json <json>              直接发送飞书/Lark interactive 卡片 JSON 字符串
+       --layout result|progress|risk|blocked|handoff
+                                       可选回复卡卡头薄壳；只在关键结果/进度/风险/阻塞/交接节点显式使用
        --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈
        --mention <id:name>             @提及（可重复）。id 默认是 open_id；bot 配置开启
                                        allowArbitraryMention 后也可传完整邮箱/手机号/union_id，
@@ -7254,16 +7256,31 @@ import {
   appendReplyCardFooterToV2Card,
   buildImageCardElements,
   buildReplyCardFooter,
+  createReplyCard,
+  extractFirstReplyCardHeading,
   prepareCardMarkdown,
   type CardUsageSnapshot,
   type LocalHomeLinkMode,
 } from './im/lark/md-card.js';
+import {
+  buildReplyLayoutHeader,
+  parseReplyLayoutRequest,
+  resolveReplyStyle,
+  type ReplyLayout,
+} from './im/lark/reply-card-style.js';
 import { buildFeedbackElement } from './im/lark/skill-feedback-card.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './services/feedback-policy-resolver.js';
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
-import { effectiveDefaultWorkingDir, loadBotConfigs, resolveBrandLabel, resolveUsageDisplay, getBot } from './bot-registry.js';
+import {
+  effectiveDefaultWorkingDir,
+  getBot,
+  loadBotConfigs,
+  resolveBrandLabel,
+  resolveReplyStyleConfig,
+  resolveUsageDisplay,
+} from './bot-registry.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from './services/model-pricing.js';
 import { config } from './config.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
@@ -7295,6 +7312,7 @@ import {
 async function relaySend(
   rest: string[],
   relayDir: string,
+  replyLayout?: ReplyLayout,
 ): Promise<void> {
   const unsupportedRouting = ['--chat-id', '--into', '--top-level']
     .filter(flag => rest.some(token => token === flag || token.startsWith(`${flag}=`)));
@@ -7410,6 +7428,10 @@ async function relaySend(
     }
     // else dropped
   }
+  // `--layout` is parsed before entering the sandbox relay. Forward only the
+  // canonical five-name form; malformed requests already warned and fell back
+  // in the child, while the host validator still rejects forged outbox input.
+  if (replyLayout) flags.push('--layout', replyLayout);
   // 原子写：req.json 是 host watcher 的触发文件，rename 让它「完整出现」，
   // watcher 永远不会读到半截 JSON（tmp 后缀不匹配 .req.json 过滤）。
   atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({
@@ -7726,6 +7748,7 @@ async function registerSelfFromCredFile(): Promise<void> {
     cliId: 'claude-code',
     brand: cred.brand as 'feishu' | 'lark' | undefined,
     feedback: cred.feedback,
+    replyStyle: resolveReplyStyleConfig(appId),
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
       process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
@@ -7811,6 +7834,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
     cliId: 'riff',
     allowedUsers: [],
     feedback,
+    replyStyle: resolveReplyStyleConfig(appId),
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
       process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
@@ -7870,6 +7894,9 @@ async function cmdSend(rest: string[]): Promise<void> {
   // central session-capability gate — same hard door every Feishu-touching CLI
   // command consults.
   assertTurnTransportOrExit('send');
+  const replyLayoutRequest = parseReplyLayoutRequest(rest);
+  if (replyLayoutRequest.warning) console.error(replyLayoutRequest.warning);
+  let replyLayout = replyLayoutRequest.layout;
   // Resolve isolation marker-first. A visible host marker always wins over a
   // leftover capability. Linux bwrap keeps its host-execution outbox; macOS
   // read isolation instead challenges the owning daemon and trusts only the
@@ -7979,7 +8006,15 @@ async function cmdSend(rest: string[]): Promise<void> {
   // The relay watcher therefore binds a short-lived host-issued capability to
   // the worker's live turn and performs the authoritative policy check.
   if (relayDir && isolatedCapabilityCtx) {
-    await relaySend(rest, relayDir);
+    if (replyLayout) {
+      const ownAppId = process.env.BOTMUX_LARK_APP_ID?.trim();
+      const style = resolveReplyStyle(ownAppId ? resolveReplyStyleConfig(ownAppId) : undefined);
+      if (!style.layout) {
+        console.error('botmux send: 当前 Bot 已关闭 layout，本次按普通回复卡发送');
+        replyLayout = undefined;
+      }
+    }
+    await relaySend(rest, relayDir, replyLayout);
     return;
   }
   if (relayDir && !liveMarkerCtx?.sessionId) {
@@ -8312,6 +8347,11 @@ async function cmdSend(rest: string[]): Promise<void> {
       process.exit(2);
     }
   }
+  if (replyLayout && (customCardRequested || asVoice || isSlashSend)) {
+    const mode = customCardRequested ? '自定义卡片' : asVoice ? '语音气泡' : '原生斜杠命令';
+    console.error(`botmux send: --layout 不作用于${mode}，本次已忽略`);
+    replyLayout = undefined;
+  }
 
   const sid = sessionIdArg ?? ancestorCtx?.sessionId ?? process.env.BOTMUX_SESSION_ID ?? null;
   if (!sid) {
@@ -8348,6 +8388,11 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+  const replyStyle = resolveReplyStyle(resolveReplyStyleConfig(s.larkAppId));
+  if (replyLayout && !replyStyle.layout) {
+    console.error('botmux send: 当前 Bot 已关闭 layout，本次按普通回复卡发送');
+    replyLayout = undefined;
+  }
   // Target-aware gate on the RESOLVED source session: `send --session-id <virtual>`
   // (or an apiOnly bot's session) must be refused even if the ambient env looks
   // transport-capable, and regardless of any `--chat-id` override — a no-transport
@@ -8495,6 +8540,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   const isOriginDocCommentTurn = exactOriginDispatch?.deliverySink === 'doc_comment'
     || (!exactOriginDispatch && originSession?.cliId !== 'codex-app' && !!docTarget);
   if (isOriginDocCommentTurn) {
+    if (replyLayout) {
+      console.error('botmux send: --layout 不作用于文档评论回复，本次已忽略');
+      replyLayout = undefined;
+    }
     if (!docTarget || !originSession?.larkAppId) {
       console.error('botmux send refused: this turn is bound to a document comment, but its exact origin target is no longer available');
       process.exit(2);
@@ -9578,6 +9627,10 @@ async function cmdSend(rest: string[]): Promise<void> {
           videoCount: videoAttachments.length,
           mentionCount: mentions.length,
         });
+    if (pureVideoSend && replyLayout) {
+      console.error('botmux send: --layout 不作用于纯视频消息，本次已忽略');
+      replyLayout = undefined;
+    }
     if (customCard) {
       messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive');
     } else if (isSlashSend) {
@@ -9628,7 +9681,13 @@ async function cmdSend(rest: string[]): Promise<void> {
       // Inline `@Name` → `<at id=…>` at the exact spot it's written (CJK-name
       // aware, see applyInlineMentions); any --mention not inlined here is
       // rendered on the footer `发送给：` line below, not the body.
-      const { text: md, usedIds } = applyInlineMentions(text, mentions);
+      const layoutBody = replyLayout
+        ? extractFirstReplyCardHeading(text)
+        : { markdown: text, heading: undefined };
+      const layoutHeader = replyLayout
+        ? buildReplyLayoutHeader(replyLayout, layoutBody.heading, replyStyle)
+        : undefined;
+      const { text: md, usedIds } = applyInlineMentions(layoutBody.markdown, mentions);
       // Non-inlined mentions are no longer dangled as a trailing @ block at the
       // body bottom — they're consolidated onto the footer `发送给：` line below
       // (human addressee first, then explicit targets). See orderedFooterRecipients.
@@ -9704,7 +9763,7 @@ async function cmdSend(rest: string[]): Promise<void> {
                 tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
                 elements: [footer?.element ?? {
                   tag: 'markdown',
-                  text_size: 'notation_small_v2',
+                  text_size: 'notation',
                   content: ' ',
                 }],
               },
@@ -9728,16 +9787,14 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
 
       if (feedbackPolicy && effectiveResponseKind === 'final') {
-        const canonicalCard = { schema: '2.0', config: { update_multi: true }, body: { direction: 'vertical', elements: [...elements] } } as { schema: string; config: Record<string, unknown>; body: { direction: string; elements: unknown[] } };
+        const canonicalCard = createReplyCard([...elements], layoutHeader);
         const feedbackElement = buildFeedbackElement(feedbackPolicy);
         const footerIndex = canonicalCard.body.elements.findIndex((element: any) => element?.element_id === 'botmux_reply_footer');
         canonicalCard.body.elements.splice(footerIndex >= 0 ? footerIndex : canonicalCard.body.elements.length, 0, feedbackElement);
         feedbackBaseCard = canonicalCard as unknown as Record<string, unknown>;
         messageId = await dispatchPrimary(JSON.stringify(feedbackBaseCard), 'interactive');
       } else {
-        messageId = await dispatchPrimary(JSON.stringify({
-          schema: '2.0', config: { update_multi: true }, body: { direction: 'vertical', elements },
-        }), 'interactive');
+        messageId = await dispatchPrimary(JSON.stringify(createReplyCard(elements, layoutHeader)), 'interactive');
       }
     }
 
