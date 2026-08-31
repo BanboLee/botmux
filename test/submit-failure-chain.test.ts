@@ -144,6 +144,111 @@ describe('createSubmitFailureChainController', () => {
     expect(controller.size()).toBe(0);
   });
 
+  it('does not schedule an ordinary warning after its terminal arrived first', async () => {
+    const controller = createSubmitFailureChainController();
+    const warning = vi.fn();
+    const ordinary = key({ dispatchAttempt: undefined });
+
+    expect(cancelSubmitFailureChainForTerminal(
+      controller,
+      { turnId: 'turn-1', dispatchAttempt: undefined },
+      3,
+    )).toBe(false);
+    expect(controller.schedule(ordinary, 20_000, warning)).toEqual({
+      armed: false,
+      replaced: false,
+    });
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(warning).not.toHaveBeenCalled();
+    expect(controller.size()).toBe(0);
+  });
+
+  it('does not schedule durable attempt N after its exact terminal arrived first', async () => {
+    const controller = createSubmitFailureChainController();
+    const warning = vi.fn();
+
+    cancelSubmitFailureChainForTerminal(
+      controller,
+      { turnId: 'turn-1', dispatchAttempt: 1 },
+      3,
+    );
+    expect(controller.schedule(key({ dispatchAttempt: 1 }), 20_000, warning)).toEqual({
+      armed: false,
+      replaced: false,
+    });
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(warning).not.toHaveBeenCalled();
+  });
+
+  it('does not let attempt N terminal block N+1', async () => {
+    const controller = createSubmitFailureChainController();
+    const warning = vi.fn();
+
+    cancelSubmitFailureChainForTerminal(
+      controller,
+      { turnId: 'turn-1', dispatchAttempt: 1 },
+      3,
+    );
+    expect(controller.schedule(key({ dispatchAttempt: 2 }), 20_000, warning)).toEqual({
+      armed: true,
+      replaced: false,
+    });
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(warning).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not let a prior-generation terminal block the same attempt in a new generation', async () => {
+    const controller = createSubmitFailureChainController();
+    const warning = vi.fn();
+
+    cancelSubmitFailureChainForTerminal(
+      controller,
+      { turnId: 'turn-1', dispatchAttempt: 1 },
+      3,
+    );
+    expect(controller.schedule(
+      key({ dispatchAttempt: 1, cliGeneration: 4 }),
+      20_000,
+      warning,
+    )).toEqual({ armed: true, replaced: false });
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(warning).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds terminal receipts and clears them with the generation state', () => {
+    const controller = createSubmitFailureChainController();
+    const warning = vi.fn();
+    for (let index = 0; index < 1_025; index++) {
+      cancelSubmitFailureChainForTerminal(
+        controller,
+        { turnId: `turn-${index}`, dispatchAttempt: 1 },
+        3,
+      );
+    }
+
+    expect(controller.schedule(
+      key({ turnId: 'turn-0', dispatchAttempt: 1 }),
+      20_000,
+      warning,
+    )).toEqual({ armed: true, replaced: false });
+    expect(controller.schedule(
+      key({ turnId: 'turn-1024', dispatchAttempt: 1 }),
+      20_000,
+      warning,
+    )).toEqual({ armed: false, replaced: false });
+
+    controller.clear();
+    expect(controller.schedule(
+      key({ turnId: 'turn-1024', dispatchAttempt: 1 }),
+      20_000,
+      warning,
+    )).toEqual({ armed: true, replaced: false });
+  });
+
   it('cancels only the exact durable attempt when a completed turn is drained', async () => {
     const controller = createSubmitFailureChainController();
     const attemptOneWarning = vi.fn();

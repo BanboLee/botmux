@@ -30,7 +30,7 @@ export function cancelSubmitFailureChainForTerminal(
   cliGeneration: number,
 ): boolean {
   if (!identity.turnId) return false;
-  return controller.cancel({
+  return controller.observeTerminal({
     turnId: identity.turnId,
     dispatchAttempt: identity.dispatchAttempt,
     cliGeneration,
@@ -49,6 +49,8 @@ export interface SubmitFailureChainController {
   /** Cancel and forget any live chain for the key. Returns true when one was
    *  cancelled. */
   cancel(key: SubmitFailureChainKey): boolean;
+  /** Record an exact terminal even when its warning chain is not armed yet. */
+  observeTerminal(key: SubmitFailureChainKey): boolean;
   /** True when a live chain exists for the key. */
   has(key: SubmitFailureChainKey): boolean;
   /** Number of live chains. */
@@ -58,15 +60,20 @@ export interface SubmitFailureChainController {
 }
 
 export function createSubmitFailureChainController(): SubmitFailureChainController {
+  const MAX_TERMINAL_RECEIPTS = 1_024;
   type Chain = {
     readonly token: symbol;
     readonly timer: ReturnType<typeof setTimeout>;
   };
   const chains = new Map<string, Chain>();
+  const terminalReceipts = new Set<string>();
 
   return {
     schedule(key, delayMs, fn) {
       const encoded = submitFailureChainKeyOf(key);
+      if (terminalReceipts.has(encoded)) {
+        return { armed: false, replaced: false };
+      }
       const existing = chains.get(encoded);
       if (existing !== undefined) clearTimeout(existing.timer);
       const token = Symbol(encoded);
@@ -89,6 +96,22 @@ export function createSubmitFailureChainController(): SubmitFailureChainControll
       return true;
     },
 
+    observeTerminal(key) {
+      const encoded = submitFailureChainKeyOf(key);
+      const existing = chains.get(encoded);
+      if (existing !== undefined) {
+        clearTimeout(existing.timer);
+        chains.delete(encoded);
+      }
+      terminalReceipts.delete(encoded);
+      terminalReceipts.add(encoded);
+      if (terminalReceipts.size > MAX_TERMINAL_RECEIPTS) {
+        const oldest = terminalReceipts.values().next().value;
+        if (oldest !== undefined) terminalReceipts.delete(oldest);
+      }
+      return existing !== undefined;
+    },
+
     has(key) {
       return chains.has(submitFailureChainKeyOf(key));
     },
@@ -100,6 +123,7 @@ export function createSubmitFailureChainController(): SubmitFailureChainControll
     clear() {
       for (const chain of chains.values()) clearTimeout(chain.timer);
       chains.clear();
+      terminalReceipts.clear();
     },
   };
 }
