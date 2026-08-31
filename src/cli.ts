@@ -6167,7 +6167,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON
        --card-json <json>              直接发送飞书/Lark interactive 卡片 JSON 字符串
        --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈
-       --mention <open_id:name>        @提及（可重复）
+       --mention <id:name>             @提及（可重复）。id 默认是 open_id；bot 配置开启
+                                       allowArbitraryMention 后也可传邮箱/用户名/union_id，
+                                       自动解析并校验其为目标群成员，否则拒发
        --mention-back                  @回本轮触发消息的发送者（open_id 自动取自会话）
        --no-mention                    明确声明本条不@任何人
        --quote <message_id>            指定引用某条消息（普通群，默认引用本轮触发消息）
@@ -7247,6 +7249,7 @@ import {
   resolveQuoteTarget,
   shouldDropAfterTheFactTopicQuote,
   validateMentionDecision,
+  classifyMentionIdentifiers,
   mentionBackAmbiguity,
   mentionBackAmbiguityError,
   parseAttentionFlag,
@@ -8663,17 +8666,24 @@ async function cmdSend(rest: string[]): Promise<void> {
     return;
   }
 
-  // Parse mentions: "open_id:Display Name" or bare "open_id"
-  // Bare form appends a trailing <at id=...> to the message and still writes
-  // a bot-mention signal — useful when the sender doesn't know the target's
-  // display name or just wants to notify without inline substitution.
+  // Parse mentions: "identifier:Display Name" or bare "identifier".
+  // `identifier` is a literal open_id (ou_…) by default. When the bot config
+  // enables `allowArbitraryMention`, it may also be an email / username /
+  // union_id (on_…) / mobile — those are resolved to this app's open_id after
+  // bot registration (see the resolveArbitraryMentions block below), then gated
+  // against the target chat's membership so an agent can only @ people who are
+  // actually in the group. With the switch off, non-open_id identifiers are
+  // rejected (default-deny: the model can't @ arbitrary people).
+  // Splitting on the FIRST ':' is safe: open_id / union_id / email / username
+  // never contain ':', only the optional trailing Display Name might.
   const mentions: Array<{ open_id: string; name: string }> = [];
+  const rawMentions: Array<{ identifier: string; name: string }> = [];
   for (const m of mentionArgs) {
     const idx = m.indexOf(':');
     if (idx > 0) {
-      mentions.push({ open_id: m.slice(0, idx), name: m.slice(idx + 1) });
+      rawMentions.push({ identifier: m.slice(0, idx).trim(), name: m.slice(idx + 1) });
     } else if (m.trim()) {
-      mentions.push({ open_id: m.trim(), name: '' });
+      rawMentions.push({ identifier: m.trim(), name: '' });
     }
   }
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
@@ -8709,6 +8719,70 @@ async function cmdSend(rest: string[]): Promise<void> {
   const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
+
+  // ── --mention resolution + group-membership gate ──────────────────────────
+  // Turn each raw --mention identifier into a { open_id, name } entry.
+  //   • Literal open_id (ou_…): kept as-is, always allowed (pre-existing
+  //     behavior — an agent that already has an app-scoped open_id is trusted).
+  //   • Anything else (email / username / union_id / mobile): only when the bot
+  //     config sets `allowArbitraryMention: true`. Resolve via the existing
+  //     resolveAllowedUsersWithMap (email→open_id etc.), then require the
+  //     resolved open_id to be a member of the destination chat. This is the
+  //     safety门 孙晓雪 asked for: default-deny, and even when opened, an agent
+  //     can only @ people who are actually in the group.
+  {
+    const mentionChatId = overrideChatId ?? s.chatId;
+    const arbitraryAllowed = (() => {
+      try { return getBot(s.larkAppId).config.allowArbitraryMention === true; }
+      catch { return false; }
+    })();
+    const classified = classifyMentionIdentifiers(rawMentions, arbitraryAllowed);
+    if (!classified.ok) { console.error(classified.error); process.exit(2); }
+
+    // open_id entries pass through untouched.
+    for (const r of classified.openIdMentions) {
+      mentions.push({ open_id: r.identifier, name: r.name });
+    }
+
+    const nonOpenId = classified.toResolve;
+    if (nonOpenId.length > 0) {
+      const { resolveAllowedUsersWithMap, listChatMemberOpenIds } = await import('./im/lark/client.js');
+      const { map, errored } = await resolveAllowedUsersWithMap(
+        s.larkAppId, nonOpenId.map(r => r.identifier),
+      );
+      const unresolved = nonOpenId.filter(r => !map.get(r.identifier));
+      if (unresolved.length > 0) {
+        console.error(
+          `--mention 无法解析这些标识为群内 open_id：${unresolved.map(r => r.identifier).join(', ')}` +
+          (errored ? `（部分为临时失败，可稍后重试）` : `（不存在或本 bot 不可见）`),
+        );
+        process.exit(2);
+      }
+      // Membership gate: only @ people actually in the destination chat.
+      let memberIds: Set<string>;
+      try {
+        memberIds = new Set(await listChatMemberOpenIds(s.larkAppId, mentionChatId));
+      } catch (err: any) {
+        console.error(
+          `--mention 群成员校验失败（无法读取群 ${mentionChatId} 成员，可能缺 im:chat 成员读取权限）：` +
+          `${err?.message ?? err}`,
+        );
+        process.exit(2);
+      }
+      const outsiders = nonOpenId.filter(r => !memberIds.has(map.get(r.identifier)!));
+      if (outsiders.length > 0) {
+        console.error(
+          `--mention 拒绝：以下用户不在目标群里，不能 @：` +
+          outsiders.map(r => `${r.identifier}→${map.get(r.identifier)}`).join(', '),
+        );
+        process.exit(2);
+      }
+      for (const r of nonOpenId) {
+        mentions.push({ open_id: map.get(r.identifier)!, name: r.name });
+      }
+    }
+  }
+  // ───────────────────────────────────────────────────────────────────────────
   let feedbackPolicy: ReturnType<typeof resolveFeedbackPolicyForDelivery>;
   let feedbackWebhookDestinations: import('./services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
   try {

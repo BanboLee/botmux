@@ -179,6 +179,54 @@ export function neutralizeLarkAtTags(content: string): string {
     .replace(/<\/at\s*>/giu, match => `＜${match.slice(1, -1)}＞`);
 }
 
+export interface RawMention {
+  /** open_id (ou_…), or an email / username / union_id / mobile when the bot
+   *  enables arbitrary mention. */
+  identifier: string;
+  /** optional display name for inline <at> substitution */
+  name: string;
+}
+
+export interface MentionClassifyResult {
+  ok: boolean;
+  /** present when !ok — message to print before exit(2) */
+  error?: string;
+  /** literal open_id entries — always allowed, pass through untouched */
+  openIdMentions: RawMention[];
+  /** non-open_id entries that must be resolved + membership-gated (empty unless
+   *  the switch is on) */
+  toResolve: RawMention[];
+}
+
+/**
+ * Pure gate for `botmux send --mention` identifiers. Splits literal open_ids
+ * (always allowed) from non-open_id identifiers (email / username / union_id /
+ * mobile). Non-open_id identifiers are only permitted when the bot config sets
+ * `allowArbitraryMention`; otherwise this returns ok:false so the caller can
+ * reject before doing any Lark I/O. The actual email→open_id resolution and
+ * group-membership check are async side effects the caller performs on
+ * `toResolve`. Keeping the decision here makes it unit-testable without Lark.
+ */
+export function classifyMentionIdentifiers(
+  raw: RawMention[],
+  allowArbitraryMention: boolean,
+): MentionClassifyResult {
+  const openIdMentions = raw.filter(r => r.identifier.startsWith('ou_'));
+  const nonOpenId = raw.filter(r => !r.identifier.startsWith('ou_'));
+  if (nonOpenId.length > 0 && !allowArbitraryMention) {
+    return {
+      ok: false,
+      error:
+        `--mention 只接受字面 open_id（ou_…）；不支持用邮箱/用户名 @ 任意人。\n` +
+        `如需按邮箱/用户名 @ 群内成员，请在该 bot 配置里设 allowArbitraryMention: true。\n` +
+        `无法解析的项：${nonOpenId.map(r => r.identifier).join(', ')}`,
+      openIdMentions,
+      toResolve: [],
+    };
+  }
+  return { ok: true, openIdMentions, toResolve: nonOpenId };
+}
+
 export interface MentionDecisionArgs {
   /** config.send.requireMentionDecision */
   enabled: boolean;

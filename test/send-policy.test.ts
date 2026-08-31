@@ -3,6 +3,7 @@ import {
   resolveQuoteTarget,
   shouldDropAfterTheFactTopicQuote,
   validateMentionDecision,
+  classifyMentionIdentifiers,
   mentionBackAmbiguity,
   mentionBackAmbiguityError,
   parseAttentionFlag,
@@ -414,5 +415,41 @@ describe('shouldDropAfterTheFactTopicQuote', () => {
     expect(shouldDropAfterTheFactTopicQuote({
       ...base, quotedTurnInThread: false, currentThreadId: '   ',
     })).toBe(false);
+  });
+});
+
+describe('classifyMentionIdentifiers', () => {
+  const oid = { identifier: 'ou_abc', name: 'Alice' };
+  const email = { identifier: 'bob@bytedance.com', name: 'Bob' };
+  const union = { identifier: 'on_xyz', name: '' };
+
+  it('passes literal open_ids through regardless of the switch', () => {
+    const r = classifyMentionIdentifiers([oid], false);
+    expect(r.ok).toBe(true);
+    expect(r.openIdMentions).toEqual([oid]);
+    expect(r.toResolve).toEqual([]);
+  });
+
+  it('rejects non-open_id identifiers when the switch is off', () => {
+    const r = classifyMentionIdentifiers([oid, email], false);
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('allowArbitraryMention');
+    expect(r.error).toContain('bob@bytedance.com');
+    // open_ids are still surfaced so callers could partially proceed if desired
+    expect(r.openIdMentions).toEqual([oid]);
+  });
+
+  it('routes non-open_id identifiers to resolution when the switch is on', () => {
+    const r = classifyMentionIdentifiers([oid, email, union], true);
+    expect(r.ok).toBe(true);
+    expect(r.openIdMentions).toEqual([oid]);
+    expect(r.toResolve).toEqual([email, union]);
+  });
+
+  it('is a no-op for an empty mention list', () => {
+    const r = classifyMentionIdentifiers([], false);
+    expect(r.ok).toBe(true);
+    expect(r.openIdMentions).toEqual([]);
+    expect(r.toResolve).toEqual([]);
   });
 });

@@ -1947,6 +1947,17 @@ export interface BotConfig {
    */
   regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
   /**
+   * 允许 `botmux send --mention` @ 群内任意成员（用邮箱 / username / union_id /
+   * open_id 指定），而不仅是本轮触发者（--mention-back）。默认 false：关闭时
+   * --mention 只接受字面 open_id，传入邮箱等非 open_id 标识会被拒绝，避免模型
+   * 自主决定 @ 谁时“乱发”。开启后：
+   *   1. --mention 的每个值先经 resolveAllowedUsersWithMap 解析成本 app open_id；
+   *   2. 解析结果再与目标群的成员列表（listChatMemberOpenIds）做交集校验，
+   *      只有确实在群里的人才会被 @，不在群里的直接拒绝发送。
+   * 是否开放由配置该 bot 的人决定（孙晓雪/李嘉瑞 #mention 讨论）。
+   */
+  allowArbitraryMention?: boolean;
+  /**
    * Regular-group substitute trigger. When enabled, an @mention of one of the
    * configured people is treated as an address to this bot when the sender can
    * talk to the bot. Matching currently uses mention open_id / user_id / union_id;
@@ -3333,6 +3344,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinSeed
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      // 默认 OFF：只有显式 true 有意义/落盘。开启后 `botmux send --mention`
+      // 才能用邮箱/username 等标识 @ 群内任意成员（见 BotConfig 上的说明）。
+      allowArbitraryMention: entry.allowArbitraryMention === true || undefined,
       messageListeners,
       worktreeMultiPicker: entry.worktreeMultiPicker === true || undefined,
       // Per-bot regular-group default mode. Default is 'chat-topic' (顶层平铺
