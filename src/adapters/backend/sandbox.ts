@@ -1064,7 +1064,7 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
   }
   const flags: string[] = [];
   const rawFlags = Array.isArray(req.flags) ? req.flags : [];
-  const dispatchValueFlags = new Set(['--title', '--bot-app', '--chat-id', '--into']);
+  const dispatchValueFlags = new Set(['--title', '--bot-app', '--chat-id']);
   for (let i = 0; i < rawFlags.length; i++) {
     const f = rawFlags[i];
     if (typeof f !== 'string') return { ok: false, error: 'flag must be a string' };
@@ -1080,9 +1080,6 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       }
       if (f === '--chat-id' && !/^oc_[A-Za-z0-9_-]{1,128}$/.test(v)) {
         return { ok: false, error: 'dispatch --chat-id is invalid' };
-      }
-      if (f === '--into' && !/^om_[A-Za-z0-9_-]{1,128}$/.test(v)) {
-        return { ok: false, error: 'dispatch --into is invalid' };
       }
       flags.push(f, v); i++; continue;
     }

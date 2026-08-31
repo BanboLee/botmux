@@ -42,7 +42,13 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
-import { updateDispatchRegistry } from './core/dispatch-registry.js';
+import {
+  persistDispatchLifecycle as persistDispatchLifecycleRecord,
+  type DispatchAcceptanceState,
+  type DispatchLifecycleStatus,
+  type DispatchReceiptState,
+  type DispatchTransportState,
+} from './core/dispatch-lifecycle.js';
 import { withBotSteerDirective } from './core/bot-steer-directive.js';
 import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
 import {
@@ -7445,7 +7451,7 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
     process.exit(2);
   }
   const allowedFlags = new Set([
-    '--title', '--bot-app', '--chat-id', '--into', '--steer',
+    '--title', '--bot-app', '--chat-id', '--steer',
     '--brief', '--brief-file', '--session-id',
   ]);
   const unsupportedFlags = [...new Set(rest
@@ -7467,13 +7473,13 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
   let brief = argValue(rest, '--brief') ?? '';
   if (briefFile) {
     if (!existsSync(briefFile)) {
-      console.error(JSON.stringify({ success: false, sourceSessionId: sid, errorCode: 'ROUTING_NOT_SUPPORTED', detail: `brief file not found: ${briefFile}` }));
+      console.error(JSON.stringify({ success: false, sourceSessionId: sid, errorCode: 'BRIEF_FILE_NOT_FOUND', detail: `brief file not found: ${briefFile}` }));
       process.exit(1);
     }
     brief = readFileSync(briefFile, 'utf8');
   }
   const flags: string[] = [];
-  for (const flag of ['--title', '--bot-app', '--chat-id', '--into'] as const) {
+  for (const flag of ['--title', '--bot-app', '--chat-id'] as const) {
     for (const value of argValues(rest, flag)) flags.push(flag, value);
   }
   if (rest.includes('--steer')) flags.push('--steer');
@@ -7509,7 +7515,7 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
     success: false,
     sourceSessionId: sid,
     transportState: 'failed',
-    acceptanceState: 'timed_out',
+    acceptanceState: 'not_requested',
     errorCode: 'TRANSPORT_FAILED',
     detail: 'daemon relay response timed out after 120s',
   }));
@@ -7519,35 +7525,22 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
 async function persistDispatchLifecycle(input: {
   dispatchRoot: string;
   sourceSessionId: string;
-  status: 'dispatched' | 'accepted' | 'failed' | 'timed_out';
+  status: DispatchLifecycleStatus;
+  transportState: DispatchTransportState;
+  acceptanceState: DispatchAcceptanceState;
   errorCode?: string | null;
   acceptedBotAppIds?: readonly string[];
   missingBotAppIds?: readonly string[];
-}): Promise<void> {
+}): Promise<DispatchReceiptState> {
   try {
-    await updateDispatchRegistry(join(resolveDataDir(), 'orchestrate-dispatch.json'), registry => {
-      const raw = registry[input.dispatchRoot];
-      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
-      const entry = raw as Record<string, unknown>;
-      if (entry.orchSessionId !== input.sourceSessionId) return;
-      const now = new Date().toISOString();
-      entry.status = input.status;
-      entry.transportState = 'dispatched';
-      entry.acceptanceState = input.status === 'failed'
-        ? 'failed'
-        : input.status === 'timed_out'
-        ? 'timed_out'
-        : input.status === 'accepted' ? 'accepted' : 'requested';
-      entry.errorCode = input.errorCode
-        ?? (input.status === 'timed_out' ? 'ACCEPTANCE_TIMEOUT' : null);
-      if (input.acceptedBotAppIds) entry.acceptedBotAppIds = [...input.acceptedBotAppIds];
-      if (input.missingBotAppIds) entry.missingBotAppIds = [...input.missingBotAppIds];
-      if (input.status === 'accepted') entry.acceptedAt = now;
-      if (input.status === 'failed' || input.status === 'timed_out') entry.failedAt = now;
-      entry.updatedAt = now;
-    });
+    return await persistDispatchLifecycleRecord({ dataDir: resolveDataDir(), ...input });
   } catch (error) {
     console.error(`dispatch lifecycle persistence failed: ${error instanceof Error ? error.message : String(error)}`);
+    return {
+      transportState: input.transportState,
+      acceptanceState: input.acceptanceState,
+      errorCode: input.errorCode ?? null,
+    };
   }
 }
 
@@ -10133,18 +10126,27 @@ async function cmdDispatch(rest: string[]): Promise<void> {
           })
         : undefined;
       const accepted = !acceptance || acceptance.missingBotAppIds.length === 0;
-      await persistDispatchLifecycle({
+      const acceptanceState: DispatchAcceptanceState = !acceptance
+        ? 'not_requested'
+        : accepted ? 'accepted' : 'timed_out';
+      const lifecycleStatus: DispatchLifecycleStatus = !acceptance
+        ? 'dispatched'
+        : accepted ? 'accepted' : 'timed_out';
+      const errorCode = !acceptance || accepted ? null : 'ACCEPTANCE_TIMEOUT';
+      const receiptState = await persistDispatchLifecycle({
         dispatchRoot: intoRoot,
         sourceSessionId: sid,
-        status: !acceptance ? 'dispatched' : accepted ? 'accepted' : 'timed_out',
+        status: lifecycleStatus,
+        transportState: 'dispatched',
+        acceptanceState,
+        errorCode,
         acceptedBotAppIds: acceptance?.acceptedBotAppIds,
         missingBotAppIds: acceptance?.missingBotAppIds,
       });
       console.log(JSON.stringify({
         success: accepted, taskSent: true, mode: 'into', sourceSessionId: sid,
         targetAppIds: parsedBotApps.map(item => item.appId),
-        transportState: 'dispatched', acceptanceState: !acceptance ? 'not_requested' : accepted ? 'accepted' : 'timed_out',
-        errorCode: !acceptance || accepted ? null : 'ACCEPTANCE_TIMEOUT', threadRootId: intoRoot,
+        ...receiptState, threadRootId: intoRoot,
         kickoffMessageId: kickoffId, chatId: targetChatId, bots: built.mentionedOpenIds,
         collaborationReady: parsedBotApps.length > 0,
         ...(acceptance ? {
@@ -10169,6 +10171,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         seedText: built.seedText,
         targetChatId,
         targetAppIds: parsedBotApps.map(item => item.appId),
+        acceptanceRequested: !standby && parsedBotApps.length > 0,
         title: title.trim(),
         bots: built.mentionedOpenIds,
       },
@@ -10224,10 +10227,20 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     }
 
     const accepted = !acceptance || acceptance.missingBotAppIds.length === 0;
-    await persistDispatchLifecycle({
+    const acceptanceState: DispatchAcceptanceState = standby || !acceptance
+      ? 'not_requested'
+      : accepted ? 'accepted' : 'timed_out';
+    const lifecycleStatus: DispatchLifecycleStatus = standby || !acceptance
+      ? 'dispatched'
+      : accepted ? 'accepted' : 'timed_out';
+    const errorCode = !acceptance || accepted ? null : 'ACCEPTANCE_TIMEOUT';
+    const receiptState = await persistDispatchLifecycle({
       dispatchRoot: seedId,
       sourceSessionId: sid,
-      status: standby || !acceptance ? 'dispatched' : accepted ? 'accepted' : 'timed_out',
+      status: lifecycleStatus,
+      transportState: 'dispatched',
+      acceptanceState,
+      errorCode,
       acceptedBotAppIds: acceptance?.acceptedBotAppIds,
       missingBotAppIds: acceptance?.missingBotAppIds,
     });
@@ -10235,9 +10248,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       success: accepted,
       sourceSessionId: sid,
       targetAppIds: parsedBotApps.map(item => item.appId),
-      transportState: 'dispatched',
-      acceptanceState: standby || !acceptance ? 'not_requested' : accepted ? 'accepted' : 'timed_out',
-      errorCode: !acceptance || accepted ? null : 'ACCEPTANCE_TIMEOUT',
+      ...receiptState,
       taskSent: !standby,
       mode: standby ? 'standby' : 'dispatch',
       seedMessageId: seedId,
@@ -10256,15 +10267,30 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     }));
     if (!accepted) process.exitCode = 1;
   } catch (err: any) {
+    let receiptState: DispatchReceiptState = {
+      transportState: 'failed',
+      acceptanceState: 'failed',
+      errorCode: 'TRANSPORT_FAILED',
+    };
     if (dispatchRootForLifecycle) {
-      await persistDispatchLifecycle({
+      receiptState = await persistDispatchLifecycle({
         dispatchRoot: dispatchRootForLifecycle,
         sourceSessionId: sid,
         status: 'failed',
+        transportState: 'failed',
+        acceptanceState: 'failed',
         errorCode: 'TRANSPORT_FAILED',
       });
     }
-    console.error(`dispatch 失败: ${err.message}`);
+    console.error(JSON.stringify({
+      success: false,
+      sourceSessionId: sid,
+      targetAppIds: parsedBotApps.map(item => item.appId),
+      chatId: targetChatId,
+      threadRootId: dispatchRootForLifecycle ?? null,
+      ...receiptState,
+      detail: err?.message ?? String(err),
+    }));
     process.exit(1);
   }
 }
