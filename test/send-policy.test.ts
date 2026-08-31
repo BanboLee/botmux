@@ -4,6 +4,7 @@ import {
   shouldDropAfterTheFactTopicQuote,
   validateMentionDecision,
   classifyMentionIdentifiers,
+  outsidersForMembership,
   mentionBackAmbiguity,
   mentionBackAmbiguityError,
   parseAttentionFlag,
@@ -451,5 +452,33 @@ describe('classifyMentionIdentifiers', () => {
     expect(r.ok).toBe(true);
     expect(r.openIdMentions).toEqual([]);
     expect(r.toResolve).toEqual([]);
+  });
+});
+
+describe('outsidersForMembership', () => {
+  const members = new Set(['ou_alice', 'ou_bob']);
+
+  it('returns empty when every resolved open_id is a member (in-group passes)', () => {
+    const out = outsidersForMembership(
+      [{ identifier: 'a@x.com', openId: 'ou_alice' }, { identifier: 'b@x.com', openId: 'ou_bob' }],
+      members,
+    );
+    expect(out).toEqual([]);
+  });
+
+  it('flags a resolved open_id that is NOT a member (out-of-group rejected)', () => {
+    const out = outsidersForMembership(
+      [{ identifier: 'a@x.com', openId: 'ou_alice' }, { identifier: 'c@x.com', openId: 'ou_carol' }],
+      members,
+    );
+    expect(out).toEqual([{ identifier: 'c@x.com', openId: 'ou_carol' }]);
+  });
+
+  it('flags everyone when the member set is empty (gate has teeth)', () => {
+    const out = outsidersForMembership(
+      [{ identifier: 'a@x.com', openId: 'ou_alice' }],
+      new Set<string>(),
+    );
+    expect(out).toHaveLength(1);
   });
 });

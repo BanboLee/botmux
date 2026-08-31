@@ -180,7 +180,7 @@ export function neutralizeLarkAtTags(content: string): string {
 }
 
 export interface RawMention {
-  /** open_id (ou_…), or an email / username / union_id / mobile when the bot
+  /** open_id (ou_…), or a full email / union_id / mobile when the bot
    *  enables arbitrary mention. */
   identifier: string;
   /** optional display name for inline <at> substitution */
@@ -200,7 +200,7 @@ export interface MentionClassifyResult {
 
 /**
  * Pure gate for `botmux send --mention` identifiers. Splits literal open_ids
- * (always allowed) from non-open_id identifiers (email / username / union_id /
+ * (always allowed) from non-open_id identifiers (email / union_id /
  * mobile). Non-open_id identifiers are only permitted when the bot config sets
  * `allowArbitraryMention`; otherwise this returns ok:false so the caller can
  * reject before doing any Lark I/O. The actual email→open_id resolution and
@@ -217,14 +217,30 @@ export function classifyMentionIdentifiers(
     return {
       ok: false,
       error:
-        `--mention 只接受字面 open_id（ou_…）；不支持用邮箱/用户名 @ 任意人。\n` +
-        `如需按邮箱/用户名 @ 群内成员，请在该 bot 配置里设 allowArbitraryMention: true。\n` +
+        `--mention 只接受字面 open_id（ou_…）；不支持用邮箱 @ 任意人。\n` +
+        `如需按完整邮箱/手机号/union_id @ 群内成员，请在该 bot 配置里设 allowArbitraryMention: true。\n` +
         `无法解析的项：${nonOpenId.map(r => r.identifier).join(', ')}`,
       openIdMentions,
       toResolve: [],
     };
   }
   return { ok: true, openIdMentions, toResolve: nonOpenId };
+}
+
+/**
+ * Pure group-membership gate for resolved --mention targets. Given the resolved
+ * open_id per non-open_id identifier and the set of open_ids that are actually
+ * members of the destination chat, return the identifiers whose resolved open_id
+ * is NOT a member (the ones that must be rejected). Extracted from cmdSend so the
+ * "in-group passes / out-of-group rejected" contract is unit-testable without
+ * Lark I/O — a mutation that deletes the check (always [] ) or reverses it
+ * (`has` instead of `!has`) must make these tests fail.
+ */
+export function outsidersForMembership(
+  resolved: Array<{ identifier: string; openId: string }>,
+  memberIds: Set<string>,
+): Array<{ identifier: string; openId: string }> {
+  return resolved.filter(r => !memberIds.has(r.openId));
 }
 
 export interface MentionDecisionArgs {

@@ -215,6 +215,34 @@ describe('parseBotConfigsFromText — brand', () => {
     }
   });
 
+  // allowArbitraryMention is a SAFETY switch (gates whether an agent may @
+  // arbitrary group members via email). Default MUST be off, and only a literal
+  // boolean `true` may turn it on — a mutation that flips normalization to
+  // `!== false` (default-open) or accepts the string "true" must fail here.
+  it('sets allowArbitraryMention only for a literal boolean true', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', allowArbitraryMention: true },
+    ]));
+    expect(cfg.allowArbitraryMention).toBe(true);
+  });
+
+  it('defaults allowArbitraryMention to NOT-true (undefined) when unset', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's' },
+    ]));
+    expect(cfg.allowArbitraryMention).not.toBe(true);
+    expect(cfg.allowArbitraryMention).toBeUndefined();
+  });
+
+  it('keeps allowArbitraryMention NOT-true for false / "true" / 1 / {} (never default-open)', () => {
+    for (const val of [false, 'true', 1, {}] as const) {
+      const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'a', larkAppSecret: 's', allowArbitraryMention: val },
+      ]));
+      expect(cfg.allowArbitraryMention).not.toBe(true);
+    }
+  });
+
   it('keeps only a valid sessionOwnerReminder configuration', () => {
     const reminder = {
       enabled: true,
