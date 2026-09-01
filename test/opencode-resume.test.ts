@@ -353,6 +353,28 @@ describe('opencode writeInput DB verification', () => {
     expect(result.submitted).toBe(false);
     expect(pty.enters).toBe(3);
   });
+
+  it('does not confirm when extra text wraps the envelope on both sides (prefix + suffix)', async () => {
+    // 钉住 textMatches 的边界：宽容前缀分支只允许「前面加东西」，后缀分支只允许
+    // 「后面加东西」；前后都加东西时（na 既不 startsWith 也不 endsWith 于 ne）
+    // 必须判为未提交。若有人把 endsWith 放宽成 includes，这条会立刻变红。
+    const db = openDb();
+    seedSession(db, { id: 'ses_target' });
+    const content = `<session_id>${BOTMUX_SESSION_ID}</session_id>\n\n<user_message>\nhello from lark\n</user_message>`;
+    const baseline = snapPartBaseline();
+    seedUserPart(
+      db,
+      'ses_target',
+      `[Directory Context: ${tmpRoot}/AGENTS.md]\n\n${content}\n\n[trailing text after the envelope]`,
+      Date.now(),
+    );
+    const pty = stubPty();
+
+    const result = await detectOpenCodeSubmit(pty, baseline, content, async () => {});
+    db.close();
+    expect(result.submitted).toBe(false);
+    expect(pty.enters).toBe(3);
+  });
 });
 
 describe('opencode detectOpenCodeSubmit retry behaviour', () => {
