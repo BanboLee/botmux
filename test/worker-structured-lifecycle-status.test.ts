@@ -642,7 +642,7 @@ describe('worker structured-turn status wiring', () => {
     expect(handler).toContain('msg.dispatchAttempt');
     expect(adopt).toContain('adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(content, turnId, dispatchAttempt)');
     expect(adopt).toContain('scheduleSubmitFailureNotify(');
-    expect(adopt).toContain("'submit history'");
+    expect(adopt).toContain("t('worker.transcriptLabel')");
     expect(adopt).toContain('dropFailedBridgeMark(adoptStructuredBridgeTurnId, dispatchAttempt)');
   });
 });

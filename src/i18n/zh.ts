@@ -1341,6 +1341,7 @@ export const messages: Record<string, string> = {
 
   // Worker-side submit / notify messages
   'worker.codex_composer_conflict': '已 adopt 的 Codex 终端输入框里已有未提交的本地草稿。botmux 保留了草稿，没有把这条飞书消息拼到后面。请先提交或清空本地草稿，再重发飞书消息。',
+  'worker.transcriptLabel': '会话存储',
   'worker.submit_impossible': '⚠️ 刚才那条消息没有安全写入 {cliName}。\n原因：{reason}\n请处理上述原因并确认终端状态后再试。\n开头：{preview}',
   'worker.submit_unconfirmed': '⚠️ 消息提交自动确认失败\n阶段：输入提交\n错误码：submit_unconfirmed\nBotMux 未能在{transcriptLabel}确认 {cliName} 已接收这条消息。自动确认失败不代表消息一定没有执行：它可能仍在执行或已经执行。\n请打开 Web 终端检查输入框与执行状态；确认消息确实未执行后再重发。\n原消息：{preview}',
   'worker.submit_unconfirmed_zmx': '⚠️ 消息提交自动确认失败\n阶段：输入提交\n错误码：submit_unconfirmed\nBotMux 未能在{transcriptLabel}确认 {cliName} 已接收这条消息。自动确认失败不代表消息一定没有执行：它可能仍在执行或已经执行。\n不要直接重发；请在本机运行 botmux list，进入该 ZMX 会话检查输入框与执行状态，确认消息确实未执行后再重发。\n原消息：{preview}',

@@ -7983,7 +7983,7 @@ async function writeAdoptMessage(
       scheduleSubmitFailureNotify(
         content,
         undefined,
-        'submit history',
+        t('worker.transcriptLabel'),
         undefined,
         composerConflict,
         turnSeq,
@@ -8026,7 +8026,7 @@ async function writeAdoptMessage(
           scheduleSubmitFailureNotify(
             content,
             result?.recheck,
-            'submit history',
+            t('worker.transcriptLabel'),
             adoptStructuredBridgeTurnId,
             result?.failureReason,
             turnSeq,
@@ -11636,7 +11636,7 @@ async function flushPending(): Promise<void> {
             scheduleSubmitFailureNotify(
               logicalMsg,
               undefined,
-              '会话存储',
+              t('worker.transcriptLabel'),
               bridgeTurnId,
               undefined,
               turnSeq,
@@ -11742,7 +11742,7 @@ async function flushPending(): Promise<void> {
           scheduleSubmitFailureNotify(
             logicalMsg,
             result.recheck,
-            '会话存储',
+            t('worker.transcriptLabel'),
             bridgeTurnId,
             result.failureReason,
             turnSeq,

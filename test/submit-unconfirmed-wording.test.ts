@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { messages as enMessages } from '../src/i18n/en.js';
 import { messages as zhMessages } from '../src/i18n/zh.js';
+import { t } from '../src/i18n/index.js';
 
 /**
  * submit_unconfirmed 文案只钉「机器消费」的接缝：
@@ -66,5 +67,41 @@ describe('submit_unconfirmed wording seam', () => {
   it('worker passes a storage-agnostic transcriptLabel instead of 会话 JSONL', () => {
     const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
     expect(worker).not.toContain("'会话 JSONL'");
+  });
+
+  it('worker.transcriptLabel exists in both locales and is locale-appropriate', () => {
+    expect(Object.prototype.hasOwnProperty.call(zhMessages, 'worker.transcriptLabel')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(enMessages, 'worker.transcriptLabel')).toBe(true);
+    expect(zhMessages['worker.transcriptLabel']).toBeTruthy();
+    expect(enMessages['worker.transcriptLabel']).toBeTruthy();
+    // The English value must not leak CJK characters into the en template.
+    expect(enMessages['worker.transcriptLabel']).not.toMatch(/[\u4e00-\u9fff]/);
+  });
+
+  it('renders en submit_unconfirmed templates without CJK when the label is localized', () => {
+    const enLabel = t('worker.transcriptLabel', {}, 'en');
+    for (const key of UNCONFIRMED_KEYS) {
+      const rendered = t(key, { cliName: 'OpenCode', transcriptLabel: enLabel, preview: 'p' }, 'en');
+      expect(rendered).not.toMatch(/[\u4e00-\u9fff]/);
+    }
+  });
+
+  it('renders zh submit_unconfirmed templates with the localized Chinese label', () => {
+    const zhLabel = t('worker.transcriptLabel', {}, 'zh');
+    expect(zhLabel).toContain('会话存储');
+    for (const key of UNCONFIRMED_KEYS) {
+      const rendered = t(key, { cliName: 'OpenCode', transcriptLabel: zhLabel, preview: 'p' }, 'zh');
+      expect(rendered).toContain('会话存储');
+    }
+  });
+
+  it('worker passes the localized transcriptLabel instead of hardcoded literals', () => {
+    const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+    // All four call sites must route through the i18n key rather than embedding
+    // '会话存储' (zh) or 'submit history' (en) literals that bleed into the other
+    // locale's template.
+    expect(worker).not.toContain("'会话存储'");
+    expect(worker).not.toContain("'submit history'");
+    expect(worker).toContain("t('worker.transcriptLabel')");
   });
 });
