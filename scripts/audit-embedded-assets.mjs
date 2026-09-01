@@ -96,14 +96,27 @@ function walk(dir) {
   return out;
 }
 
-if (!existsSync(DIST)) {
+/**
+ * The ASSET-side audit needs a built `dist/`; the READER-side scan below reads only
+ * `src/` and needs nothing. Aborting here would therefore make the reader gate
+ * unrunnable in a fresh checkout — and its two tests spawn this script, so
+ * `vitest run test/setup-app-icon.test.ts` on its own exited 2 before any assertion
+ * ran. CI happens to build first, which is exactly why that would have gone unnoticed.
+ *
+ * So: skip the asset half when dist/ is absent, and say so, rather than exiting. The
+ * `--require-dist` flag keeps the build's own invocation strict, so a real build can
+ * never silently skip the asset audit.
+ */
+const REQUIRE_DIST = process.argv.includes('--require-dist');
+const distBuilt = existsSync(DIST);
+if (!distBuilt && REQUIRE_DIST) {
   console.error('[audit-embed] dist/ missing — run `bun run build` first.');
   process.exit(2);
 }
 
-const assets = walk(DIST)
-  .filter((rel) => !CODE_SUFFIXES.some((s) => rel.endsWith(s)))
-  .sort();
+const assets = distBuilt
+  ? walk(DIST).filter((rel) => !CODE_SUFFIXES.some((s) => rel.endsWith(s))).sort()
+  : [];
 
 const unaccounted = [];
 for (const rel of assets) {
@@ -114,7 +127,11 @@ for (const rel of assets) {
 
 // Stale-entry check: an exemption that no longer matches any asset is worse than
 // no exemption, because it silently stops protecting anything.
-const stale = NOT_NEEDED_IN_BINARY.filter((e) => !assets.includes(e.rel));
+//
+// ⚠️ Only meaningful when dist/ was actually scanned. With `assets` empty (no build),
+// EVERY exemption looks rotted and this would fail for a reason that has nothing to do
+// with the tree — the same vacuous-verdict shape the reader gate's own probe avoids.
+const stale = distBuilt ? NOT_NEEDED_IN_BINARY.filter((e) => !assets.includes(e.rel)) : [];
 if (stale.length > 0) {
   console.error(
     `[audit-embed] ${stale.length} exemption(s) no longer match any dist asset — delete them:\n`
@@ -269,8 +286,11 @@ const exemptionsUsed = new Set();
 // worse than the gap it was checking). Production never sets it.
 const extraSrc = process.env.BOTMUX_AUDIT_EXTRA_SRC;
 const scanRoots = [SRC, ...(extraSrc ? [extraSrc] : [])].filter((d) => existsSync(d));
+/** How many source files were actually read — the honest "did we scan anything" signal. */
+let scannedFileCount = 0;
 for (const root of scanRoots) {
   for (const abs of walkSource(root)) {
+    scannedFileCount += 1;
     const rel = relative(REPO_ROOT, abs).split(/[\\/]/).join('/');
     const lines = readFileSync(abs, 'utf8').split('\n');
 
@@ -303,7 +323,18 @@ for (const root of scanRoots) {
 
 // Skip the staleness check when scanning an extra tree: that run is a targeted probe,
 // not the real inventory, so "this exemption matched nothing" carries no information.
-const staleReaderExemptions = extraSrc ? [] : READER_EXEMPTIONS.filter((e) => !exemptionsUsed.has(e.file));
+// ⚠️ Only meaningful when the REAL src/ tree was scanned. Three ways it becomes
+// vacuous, all observed while building this: with `BOTMUX_AUDIT_EXTRA_SRC` the run is a
+// targeted probe; with `src/` absent nothing can match; and with an EMPTY-ish `src/`
+// (a scratch copy of just this script) `existsSync` is still true while zero files were
+// read — that last one is why the guard counts scanned FILES rather than trusting the
+// directory to exist. In all three every exemption "looks rotted" for a reason that has
+// nothing to do with the exemptions, and a check that fails vacuously trains people to
+// ignore it.
+const scannedRealSrc = !extraSrc && scannedFileCount > 0;
+const staleReaderExemptions = scannedRealSrc
+  ? READER_EXEMPTIONS.filter((e) => !exemptionsUsed.has(e.file))
+  : [];
 if (staleReaderExemptions.length > 0) {
   console.error(
     `[audit-embed] ${staleReaderExemptions.length} reader exemption(s) no longer suppress anything — delete them:\n`

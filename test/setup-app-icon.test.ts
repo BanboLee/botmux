@@ -88,7 +88,7 @@ describe('default app icon — reachable from the compiled binary', () => {
     // gate could lose a syntax (e.g. stop recognising `import.meta.dirname`) while the
     // two-statement fixture keeps the test green. That is the same "control does not
     // fire" failure mode this test exists to prevent, one level up.
-    for (const fixture of ['offender.ts', 'modern-idiom.ts', 'new-url.ts']) {
+    for (const fixture of ['offender.ts', 'modern-idiom.ts', 'new-url.ts', 'uppercase-ext.ts']) {
       expect(output, `gate should flag ${fixture}`).toContain(fixture);
     }
   });
