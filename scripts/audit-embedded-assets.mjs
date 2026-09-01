@@ -175,14 +175,34 @@ if (unaccounted.length > 0) {
  * the exact defect it was written for. So the scan is two-pass — first collect the
  * identifiers BOUND to a module-relative directory in this file, then flag any asset
  * path built from one of them (or from the derivation inline).
+ *
+ * ── WHAT THIS GATE DOES AND DOES NOT CATCH ─────────────────────────────────────
+ * It catches every SYNTAX that derives a module-relative base: `dirname(
+ * fileURLToPath(import.meta.url))`, bare `__dirname`, `import.meta.dirname` (the
+ * modern Bun/Node idiom — MEASURED to resolve to the same virtual /$bunfs/root under
+ * --compile, so it is the same hazard in a shorter costume), and `new URL('.',
+ * import.meta.url)`. Extensions are matched case-insensitively.
+ *
+ * It does NOT do data-flow analysis, so a directory that reaches the asset line
+ * through a hop evades it. KNOWN LIMITATIONS (accepted, not silent):
+ *   • a function RETURNS the dir, another call site builds the asset path
+ *     (`function baseDir() { return dirname(fileURLToPath(import.meta.url)); }`
+ *      then `join(baseDir(), 'x.png')`) — cross-function, the identifier is never
+ *      `const`-bound in the file that reads;
+ *   • an alias/reassignment hop (`const base = here;` then `join(base, …)`);
+ *   • a binding split across lines, or `let here; here = …`;
+ *   • destructuring (`const [here] = […]`).
+ * These need a real parser/flow analysis; the line-based scan is deliberately the
+ * cheap layer that catches the copy-paste shape. If one of them ships, the fix is to
+ * strengthen the scan, not to excuse the miss — the two-pass lesson above applies.
  */
 const SRC = join(REPO_ROOT, 'src');
 /** Extensions whose contents get READ at runtime (not spawned, not imported). */
-const ASSET_EXT = /\.(png|jpe?g|gif|svg|ico|webp|woff2?|ttf|otf|mp4|wav|json|html|css|txt|md|pem|crt)['"`\s,)\]]/;
-/** How a module-relative base directory is derived. */
-const MODULE_DIR = /fileURLToPath\(\s*import\.meta\.url\s*\)|\b__dirname\b/;
+const ASSET_EXT = /\.(png|jpe?g|gif|svg|ico|webp|woff2?|ttf|otf|mp4|wav|json|html|css|txt|md|pem|crt)['"`\s,)\]]/i;
+/** How a module-relative base directory is derived (every syntax that resolves to /$bunfs under --compile). */
+const MODULE_DIR = /fileURLToPath\(\s*import\.meta\.url\s*\)|\b__dirname\b|import\.meta\.dirname|new URL\([^)]*import\.meta\.url/;
 /** `const here = dirname(fileURLToPath(import.meta.url))` → captures `here`. */
-const DIR_BINDING = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=[^;]*(?:fileURLToPath\(\s*import\.meta\.url\s*\)|\b__dirname\b)/;
+const DIR_BINDING = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=[^;]*(?:fileURLToPath\(\s*import\.meta\.url\s*\)|\b__dirname\b|import\.meta\.dirname|new URL\([^)]*import\.meta\.url)/;
 
 /**
  * Source sites allowed to derive an asset path from their own module directory,

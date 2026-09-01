@@ -72,17 +72,25 @@ describe('default app icon — reachable from the compiled binary', () => {
    * than none.
    */
   it('the build gate rejects a module-relative asset read (positive control)', () => {
+    // The offending shape, injected via env so no repo file is touched: the gate
+    // scans src/, so we point it at a throwaway tree instead of mutating the real one.
     const probe = spawnSync(process.execPath, [resolve('scripts/audit-embedded-assets.mjs')], {
       encoding: 'utf-8',
       cwd: resolve('.'),
       timeout: 120_000,
-      // The offending shape, injected via env so no repo file is touched: the gate
-      // scans src/, so we point it at a throwaway tree instead of mutating the real one.
       env: { ...process.env, BOTMUX_AUDIT_EXTRA_SRC: resolve('test/fixtures/module-relative-asset-read') },
     });
     expect(probe.error).toBeUndefined();
     expect(probe.status, `gate should reject; stdout=${probe.stdout} stderr=${probe.stderr}`).not.toBe(0);
-    expect(`${probe.stdout}${probe.stderr}`).toContain('module-relative path');
+    const output = `${probe.stdout}${probe.stderr}`;
+    expect(output).toContain('module-relative path');
+    // Assert EACH fixture shape fires, not just that the run failed — otherwise the
+    // gate could lose a syntax (e.g. stop recognising `import.meta.dirname`) while the
+    // two-statement fixture keeps the test green. That is the same "control does not
+    // fire" failure mode this test exists to prevent, one level up.
+    for (const fixture of ['offender.ts', 'modern-idiom.ts', 'new-url.ts']) {
+      expect(output, `gate should flag ${fixture}`).toContain(fixture);
+    }
   });
 
   it('the build gate passes on the real tree (so the control above is discriminating)', () => {
