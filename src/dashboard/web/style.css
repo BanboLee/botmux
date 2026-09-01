@@ -23542,9 +23542,14 @@ dialog select[multiple]:hover:not(:disabled) {
   box-shadow: none;
 }
 
+/* align-content:start 不能省：桌面名册被 fill-height 壳撑满，列表这一行拿到
+   整段剩余高度。grid 默认 align-content:normal(=stretch) 会把这点余量摊给
+   每个自动行——搜索只剩两三个结果时，行高从 54px 拉成几百 px，选中项变成一
+   整块色带、末位被推到面板底部。列表只按内容排、余量留白，才是名册该有的样子。 */
 .bot-defaults-page .bd-roster-list {
   display: grid;
   gap: 3px;
+  align-content: start;
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
