@@ -45,12 +45,12 @@ function yamlSingleQuoted(value: string): string {
 }
 
 function jsonLiteral(value: unknown): string {
-  return JSON.stringify(value).replace(/<\//g, '<\\/');
+  return (JSON.stringify(value) ?? 'undefined').replace(/<\//g, '<\\/');
 }
 
 function dshConfigHome(homeDir: string): string {
   const configured = process.env.DSH_HOME?.trim();
-  return configured ? resolve(configured) : join(homeDir, '.config', 'dsh');
+  return configured ? resolve(configured) : join(homeDir, '.dsh');
 }
 
 function defaultDshTuiProfileDir(homeDir: string): string {
