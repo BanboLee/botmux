@@ -5,6 +5,7 @@ import { delay } from '../../utils/timing.js';
 import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { ensureDshQuestionBridgePatch, type DshQuestionBridgePatch } from '../dsh-question-bridge.js';
 
 /**
  * dsh-tui adapter — PTY-driven full-screen TUI for DeepSeek Harness.
@@ -29,6 +30,8 @@ import { join } from 'node:path';
 export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'dsh-tui';
   let cachedBin: string | undefined;
+  let cachedBridge: DshQuestionBridgePatch | null | undefined;
+  const bridgePatch = () => (cachedBridge ??= ensureDshQuestionBridgePatch({ cliId: 'dsh-tui' }));
   // The launcher spawns `dsh` as a second-stage child. Inside the file sandbox
   // /run is masked, so an nvm/fnm-installed dsh would vanish — re-expose it
   // (same pattern as the dsh adapter's dsh binary).
@@ -41,6 +44,11 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
       return [(cachedDshBin ??= resolveCommand('dsh'))];
     },
 
+    sandboxReadonlyPaths() {
+      const bridge = bridgePatch();
+      return bridge ? [bridge.readonlyRoot] : [];
+    },
+
     buildArgs({ resume, resumeSessionId }) {
       // Pre-create the authPaths in the real HOME before the worker enters the
       // sandbox: the sandbox's keepExisting filter drops authPaths that don't
@@ -51,6 +59,11 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
       mkdirSync(join(home, '.dsh'), { recursive: true });
       mkdirSync(join(home, '.dsh-tui'), { recursive: true });
       const args: string[] = [];
+      const bridge = bridgePatch();
+      // dsh-tui's launcher treats a split `--patch /abs/path` value as a
+      // workspace target. Keep the DSH overlay as one token so it reaches
+      // `dsh --profile dsh-tui` intact.
+      if (bridge) args.push(`--patch=${bridge.patchPath}`);
       if (resume) {
         // Bare --resume makes the launcher read ~/.dsh-tui/resume.txt; an
         // explicit session id is passed through verbatim.

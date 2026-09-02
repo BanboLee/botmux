@@ -814,6 +814,16 @@ describe('dsh buildArgs (runner model)', () => {
 
 describe('dsh-tui buildArgs (PTY TUI model)', () => {
   const adapter = createDshTuiAdapter('/opt/dsh-tui/bin/dsh-tui');
+  const originalBridgeFlag = process.env.BOTMUX_DSH_ASK_BRIDGE;
+
+  beforeEach(() => {
+    process.env.BOTMUX_DSH_ASK_BRIDGE = '0';
+  });
+
+  afterEach(() => {
+    if (originalBridgeFlag === undefined) delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    else process.env.BOTMUX_DSH_ASK_BRIDGE = originalBridgeFlag;
+  });
 
   it('spawns the dsh-tui binary directly (no runner)', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-tui', resume: false, workingDir: '/repo/root' });
@@ -833,8 +843,41 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     expect(args).toEqual(['--resume']);
   });
 
-  it('omits --resume on fresh spawn', () => {
+  it('omits --resume on fresh spawn when the question bridge is disabled', () => {
     expect(adapter.buildArgs({ sessionId: 's', resume: false })).toEqual([]);
+  });
+
+  it('injects the question bridge patch as a single --patch= token when available', () => {
+    delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-tui-bridge-profile-'));
+    const previousDshHome = process.env.DSH_HOME;
+    try {
+      process.env.DSH_HOME = root;
+      const pkgRoot = join(root, 'profiles', 'dsh-tui', 'node_modules', '@deepseek-harness-tui', 'dsh-tui');
+      mkdirSync(join(pkgRoot, 'lib', 'types'), { recursive: true });
+      writeFileSync(join(root, 'profiles', 'dsh-tui', 'package.json'), JSON.stringify({ name: 'profile' }) + '\n');
+      writeFileSync(join(pkgRoot, 'package.json'), JSON.stringify({
+        name: '@deepseek-harness-tui/dsh-tui',
+        type: 'module',
+        exports: { '.': { import: './lib/types/index.js' } },
+      }) + '\n');
+      writeFileSync(join(pkgRoot, 'lib', 'types', 'index.js'), 'export function apply(){}\n');
+
+      const bridgeAdapter = createDshTuiAdapter('/opt/dsh-tui/bin/dsh-tui');
+      const args = bridgeAdapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: 'abc-123' });
+      const patchArg = args.find(arg => arg.startsWith('--patch='));
+      expect(patchArg).toBeDefined();
+      expect(args).not.toContain('--patch');
+      expect(args).toContain('--resume');
+      expect(args).toContain('abc-123');
+      const readonly = bridgeAdapter.sandboxReadonlyPaths?.();
+      expect(readonly?.length).toBe(1);
+      expect(patchArg).toContain(readonly![0]);
+    } finally {
+      if (previousDshHome === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = previousDshHome;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('has no portable copy-paste resume command (session id not tracked)', () => {
