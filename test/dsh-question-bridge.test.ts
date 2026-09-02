@@ -213,6 +213,58 @@ process.stdin.on('end', () => {
     delete process.env.BOTMUX_LARK_APP_ID;
   });
 
+  it('generated dsh-tui wrapper prefers bridge answers before native provider', async () => {
+    const home = tmp();
+    const originalSource = `
+export const name = 'dsh-tui';
+export const inject = ['agents'];
+export const Config = { marker: true };
+export async function apply(ctx, config) {
+  globalThis.__botmuxWrapperConfig = config;
+  ctx.userQuestions.registerProvider({ ask: async (request) => ({ answers: [{ id: request.questions[0].id, selected: ['Native'] }] }) });
+}
+`;
+    const profile = makeDshTuiProfile(home, originalSource);
+    const hook = makeHookScript(home, `
+let input = '';
+process.stdin.on('data', d => { input += d.toString('utf8'); });
+process.stdin.on('end', () => {
+  const payload = JSON.parse(input);
+  process.stdout.write(JSON.stringify({ answers: [{ id: payload.tool_input.questions[0].id, selected: ['Bridge'] }] }));
+});
+`);
+    process.env.BOTMUX_SESSION_ID = 's';
+    process.env.BOTMUX_CHAT_ID = 'c';
+    process.env.BOTMUX_LARK_APP_ID = 'app';
+    const result = ensureDshQuestionBridgePatch({
+      cliId: 'dsh-tui',
+      homeDir: home,
+      dshTuiProfileDir: profile,
+      hookCommand: { cmd: process.execPath, args: [hook] },
+      buildSalt: 'wrapper-success',
+    })!;
+    const mod = await import(`${pathToFileURL(result.pluginPath).href}?case=${Date.now()}`);
+    const service: any = {
+      provider: undefined,
+      registerProvider(provider: any) { this.provider = provider; return () => { this.provider = undefined; }; },
+    };
+    const originalEntryConfig = { provider: 'deepseek-official', fullscreen: true };
+    const ctx: any = {
+      userQuestions: service,
+      get: (name: string) => name === 'userQuestions' ? service : undefined,
+      effect: () => undefined,
+      loader: { entries: function* () { yield { options: { id: 'dsh-tui', config: originalEntryConfig } }; } },
+    };
+    await mod.apply(ctx, {});
+    const answer = await service.provider.ask({ questions: [{ id: 'q', question: 'Q?', options: [{ label: 'A' }, { label: 'B' }] }] });
+    expect(answer).toEqual({ answers: [{ id: 'q', selected: ['Bridge'] }] });
+    expect((globalThis as any).__botmuxWrapperConfig).toBe(originalEntryConfig);
+    delete (globalThis as any).__botmuxWrapperConfig;
+    delete process.env.BOTMUX_SESSION_ID;
+    delete process.env.BOTMUX_CHAT_ID;
+    delete process.env.BOTMUX_LARK_APP_ID;
+  });
+
   it('generated dsh-tui wrapper uses native provider fallback on hook passthrough', async () => {
     const home = tmp();
     const originalSource = `
