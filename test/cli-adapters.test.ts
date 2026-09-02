@@ -790,6 +790,19 @@ describe('dsh buildArgs (runner model)', () => {
     expect(adapter.buildResumeCommand?.({ sessionId: 'sess-dsh', cliSessionId: 'session-abc' })).toBeNull();
   });
 
+  it('exposes configured DSH_HOME for sandboxed profile state', () => {
+    expect(adapter.authPaths).toContain('~/.dsh');
+    const previousDshHome = process.env.DSH_HOME;
+    try {
+      process.env.DSH_HOME = '/tmp/custom-dsh-home';
+      const configured = createDshAdapter('/opt/dsh/bin/dsh');
+      expect(configured.authPaths).toContain('/tmp/custom-dsh-home');
+    } finally {
+      if (previousDshHome === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = previousDshHome;
+    }
+  });
+
   it('readyPattern matches the runner prompt indicator', () => {
     expect(adapter.readyPattern?.test('› ')).toBe(true);
   });
@@ -935,9 +948,19 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     expect(adapter.supportsTypeAhead).not.toBe(true);
   });
 
-  it('exposes ~/.dsh and ~/.dsh-tui as auth paths', () => {
+  it('exposes ~/.dsh, configured DSH_HOME, and ~/.dsh-tui as auth paths', () => {
     expect(adapter.authPaths).toContain('~/.dsh');
     expect(adapter.authPaths).toContain('~/.dsh-tui');
+    const previousDshHome = process.env.DSH_HOME;
+    try {
+      process.env.DSH_HOME = '/tmp/custom-dsh-home';
+      const configured = createDshTuiAdapter('/opt/dsh-tui/bin/dsh-tui');
+      expect(configured.authPaths).toContain('/tmp/custom-dsh-home');
+      expect(configured.authPaths).toContain('~/.dsh-tui');
+    } finally {
+      if (previousDshHome === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = previousDshHome;
+    }
   });
 
   it('writeInput types text and presses Enter', async () => {

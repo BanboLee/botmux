@@ -7,6 +7,11 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { ensureDshQuestionBridgePatch, type DshQuestionBridgePatch } from '../dsh-question-bridge.js';
 
+function dshAuthPaths(): string[] {
+  const configured = process.env.DSH_HOME?.trim();
+  return configured ? ['~/.dsh', configured, '~/.dsh-tui'] : ['~/.dsh', '~/.dsh-tui'];
+}
+
 /**
  * dsh-tui adapter — PTY-driven full-screen TUI for DeepSeek Harness.
  *
@@ -105,7 +110,7 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
     altScreen: false,
     // ~/.dsh holds profiles + credentials + sessions; ~/.dsh-tui holds
     // resume.txt. Both must survive the file sandbox.
-    authPaths: ['~/.dsh', '~/.dsh-tui'],
+    get authPaths(): string[] { return dshAuthPaths(); },
     // Model is NOT injected: the TUI resolves its (provider, model) route from
     // its own profile config / persisted /model choice, and the bot's model
     // field carries no provider — hardcoding deepseek-official would break

@@ -30,6 +30,11 @@ function pushOpt(args: string[], key: string, value: string | undefined): void {
   args.push(key, value);
 }
 
+function dshAuthPaths(): string[] {
+  const configured = process.env.DSH_HOME?.trim();
+  return configured ? ['~/.dsh', configured] : ['~/.dsh'];
+}
+
 export function createDshAdapter(pathOverride?: string): CliAdapter {
   // Resolve the wrapped `dsh` binary lazily, on first buildArgs
   // (spawn time), so constructing the adapter during `botmux setup` doesn't
@@ -47,7 +52,7 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
     // file sandbox so both survive (see adapters CLAUDE.md sandbox notes).
     // Pre-created in buildArgs so the sandbox's keepExisting filter doesn't
     // drop it.
-    authPaths: ['~/.dsh'],
+    get authPaths(): string[] { return dshAuthPaths(); },
     resolvedBin: process.execPath,
 
     // resolvedBin is node-running-the-runner; the real dsh runtime is spawned
