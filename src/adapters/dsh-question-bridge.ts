@@ -271,6 +271,8 @@ function buildOrdinaryBridgePatch(pluginUrl: string, hash: string): string {
     '- insert:',
     `    - id: botmux-dsh-question-bridge-${hash}`,
     `      name: ${yamlSingleQuoted(pluginUrl)}`,
+    '      inject:',
+    '        - userQuestions',
     '',
   ].join('\n');
 }
@@ -282,6 +284,9 @@ function buildDshTuiWrapperPatch(pluginUrl: string, hash: string): string {
     '- insert:',
     `    - id: botmux-dsh-tui-wrapper-${hash}`,
     `      name: ${yamlSingleQuoted(pluginUrl)}`,
+    '      inject:',
+    '        - agents',
+    '        - userQuestions',
     '',
   ].join('\n');
 }
