@@ -6,6 +6,7 @@ import { resolveCommandReal } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
 import { runnerArgv0 } from '../../core/self-spawn.js';
+import { ensureDshQuestionBridgePatch, type DshQuestionBridgePatch } from '../dsh-question-bridge.js';
 
 function runnerPath(): string {
   // Source-level worker integration tests execute through tsx and need the
@@ -36,6 +37,8 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
   // itself.
   const rawDshBin = pathOverride ?? 'dsh';
   let cachedDshBin: string | undefined;
+  let cachedBridge: DshQuestionBridgePatch | null | undefined;
+  const bridgePatch = () => (cachedBridge ??= ensureDshQuestionBridgePatch({ cliId: 'dsh' }));
   return {
     id: 'dsh',
     // The runner reads ~/.dsh/settings.yaml + .credentials.yaml and writes
@@ -58,6 +61,11 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
       return [(cachedDshBin ??= resolveCommandReal(rawDshBin))];
     },
 
+    sandboxReadonlyPaths() {
+      const bridge = bridgePatch();
+      return bridge ? [bridge.readonlyRoot] : [];
+    },
+
     buildArgs({ sessionId, workingDir, botName, botOpenId, locale, model, turnTimeoutMs, dshProfile }) {
       // Pre-create the native dsh home + sessions subdir in the real HOME
       // before the worker enters the sandbox: the sandbox's keepExisting
@@ -77,6 +85,8 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
       pushOpt(args, '--locale', locale);
       pushOpt(args, '--model', model && model.trim() ? model.trim() : undefined);
       pushOpt(args, '--dsh-profile', dshProfile && dshProfile.trim() ? dshProfile.trim() : 'botmux');
+      const bridge = bridgePatch();
+      pushOpt(args, '--bridge-patch', bridge?.patchPath);
       // Per-bot turn timeout override; undefined → runner default (10 min).
       pushOpt(args, '--turn-timeout-ms', typeof turnTimeoutMs === 'number' && turnTimeoutMs > 0
         ? String(turnTimeoutMs)

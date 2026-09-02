@@ -942,7 +942,7 @@ bunx vitest run test/ask-hook-dsh.test.ts test/dsh-question-bridge.test.ts test/
 - [x] W2-T2：dsh-tui adapter 通过临时 `--patch=` 注入 bridge。
 - [x] W3-T1：公共 ask 链路回归保护；本轮未修改公共 ask 类型/card，后续验收仍跑既有 hook 回归。
 - [x] W3-T2：更新设计与测试文档。
-- [ ] W4-T1：fake 集成测试。
+- [x] W4-T1：fake 集成测试。
 - [ ] W4-T2：真实 smoke 矩阵。
 
 ### 回滚与运营 Todo
