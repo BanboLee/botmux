@@ -32,7 +32,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { parse as parseYaml } from 'yaml';
+import { createRequire } from 'node:module';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 import { ensureDshQuestionBridgePatch } from './adapters/dsh-question-bridge.js';
 
@@ -131,6 +131,51 @@ function truncate(text: string, max: number): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+let parseYamlImpl: ((input: string) => unknown) | undefined;
+
+function scalarYamlValue(raw: string): unknown {
+  const value = raw.trim();
+  if (!value) return {};
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    return value.slice(1, -1);
+  }
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && /^-?\d+(?:\.\d+)?$/.test(value)) return numeric;
+  return value;
+}
+
+function parseMinimalYaml(input: string): unknown {
+  const root: Record<string, unknown> = {};
+  const stack: Array<{ indent: number; value: Record<string, unknown> }> = [{ indent: -1, value: root }];
+  for (const line of input.split(/\r?\n/)) {
+    if (!line.trim() || line.trimStart().startsWith('#')) continue;
+    const match = /^(\s*)([^:#]+):(?:\s*(.*))?$/.exec(line);
+    if (!match) continue;
+    const indent = match[1]!.length;
+    const key = match[2]!.trim();
+    const rawValue = match[3] ?? '';
+    while (stack.length > 1 && indent <= stack[stack.length - 1]!.indent) stack.pop();
+    const parent = stack[stack.length - 1]!.value;
+    const value = scalarYamlValue(rawValue);
+    parent[key] = value;
+    if (isRecord(value) && rawValue.trim() === '') stack.push({ indent, value });
+  }
+  return root;
+}
+
+function parseYamlDocument(input: string): unknown {
+  if (!parseYamlImpl) {
+    try {
+      const req = createRequire(import.meta.url);
+      const mod = req('yaml') as { parse?: (value: string) => unknown };
+      parseYamlImpl = typeof mod.parse === 'function' ? mod.parse : undefined;
+    } catch { /* dependency unavailable in some source-tree test checkouts */ }
+  }
+  return parseYamlImpl ? parseYamlImpl(input) : parseMinimalYaml(input);
 }
 
 /** Keep the wire checks aligned with the official dsh SDK client. A successful
@@ -287,7 +332,7 @@ function ensureProfileDir(name: string, dshBin: string): string {
 function loadCredentials(): Record<string, string> {
   const credPath = join(homedir(), '.dsh', '.credentials.yaml');
   if (!existsSync(credPath)) return {};
-  const parsed = parseYaml(readFileSync(credPath, 'utf8')) as unknown;
+  const parsed = parseYamlDocument(readFileSync(credPath, 'utf8')) as unknown;
   const source = isRecord(parsed) && parsed.version === 1 && isRecord(parsed.refs)
     ? parsed.refs
     : parsed;
@@ -318,7 +363,7 @@ function resolveNativeDshConfig(): NativeDshConfig {
   let provider = 'deepseek-official';
   let settingsModel = '';
   if (existsSync(settingsPath)) {
-    const settings = parseYaml(readFileSync(settingsPath, 'utf8')) as unknown;
+    const settings = parseYamlDocument(readFileSync(settingsPath, 'utf8')) as unknown;
     const s = isRecord(settings) ? settings : {};
     const defaultModel = isRecord(s['agent-default-model']) ? s['agent-default-model'] : {};
     provider = typeof defaultModel.provider === 'string' && defaultModel.provider
