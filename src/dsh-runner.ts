@@ -34,6 +34,7 @@ import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { parse as parseYaml } from 'yaml';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
+import { ensureDshQuestionBridgePatch } from './adapters/dsh-question-bridge.js';
 
 const DSH_MARKER = '::botmux-dsh:';
 const DEFAULT_TURN_TIMEOUT_MS = 10 * 60 * 1000;
@@ -175,6 +176,8 @@ interface NativeDshConfig {
   model: string;
   /** Credentials injected into the runtime's environment (env wins on conflict). */
   credentials: Record<string, string>;
+  /** Optional botmux question bridge patch, applied as a process-scoped overlay. */
+  bridgePatchPath?: string;
 }
 
 /** Seed a minimal dsh profile under ~/.dsh/profiles/<name> so `dsh --profile <name>`
@@ -324,11 +327,14 @@ function resolveNativeDshConfig(): NativeDshConfig {
     settingsModel = typeof defaultModel.model === 'string' ? defaultModel.model : '';
   }
 
+  const bridge = ensureDshQuestionBridgePatch({ cliId: 'dsh' });
+
   return {
     profileName,
     provider,
     model: args.model?.trim() || settingsModel || DEFAULT_MODEL,
     credentials: loadCredentials(),
+    ...(bridge ? { bridgePatchPath: bridge.patchPath } : {}),
   };
 }
 
@@ -382,10 +388,13 @@ class DshJsonRpcClient {
     private readonly profileName: string,
     private readonly env: NodeJS.ProcessEnv,
     private readonly cwd: string,
+    private readonly bridgePatchPath?: string,
   ) {}
 
   start(): void {
-    this.child = spawn(this.dshBin, ['--profile', this.profileName], {
+    const dshArgs = ['--profile', this.profileName];
+    if (this.bridgePatchPath) dshArgs.push(`--patch=${this.bridgePatchPath}`);
+    this.child = spawn(this.dshBin, dshArgs, {
       env: this.env,
       cwd: this.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -796,7 +805,8 @@ async function main(): Promise<void> {
     ...process.env,
     DSH_SESSION_ROOT: sessionRoot,
     DSH_CWD: cwd,
-  }, cwd);
+    BOTMUX_DSH_ASK_TIMEOUT_MS: String(Math.max(1000, args.turnTimeoutMs - 5000)),
+  }, cwd, native.bridgePatchPath);
   client.onNotification = handleNotification;
   client.onExit = (code, signal) => {
     if (shuttingDown) return;

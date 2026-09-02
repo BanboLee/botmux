@@ -163,6 +163,16 @@ describe('dsh-runner', () => {
     expect(existsSync(join(h.home, '.botmux', 'dsh'))).toBe(false);
   });
 
+  it('passes the generated question bridge patch to the dsh profile launch', async () => {
+    h = spawnRunner('happy');
+    await waitFor(() => h!.stdout.includes('›'), { label: 'ready marker' });
+
+    const argvEntry = readLog(h).find((entry: any) => Array.isArray(entry.argv));
+    expect(argvEntry?.argv[0]).toBe('--profile');
+    expect(argvEntry?.argv[1]).toBe('botmux');
+    expect(argvEntry?.argv.some((arg: string) => arg.startsWith('--patch='))).toBe(true);
+  });
+
   it('fails fast when the dsh binary is missing', async () => {
     h = spawnRunner('happy', ['--dsh-bin', '/nonexistent/dsh']);
     const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
