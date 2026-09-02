@@ -82,7 +82,7 @@ curl -sS -X POST "http://127.0.0.1:<ipcPort>/api/asks" \
 # 飞书点选 + 提交后，curl 返回 {"kind":"answered","answers":[["deploy"],["unit","types"]],...} 即全链路 OK
 ```
 
-## 8. DSH / dsh-tui question bridge（计划实现）
+## 8. DSH / dsh-tui question bridge
 
 DSH 不走 Claude/OpenCode 原生 hook 文件，而是由 botmux 在启动 DSH profile 时临时追加 `--patch=<bridgePatch>`：
 
