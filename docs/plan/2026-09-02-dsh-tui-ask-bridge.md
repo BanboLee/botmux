@@ -166,7 +166,7 @@
       name: 'file:///abs/path/to/dsh-tui-wrapper.mjs'
 ```
 
-wrapper 必须重新导出原 dsh-tui 的 `Config`/`inject`，并在 `apply(ctx, config)` 中先安装 bridge，再调用原 dsh-tui `apply(ctx, config)`。这样在 legacy `registerProvider()` 单 seat 版本下，wrapper 可以临时 wrap `service.registerProvider()`，把 dsh-tui 原生 provider 包成 composite provider：botmux bridge first，失败/unsupported 再调用原生 provider。
+wrapper 必须重新导出原 dsh-tui 的 `Config`/`inject`，并在 `apply(ctx, config)` 中先安装 bridge，再调用原 dsh-tui `apply(ctx, effectiveConfig)`。`effectiveConfig` 优先使用 wrapper entry config；若为空，wrapper 必须从 `ctx.loader.entries()` 中找到被禁用的原 `id: dsh-tui` entry 并读取其 `options.config`，从而保留原 dsh-tui 的 provider/model/fullscreen/preset/workspace/sessionId 等配置。这样在 legacy `registerProvider()` 单 seat 版本下，wrapper 可以临时 wrap `service.registerProvider()`，把 dsh-tui 原生 provider 包成 composite provider：botmux bridge first，失败/unsupported 再调用原生 provider。
 
 ### 3.2 bridge 文件目录与并发安全
 
@@ -249,7 +249,7 @@ bridge plugin 伪代码：
 export const name = 'botmux-dsh-question-bridge'
 
 export function apply(ctx) {
-  const mode = process.env.BOTMUX_DSH_ASK_RUNTIME // 'official' | 'tui'
+  const mode = 'tui' // generated template constant: 'official' | 'tui'
   if (!isBotmuxSessionEnv(process.env)) return
   if (process.env.BOTMUX_DSH_ASK_BRIDGE === '0') return
 
@@ -274,6 +274,8 @@ export function apply(ctx) {
   }, { prepend: true })
 }
 ```
+
+runtime mode 由 bridge 生成器以模板常量内联（`const mode = 'official' | 'tui'`），不依赖 dsh-tui adapter 额外注入 env，避免 env 缺失导致 failure 行为跑错。
 
 `handleBridgeFailure()`：
 
@@ -318,7 +320,11 @@ function installLegacyCompositeProvider(service, bridgeAsk) {
 约束：
 
 - wrapper 只能用于 dsh-tui entry replacement，不用于 official dsh。
-- wrapper 必须在调用原始 `apply()` 之前安装 monkey patch，且在 `ctx.effect` teardown 时恢复原 `registerProvider`。
+- wrapper 必须在调用原始 `apply()` 之前安装 monkey patch，且先注册 cleanup：`ctx.effect(() => () => restore())`，同时用 `try/finally` 覆盖 `original.apply` 同步/异步抛错、`registerProvider` 抛错、未注册 provider 等路径。
+- wrap 应尽量 one-shot：只包装第一次由原始 dsh-tui 注册的 native provider；若后续其它 provider 注册，默认走原始 registerProvider，不扩大劫持范围。
+- `nativeProvider.ask` 的错误按原语义透传，不能吞掉。
+- wrapper import 原模块必须由生成器从当前 dsh-tui profile package 上下文解析：`createRequire(<profileDir>/package.json).resolve('@deepseek-harness-tui/dsh-tui/package.json')`，再读取 package `exports["."].import` 或 fallback `lib/types/index.js` 生成绝对 file URL；必须断言该 URL 不等于 wrapper 自身路径。
+- sandbox 下原始 dsh-tui package 位于 `~/.config/dsh`/`~/.dsh` profile node_modules，属于 dsh auth/profile 路径；若读不到，wrapper 不注入并保留原生 TUI。
 - 如果原始 dsh-tui 模块 import/apply 失败，失败应保持原行为可见，不能吞掉。
 - 如果 service 不是 legacy 或 waterfall，可走对应分支；无法识别则不接管。
 
@@ -386,7 +392,15 @@ bridge invoke hook 规则：
 | malformed hook stdout | try/catch → `next()` | visible malformed error | bridge test |
 | stdout 超上限 | kill → `next()` | visible stdout overflow error | bridge test |
 | request.signal abort | kill child；交还/abort | throw ASK_ABORTED | bridge test |
-| sandbox deny patch file | 无 patch 或启动失败要明确 | 无 patch 或启动失败要明确 | sandbox integration |
+| sandbox deny patch file | 不注入 wrapper 或启动失败要明确；不得半加载 | 不注入 bridge 或启动失败要明确 | sandbox integration |
+| wrapper 无法解析原 dsh-tui package | 不注入 wrapper，保留原生 TUI + 一次性提示 | 不适用 | wrapper test |
+| wrapper import 递归/等于自身 | 不注入 wrapper，保留原生 TUI + 一次性提示 | 不适用 | wrapper test |
+| 原 `dsh-tui` entry config 丢失 | 禁止继续，测试失败 | 不适用 | dump-config / wrapper test |
+| original.apply 抛错 | 恢复 registerProvider 后透传原错误 | 不适用 | wrapper test |
+| legacy registerProvider shape mismatch | 不注入 wrapper，保留原生 TUI | provider path visible error/noop | capability test |
+| native provider.ask reject | 按原生错误透传 | 不适用 | wrapper test |
+| runtime mode missing | 不可能：模板常量内联；若出现则 visible error | 同左 | generator test |
+| payload route spoof | hook 端忽略 payload 身份字段 | 同左 | ask-hook/router test |
 | 重复点击/文字回复 | 由 ask-broker 保证一次 settle | 同左 | 公共 ask 回归 |
 | daemon restart during ask | runHook requestId retry / ask-broker persist | 同左，受 backend survival 约束 | 复用现有 hook restart 测试或新增 |
 
@@ -456,7 +470,7 @@ git commit -m "test(dsh): 验证 question bridge cordis patch 语义"
 
 - bridge/wrapper 插件启动时必须做 runtime capability probe。
 - alpha/waterfall：普通 listener 可接管。
-- legacy official：仅在 service 无已有 provider 时注册 bridge provider；若 `DUPLICATE_PROVIDER` 则 visible error，不 spawn hook。
+- legacy official：仅在 botmux 生成的默认 profile 且 service 无已有 provider 时注册 bridge provider；若自定义 profile 或 `DUPLICATE_PROVIDER`，不抢 seat、不 spawn hook，让已有 provider 处理；如果无 provider 也无法注册，才 visible error。
 - legacy dsh-tui：必须通过 wrapper 改造 dsh-tui 原生 provider 为 composite provider；若 wrapper 无法安装或无法定位原 dsh-tui 模块，则不注入 bridge，保留原生 UI。
 - 不能确认可接管时不 spawn hook。
 - `asksViaHook` MVP 默认不置 true；等 capability 证据稳定后再考虑。
@@ -943,8 +957,8 @@ bunx vitest run test/ask-hook-dsh.test.ts test/dsh-question-bridge.test.ts test/
 MVP 不硬编码版本号，采用运行时能力检测：
 
 - 若能确认 `user-questions/request` waterfall 可 prepend 接管：启用 ordinary bridge。
-- 若 official dsh legacy 且无其它 provider：注册 legacy bridge provider；若 provider seat 已被占用则 visible error。
-- 若 dsh-tui legacy：优先使用 W0-T6 已验证的 wrapper/composite provider 路径；wrapper 能禁用原 entry、导入原 dsh-tui、wrap `registerProvider()` 时启用 botmux-first/native-fallback。
+- 若 official dsh legacy 且处于 botmux 生成的默认 profile、确认无其它 provider：注册 legacy bridge provider；若 provider seat 已被占用或使用自定义 profile 且无法证明无 provider，则不抢 seat、不 spawn hook，让已有 provider 处理；无 provider 时才输出 visible error。
+- 若 dsh-tui legacy：优先使用 W0-T6 已验证的 wrapper/composite provider 路径；wrapper 能禁用原 entry、导入原 dsh-tui、读取原 `dsh-tui` entry config、wrap `registerProvider()` 时启用 botmux-first/native-fallback。
 - 若 dsh-tui wrapper 安装失败、无法导入原模块、无法 wrap provider 或能力检测失败：不 spawn hook，降级为原生 TUI。
 - 检测失败时：bridge 不 spawn hook；必要时在 runner/display 中输出一次性提示，例如：
 
