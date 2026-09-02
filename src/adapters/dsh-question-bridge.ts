@@ -181,9 +181,14 @@ function installWaterfallBridge(ctx) {
 
 function installLegacyOfficialProvider(ctx, service) {
   if (service.provider !== undefined) return undefined;
-  const dispose = service.registerProvider({ ask: request => bridgeAsk(request, () => Promise.reject(bridgeError('BOTMUX_ASK_BRIDGE_UNAVAILABLE', 'botmux question bridge declined request'))) });
-  try { ctx.effect(() => dispose, 'botmux-dsh-question-bridge.legacy-provider'); } catch {}
-  return dispose;
+  try {
+    const dispose = service.registerProvider({ ask: request => bridgeAsk(request, () => Promise.reject(bridgeError('BOTMUX_ASK_BRIDGE_UNAVAILABLE', 'botmux question bridge declined request'))) });
+    try { ctx.effect(() => dispose, 'botmux-dsh-question-bridge.legacy-provider'); } catch {}
+    return dispose;
+  } catch (error) {
+    if (error && error.code === 'DUPLICATE_PROVIDER') return undefined;
+    throw error;
+  }
 }
 `;
 }
