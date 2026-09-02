@@ -937,7 +937,7 @@ bunx vitest run test/ask-hook-dsh.test.ts test/dsh-question-bridge.test.ts test/
 ### 实现 Todo
 
 - [x] W1-T1：实现 DSH ask-hook adapter。
-- [ ] W1-T2：实现 content-addressed bridge 生成器。
+- [x] W1-T2：实现 content-addressed bridge 生成器。
 - [ ] W2-T1：official dsh runner 通过临时 `--patch=` 注入 bridge。
 - [ ] W2-T2：dsh-tui adapter 通过临时 `--patch=` 注入 bridge。
 - [ ] W3-T1：公共 ask 链路回归保护；默认不改公共 ask。
