@@ -15,7 +15,7 @@
 // Extracted from dashboard.ts so the env each child actually receives can be
 // asserted in a test — dashboard.ts is a side-effect module (importing it binds
 // ports and starts probes), so nothing inside it is reachable from a unit test.
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { botmuxCliEntry } from '../utils/install-info.js';
 import { resolveCliSpawn } from '../core/self-spawn.js';
 import { globalInstallUpdateCwd } from '../core/maintenance.js';
@@ -168,4 +168,23 @@ export function runLocalDevStep(dir: string, command: string, args: string[]): P
       else reject(new Error(`\`${command} ${args.join(' ')}\` exited ${code}: ${tail.trim().slice(-800)}`));
     });
   });
+}
+
+/**
+ * Run `dsh plugin --profile <name> add <pkg>` to install profile dependencies
+ * after seeding a new profile skeleton. Synchronous — the dashboard only calls
+ * this during POST /api/dsh/profiles creation, which is already a short-lived
+ * request handler. Uses redacted env (no Feishu H5 credentials for the child).
+ * Throws on failure so the caller can surface the error. */
+export function installDshProfileDeps(profileName: string, dshBin: string): void {
+  const result = spawnSync(dshBin, ['plugin', '--profile', profileName, 'add', '@deepseek-ai/dsh-sdk-jsonrpc-server@next'], {
+    env: redactChildEnv(process.env),
+    stdio: 'pipe',
+    timeout: 120_000,
+  });
+  if (result.status !== 0 || result.error) {
+    const stderr = result.stderr?.toString().trim() || '';
+    const msg = `dsh plugin add failed for profile "${profileName}" (exit ${result.status ?? 'error'}): ${stderr || result.error?.message || 'unknown error'}`;
+    throw new Error(msg);
+  }
 }
