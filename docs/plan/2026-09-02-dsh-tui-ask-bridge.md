@@ -27,7 +27,7 @@
 1. **botmux 内置 DSH question bridge 插件 / dsh-tui wrapper 插件**
    - botmux 生成内容寻址、只读 Cordis 插件文件。
    - official dsh：使用普通 bridge 插件；新版 waterfall 下监听 `user-questions/request`，legacy 且无 provider 时注册 bridge provider。
-   - dsh-tui：使用 wrapper 插件替换 `id: dsh-tui` 的 entry `name`，wrapper 先安装 bridge，再导入并调用原始 dsh-tui `apply()`；这样 legacy `registerProvider` 下可 wrap dsh-tui 自己注册的 provider，实现“botmux first、原生 TUI fallback”，而不修改 dsh-tui 源码。
+   - dsh-tui：使用 wrapper patch 禁用原 `id: dsh-tui` entry，并插入唯一 id wrapper entry；wrapper 先安装 bridge，再导入并调用原始 dsh-tui `apply()`；这样 legacy `registerProvider` 下可 wrap dsh-tui 自己注册的 provider，实现“botmux first、原生 TUI fallback”，而不修改 dsh-tui 源码。
    - 插件只处理可完整表示为 botmux ask 的 request；不可处理时按 runtime 模式 fallback 或显式失败。
    - 插件通过稳定的 `hookCommandParts(<cliId>)` 调用当前 botmux 实例的 `botmux hook dsh` / `botmux hook dsh-tui`。
 
@@ -99,7 +99,7 @@
 - `src/dsh-runner.ts`
   - official dsh runner 追加临时 `--patch=<bridgePatch>`。
   - 不修改 profile `cordis.patch.yml` 持久内容。
-  - 可向 child env 注入 `BOTMUX_DSH_ASK_RUNTIME=official` 与受控 ask timeout。
+  - 可向 child env 注入受控 ask timeout；runtime mode 不走 env，必须由 generated template 常量内联。
 
 - `src/adapters/cli/dsh.ts`
   - 如需从 adapter 传入 bridge enable/disable 或 dshProfile，最小修改。
@@ -287,15 +287,26 @@ runtime mode 由 bridge 生成器以模板常量内联（`const mode = 'official
 当前实装 `dsh 0.1.1-rc.2` 仍是 legacy `registerProvider()` 单 seat。因为 dsh-tui 自身会注册 `QuestionStore` provider，单纯追加一个 bridge row 要么抢不到 seat，要么抢先导致 dsh-tui provider 注册失败。因此 dsh-tui 必须使用 wrapper entry：
 
 ```js
-import * as original from '@deepseek-harness-tui/dsh-tui'
+import * as original from 'file:///abs/resolved/original/dsh-tui/lib/types/index.js'
 
 export const name = original.name
 export const inject = original.inject
 export const Config = original.Config
 
+function originalDshTuiConfig(ctx, wrapperConfig) {
+  if (wrapperConfig && Object.keys(wrapperConfig).length > 0) return wrapperConfig
+  const entry = [...ctx.loader.entries()].find(entry => entry.options.id === 'dsh-tui')
+  return entry?.options?.config ?? {}
+}
+
 export async function apply(ctx, config) {
-  installBotmuxQuestionBridge(ctx, { runtime: 'tui', fallbackMode: 'native' })
-  return original.apply(ctx, config)
+  const restore = installBotmuxQuestionBridge(ctx, { runtime: 'tui', fallbackMode: 'native' })
+  const effectiveConfig = originalDshTuiConfig(ctx, config)
+  try {
+    return await original.apply(ctx, effectiveConfig)
+  } finally {
+    restore?.()
+  }
 }
 ```
 
@@ -381,7 +392,7 @@ bridge invoke hook 规则：
 |---|---|---|---|
 | 非 botmux env | bridge no-op | bridge no-op | 插件 apply 不 spawn |
 | `BOTMUX_DSH_ASK_BRIDGE=0` | 不注入 patch / 插件 no-op | 不注入 patch / 插件 no-op | adapter args 无 `--patch` |
-| DSH 只支持 legacy provider | wrapper 将原生 provider 包成 composite：bridge 失败回原生；wrapper 不可用则不注入 | provider seat 空时注册 bridge；seat 被占用则 visible error | W0 capability test + wrapper test |
+| DSH 只支持 legacy provider | wrapper 将原生 provider 包成 composite：bridge 失败回原生；wrapper 不可用则不注入 | botmux 默认 profile 且 seat 空时注册 bridge；自定义 profile/seat 被占用时不接管，让已有 provider 处理；无 provider 且无法注册才 visible error | W0 capability test + wrapper test |
 | request text-only | `next()` 原生 UI | throw visible unsupported error | 单测 |
 | request plan-review | `next()` 原生 UI | throw visible unsupported error | 单测 |
 | 多问中有一题 unsupported | 整体 `next()` | 整体 visible error | 单测 |
@@ -607,14 +618,28 @@ git commit -m "feat(dsh): 增加 userQuestions ask hook 适配器"
 **核心代码片段**：
 
 ```ts
-export function ensureDshQuestionBridgePatch(cliId: 'dsh' | 'dsh-tui'): DshQuestionBridgePatch | null {
+export function ensureDshQuestionBridgePatch(opts: {
+  cliId: 'dsh' | 'dsh-tui';
+  dshProfileDir?: string;
+}): DshQuestionBridgePatch | null {
   if (process.env.BOTMUX_DSH_ASK_BRIDGE === '0') return null;
-  const parts = hookCommandParts(cliId);
-  const content = buildBridgePlugin({ cmd: parts.cmd, args: parts.args, runtime: cliId === 'dsh-tui' ? 'tui' : 'official' });
+  const parts = hookCommandParts(opts.cliId);
+  const runtime = opts.cliId === 'dsh-tui' ? 'tui' : 'official';
+  const originalDshTuiUrl = runtime === 'tui'
+    ? resolveOriginalDshTuiEntryUrl(opts.dshProfileDir)
+    : undefined;
+  if (runtime === 'tui' && !originalDshTuiUrl) return null;
+  const content = runtime === 'tui'
+    ? buildDshTuiWrapperPlugin({ cmd: parts.cmd, args: parts.args, originalDshTuiUrl: originalDshTuiUrl! })
+    : buildOrdinaryBridgePlugin({ cmd: parts.cmd, args: parts.args });
   const hash = sha256(content + '\n' + JSON.stringify(parts)).slice(0, 16);
   const root = join(homedir(), '.botmux', 'dsh-question-bridge', hash);
-  atomicWriteFileSync(join(root, 'bridge.mjs'), content, 0o600);
-  atomicWriteFileSync(join(root, 'cordis.patch.yml'), buildPatch(pathToFileURL(join(root, 'bridge.mjs')).href), 0o600);
+  const pluginPath = join(root, runtime === 'tui' ? 'dsh-tui-wrapper.mjs' : 'bridge.mjs');
+  atomicWriteFileSync(pluginPath, content, 0o600);
+  const patch = runtime === 'tui'
+    ? buildDshTuiWrapperPatch(pathToFileURL(pluginPath).href, hash)
+    : buildOrdinaryBridgePatch(pathToFileURL(pluginPath).href, hash);
+  atomicWriteFileSync(join(root, 'cordis.patch.yml'), patch, 0o600);
   return { patchPath: join(root, 'cordis.patch.yml'), readonlyRoot: root };
 }
 ```
@@ -645,7 +670,7 @@ git commit -m "feat(dsh): 生成 question bridge profile patch"
 ```ts
 const dshArgs = ['--profile', profileName];
 if (bridgePatch) dshArgs.push(`--patch=${bridgePatch.patchPath}`);
-spawn(dshBin, dshArgs, { env: { ...process.env, BOTMUX_DSH_ASK_RUNTIME: 'official', BOTMUX_DSH_ASK_TIMEOUT_MS: String(Math.max(1000, args.turnTimeoutMs - 5000)) } });
+spawn(dshBin, dshArgs, { env: { ...process.env, BOTMUX_DSH_ASK_TIMEOUT_MS: String(Math.max(1000, args.turnTimeoutMs - 5000)) } });
 ```
 
 - 确认不修改 `~/.dsh/profiles/<name>/cordis.patch.yml`。
@@ -941,11 +966,11 @@ bunx vitest run test/ask-hook-dsh.test.ts test/dsh-question-bridge.test.ts test/
 
 ## 8. W0 结果记录区
 
-> 当前为空。进入实现前必须补齐。
+> 已补齐。W0-T3 识别出当前安装 target 为 legacy 并触发 wrapper 方案修订；W0-T6 验证修订后方案可行。
 
 - W0-T1：PASS。临时 fake `dsh` 探测确认：`dsh-tui --patch=/tmp/p1.yml --resume abc --patch=/tmp/p2.yml /tmp/workspace-target` 最终调用 `dsh --profile dsh-tui --patch=/tmp/p1.yml --patch=/tmp/p2.yml`，`--resume` 被 launcher 消费为 env，绝对 workspace target 不透传；双 token `--patch /tmp/p1.yml` 会只透传 `--patch`，路径被 launcher 当 workspace target 吃掉。因此实现必须使用单 token `--patch=/abs/path`，并由测试锁定。
 - W0-T2：PASS。源码与 /tmp 临时脚本验证：顶层 `- insert:` 会插入 root entries；`name: file:///abs/bridge.mjs` 可被 Loader import；重复 id 会在 Loader group 层报 `duplicate loader entry id`，所以 bridge row id 必须使用包含短 hash 的唯一 id；`ctx.on(..., { prepend: true })` 通过 `unshift` 排在普通 listener 前；root/unscoped listener 能收到 agent-scoped `user-questions/request`，条件不接管时必须显式 `return next()`。相对 `./bridge.mjs` 也可按 overlay parser 锚定到 patch 目录，但 MVP 固定使用绝对 file URL 规避歧义。
-- W0-T3：FAIL for 当前安装 target / PASS for alpha source。当前实际 `dsh --version` 是 `0.1.1-rc.2`，其 `@deepseek-ai/dsh-user-questions` 是 legacy `registerProvider()` 单 provider seat，没有 `user-questions/request` waterfall；`/data00/home/lixingxin/project/deepseek-harness` 源码 `0.1.2-alpha.4` 已支持 waterfall。official botmux profile 在 legacy 下没有 TUI/Web provider，可注册 bridge provider；dsh-tui legacy 下自身会注册 QuestionStore provider，普通追加 bridge row 不可靠，必须改为 dsh-tui wrapper entry：先安装 composite/wrapped provider，再调用原始 dsh-tui apply；wrapper 不可行时不接管并保留原生 TUI。
+- W0-T3：PASS（能力分类结果触发方案修订）。当前实际 `dsh --version` 是 `0.1.1-rc.2`，其 `@deepseek-ai/dsh-user-questions` 是 legacy `registerProvider()` 单 provider seat，没有 `user-questions/request` waterfall；`/data00/home/lixingxin/project/deepseek-harness` 源码 `0.1.2-alpha.4` 已支持 waterfall。official botmux profile 在 legacy 下没有 TUI/Web provider，可注册 bridge provider；dsh-tui legacy 下自身会注册 QuestionStore provider，普通追加 bridge row 不可靠，必须改为 dsh-tui wrapper entry：先安装 composite/wrapped provider，再调用原始 dsh-tui apply；wrapper 不可行时不接管并保留原生 TUI。
 - W0-T4：PASS。静态审查确认 adapter `sandboxReadonlyPaths()` 会在 worker 中汇入 readonlyRoots 并由 fs-policy 编译；目录必须在 buildFsPolicy 前创建。`hookCommandParts()` 在 Node 态使用当前 checkout 的 `dist/cli.js`，standalone 态直接 `<binary> hook ...`，避免 `$bunfs` 和 global shim 漂移。sandbox 写 `/run/sbxbin/botmux` shim，并把 `/run/sbxbin` 与 canonical node/CLI bin dirs 放入 PATH；bridge 使用 argv spawn 不依赖 shell。worker/tmux/sandbox 会注入 `BOTMUX_SESSION_ID/CHAT_ID/LARK_APP_ID/ROOT_MESSAGE_ID/BOTMUX_DAEMON_IPC_PORT` 与 capability relay，daemon `/api/asks` 对非 trusted-host 请求校验 capability 并绑定 daemon 侧 session/chat/app 身份。已跑回归：`bun test test/hook-command-compiled-form.test.ts test/sandbox-shim-compiled-form.test.ts test/sandbox-relay-watcher.test.ts test/session-ready-cli.test.ts test/read-isolation.test.ts`，结果 113 pass / 0 fail。
 - W0-T5：PASS。源码与临时脚本验证：DSH `AskUserQuestionAnswerItem.selected` 明确是 option label，不存在协议级 hidden value/index；推荐标记也是 label 文本的一部分。DSH 原生 UI/Store 对重复、空、多行、超长、Markdown label 基本不强校验，但 botmux bridge 为可表示性和回写确定性收紧：label 必须非空、非纯空白、单行、长度 <= 200、同一 question 内 exact string 唯一，并且 answer 回写原始 label 不 trim。text-only 是 DSH 原生能力但 MVP bridge unsupported；plan-review 语义特殊不接管；mixed request 无部分 claim 协议，整体 fallback/error。
 - W0-T6：PASS after revision。原“按 `id: dsh-tui` 直接替换 `name`”方案失败：DSH patch 的 `name` 是 mismatch guard，不是 override 字段，会 warn 并 skip。修订方案为“disable 原 `id: dsh-tui` + root insert 唯一 id wrapper”：`dsh --profile dsh-tui --patch=/tmp/.../wrapper.patch.yml --dump-config` 证明原 entry 可 `disabled: true`，wrapper row 可插入且无 duplicate id；用当前实际 profile 的原始 dsh-tui `lib/types/index.js` 绝对 file URL，真实启动时 wrapper marker 写入成功，说明 wrapper 可 import 原始 dsh-tui 并执行；独立 JS 探针验证 legacy `registerProvider` 可被临时 wrap 成 composite provider，bridgeable 走 bridge，unsupported/failure 走 native provider，并在 dispose 后恢复。实现时必须生成 wrapper patch 而非普通追加 bridge row；wrapper 需要用当前 profile 中原始 dsh-tui package 的 resolved absolute file URL，避免 import 包名递归到自身；W4 smoke 仍需覆盖真实交互式 TTY 下 wrapper 启动。
@@ -956,9 +981,8 @@ bunx vitest run test/ask-hook-dsh.test.ts test/dsh-question-bridge.test.ts test/
 
 MVP 不硬编码版本号，采用运行时能力检测：
 
-- 若能确认 `user-questions/request` waterfall 可 prepend 接管：启用 ordinary bridge。
-- 若 official dsh legacy 且处于 botmux 生成的默认 profile、确认无其它 provider：注册 legacy bridge provider；若 provider seat 已被占用或使用自定义 profile 且无法证明无 provider，则不抢 seat、不 spawn hook，让已有 provider 处理；无 provider 时才输出 visible error。
-- 若 dsh-tui legacy：优先使用 W0-T6 已验证的 wrapper/composite provider 路径；wrapper 能禁用原 entry、导入原 dsh-tui、读取原 `dsh-tui` entry config、wrap `registerProvider()` 时启用 botmux-first/native-fallback。
+- official dsh：若能确认 `user-questions/request` waterfall 可 prepend 接管，启用 ordinary bridge；若 legacy 且处于 botmux 生成的默认 profile、确认无其它 provider，则注册 legacy bridge provider；若 provider seat 已被占用或使用自定义 profile 且无法证明无 provider，则不抢 seat、不 spawn hook，让已有 provider 处理；无 provider 且无法注册时才输出 visible error。
+- dsh-tui：优先使用 wrapper patch（disable 原 entry + insert wrapper）。wrapper 内对 alpha/waterfall 安装 prepend bridge，对 legacy `registerProvider` 安装 composite provider；wrapper 能导入原 dsh-tui、读取原 `dsh-tui` entry config、wrap provider 时启用 botmux-first/native-fallback。
 - 若 dsh-tui wrapper 安装失败、无法导入原模块、无法 wrap provider 或能力检测失败：不 spawn hook，降级为原生 TUI。
 - 检测失败时：bridge 不 spawn hook；必要时在 runner/display 中输出一次性提示，例如：
 
