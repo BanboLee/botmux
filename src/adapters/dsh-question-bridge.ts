@@ -254,12 +254,12 @@ function wrapLegacyProvider(service) {
   return restore;
 }
 export async function apply(ctx, config) {
-  if (!isBotmuxSessionEnv(process.env) || process.env.BOTMUX_DSH_ASK_BRIDGE === '0') return original.apply(ctx, config);
+  const effectiveConfig = originalDshTuiConfig(ctx, config);
+  if (!isBotmuxSessionEnv(process.env) || process.env.BOTMUX_DSH_ASK_BRIDGE === '0') return original.apply(ctx, effectiveConfig);
   const service = ctx.get && ctx.get('userQuestions');
   const restore = service && typeof service.registerProvider === 'function'
     ? wrapLegacyProvider(service)
     : installWaterfallBridge(ctx);
-  const effectiveConfig = originalDshTuiConfig(ctx, config);
   try { return await original.apply(ctx, effectiveConfig); }
   finally { try { restore && restore(); } catch {} }
 }
