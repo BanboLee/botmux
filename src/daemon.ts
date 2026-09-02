@@ -675,7 +675,12 @@ let sessionsRestored = false;
 function scheduleRestoredStreamingCardPinRecovery(larkAppId: string): void {
   queueMicrotask(() => {
     try {
-      reconcileRestoredStreamingCardPins(larkAppId);
+      Promise.resolve(reconcileRestoredStreamingCardPins(larkAppId)).catch((err) => {
+        logger.warn(
+          `[card-pin] startup restore reconcile failed for ${larkAppId}: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
     } catch (err) {
       logger.warn(
         `[card-pin] startup restore reconcile failed for ${larkAppId}: `
