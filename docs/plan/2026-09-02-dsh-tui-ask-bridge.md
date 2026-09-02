@@ -804,7 +804,7 @@ bunx vitest run test/ask-hook-dsh.test.ts test/dsh-question-bridge.test.ts test/
 ### W0 硬门禁 Todo
 
 - [x] W0-T1：验证 dsh-tui `--patch=/abs/path` 透传、顺序、多 patch、resume/workspace 交互。
-- [ ] W0-T2：验证 Cordis patch schema、file URL 插件加载、root insert、prepend、id 冲突。
+- [x] W0-T2：验证 Cordis patch schema、file URL 插件加载、root insert、prepend、id 冲突。
 - [ ] W0-T3：验证 DSH userQuestions waterfall / legacy 能力检测与门控。
 - [ ] W0-T4：验证 sandbox 下 bridge 文件可读、hook command 可执行、capability 可用。
 - [ ] W0-T5：验证 DSH answer schema 与 option label/key 语义。
@@ -845,7 +845,7 @@ bunx vitest run test/ask-hook-dsh.test.ts test/dsh-question-bridge.test.ts test/
 > 当前为空。进入实现前必须补齐。
 
 - W0-T1：PASS。临时 fake `dsh` 探测确认：`dsh-tui --patch=/tmp/p1.yml --resume abc --patch=/tmp/p2.yml /tmp/workspace-target` 最终调用 `dsh --profile dsh-tui --patch=/tmp/p1.yml --patch=/tmp/p2.yml`，`--resume` 被 launcher 消费为 env，绝对 workspace target 不透传；双 token `--patch /tmp/p1.yml` 会只透传 `--patch`，路径被 launcher 当 workspace target 吃掉。因此实现必须使用单 token `--patch=/abs/path`，并由测试锁定。
-- W0-T2：未执行。
+- W0-T2：PASS。源码与 /tmp 临时脚本验证：顶层 `- insert:` 会插入 root entries；`name: file:///abs/bridge.mjs` 可被 Loader import；重复 id 会在 Loader group 层报 `duplicate loader entry id`，所以 bridge row id 必须使用包含短 hash 的唯一 id；`ctx.on(..., { prepend: true })` 通过 `unshift` 排在普通 listener 前；root/unscoped listener 能收到 agent-scoped `user-questions/request`，条件不接管时必须显式 `return next()`。相对 `./bridge.mjs` 也可按 overlay parser 锚定到 patch 目录，但 MVP 固定使用绝对 file URL 规避歧义。
 - W0-T3：未执行。
 - W0-T4：未执行。
 - W0-T5：未执行。
