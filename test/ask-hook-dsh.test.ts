@@ -56,6 +56,19 @@ describe('DSH user-questions hook adapter', () => {
       expect(parsed!.questions[0].multiSelect).toBe(false);
     });
 
+    it('ignores spoofed routing fields in the payload', () => {
+      const parsed = dsh.parseQuestions({
+        ...singlePayload,
+        sessionId: 'evil-session',
+        chatId: 'evil-chat',
+        larkAppId: 'evil-app',
+        rootMessageId: 'evil-root',
+      });
+      expect(parsed).not.toBeNull();
+      expect(JSON.stringify(parsed!.raw)).not.toContain('evil-session');
+      expect(JSON.stringify(parsed!.raw)).not.toContain('evil-chat');
+    });
+
     it('supports multi-question and multiSelect', () => {
       const parsed = dsh.parseQuestions(multiPayload);
       expect(parsed).not.toBeNull();
