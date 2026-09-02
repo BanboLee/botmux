@@ -126,6 +126,59 @@ describe('DSH question bridge file generation', () => {
     expect(url).toContain('/node_modules/@deepseek-harness-tui/dsh-tui/lib/types/index.js');
   });
 
+  it('generated ordinary bridge registers a legacy provider when the seat is empty', async () => {
+    const home = tmp();
+    const hook = makeHookScript(home, `
+let input = '';
+process.stdin.on('data', d => { input += d.toString('utf8'); });
+process.stdin.on('end', () => process.stdout.write(JSON.stringify({ answers: [{ id: 'q', selected: ['Yes'] }] })));
+`);
+    process.env.BOTMUX_SESSION_ID = 's';
+    process.env.BOTMUX_CHAT_ID = 'c';
+    process.env.BOTMUX_LARK_APP_ID = 'app';
+    const result = ensureDshQuestionBridgePatch({
+      cliId: 'dsh',
+      homeDir: home,
+      hookCommand: { cmd: process.execPath, args: [hook] },
+      buildSalt: 'legacy-official',
+    })!;
+    const mod = await import(`${pathToFileURL(result.pluginPath).href}?case=${Date.now()}`);
+    const service: any = {
+      provider: undefined,
+      registerProvider(provider: any) { this.provider = provider; return () => { this.provider = undefined; }; },
+    };
+    mod.apply({ get: (name: string) => name === 'userQuestions' ? service : undefined, effect: () => undefined });
+    const answer = await service.provider.ask({ questions: [{ id: 'q', question: 'Q?', options: [{ label: 'Yes' }, { label: 'No' }] }] });
+    expect(answer).toEqual({ answers: [{ id: 'q', selected: ['Yes'] }] });
+    delete process.env.BOTMUX_SESSION_ID;
+    delete process.env.BOTMUX_CHAT_ID;
+    delete process.env.BOTMUX_LARK_APP_ID;
+  });
+
+  it('generated ordinary bridge does not take an occupied legacy provider seat', async () => {
+    const home = tmp();
+    const result = ensureDshQuestionBridgePatch({
+      cliId: 'dsh',
+      homeDir: home,
+      hookCommand: { cmd: '/bin/current-botmux', args: ['hook', 'dsh'] },
+      buildSalt: 'legacy-occupied',
+    })!;
+    process.env.BOTMUX_SESSION_ID = 's';
+    process.env.BOTMUX_CHAT_ID = 'c';
+    process.env.BOTMUX_LARK_APP_ID = 'app';
+    const mod = await import(`${pathToFileURL(result.pluginPath).href}?case=${Date.now()}`);
+    const existing = { ask: async () => ({ answers: [] }) };
+    const service: any = {
+      provider: existing,
+      registerProvider() { throw Object.assign(new Error('duplicate'), { code: 'DUPLICATE_PROVIDER' }); },
+    };
+    mod.apply({ get: (name: string) => name === 'userQuestions' ? service : undefined, effect: () => undefined });
+    expect(service.provider).toBe(existing);
+    delete process.env.BOTMUX_SESSION_ID;
+    delete process.env.BOTMUX_CHAT_ID;
+    delete process.env.BOTMUX_LARK_APP_ID;
+  });
+
   it('generated ordinary bridge claims waterfall requests through the hook command', async () => {
     const home = tmp();
     const hook = makeHookScript(home, `
