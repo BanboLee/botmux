@@ -335,7 +335,7 @@ function installLegacyCompositeProvider(service, bridgeAsk) {
 - wrapper 必须在调用原始 `apply()` 之前安装 monkey patch，且先注册 cleanup：`ctx.effect(() => () => restore())`，同时用 `try/finally` 覆盖 `original.apply` 同步/异步抛错、`registerProvider` 抛错、未注册 provider 等路径。
 - wrap 应尽量 one-shot：只包装第一次由原始 dsh-tui 注册的 native provider；若后续其它 provider 注册，默认走原始 registerProvider，不扩大劫持范围。
 - `nativeProvider.ask` 的错误按原语义透传，不能吞掉。
-- wrapper import 原模块必须由生成器从当前 dsh-tui profile package 上下文解析：`createRequire(<profileDir>/package.json).resolve('@deepseek-harness-tui/dsh-tui/package.json')`，再读取 package `exports["."].import` 或 fallback `lib/types/index.js` 生成绝对 file URL；必须断言该 URL 不等于 wrapper 自身路径。
+- wrapper import 原模块必须由生成器从当前 dsh-tui profile package 上下文解析：优先检查 `<profileDir>/node_modules/@deepseek-harness-tui/dsh-tui/package.json`；否则用 `createRequire(<profileDir>/package.json).resolve('@deepseek-harness-tui/dsh-tui')` 解析公开入口，再向上定位 package root，读取 `exports["."].import` 或 fallback `lib/types/index.js` 生成绝对 file URL；不得依赖未公开的 `@deepseek-harness-tui/dsh-tui/package.json` 子路径；必须断言该 URL 不等于 wrapper 自身路径。
 - sandbox 下原始 dsh-tui package 位于 `~/.config/dsh`/`~/.dsh` profile node_modules，属于 dsh auth/profile 路径；若读不到，wrapper 不注入并保留原生 TUI。
 - 如果原始 dsh-tui 模块 import/apply 失败，失败应保持原行为可见，不能吞掉。
 - 如果 service 不是 legacy 或 waterfall，可走对应分支；无法识别则不接管。
