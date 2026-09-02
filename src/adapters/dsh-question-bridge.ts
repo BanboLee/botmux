@@ -116,6 +116,7 @@ function runHook(payload, signal) {
     let settled = false;
     let out = '';
     let child;
+    let timer;
     const done = (result) => {
       if (settled) return;
       settled = true;
@@ -127,7 +128,6 @@ function runHook(payload, signal) {
       try { child && child.kill(); } catch {}
       done({ ok: false, reason: 'aborted', detail: 'ask_user_question was aborted' });
     };
-    let timer;
     try {
       child = spawn(CMD, ARGS, {
         stdio: ['pipe', 'pipe', 'ignore'],
