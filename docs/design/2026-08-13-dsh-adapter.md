@@ -209,7 +209,20 @@ runner 在首轮用户消息前插入（后续轮不插）：
 4. **双重沙箱**：默认 cordis.yml 不含 landlock 沙箱插件，v1 靠 botmux 沙箱兜底，无冲突。
 5. **密钥**：DEEPSEEK_API_KEY 走 bots.json env 注入，不进配置文件、不落盘。
 
-## 11. 已知限制（v2 backlog）
+## 11. ask_user_question bridge（2026-09-02）
+
+botmux 不改 dsh-tui 源码，而是通过 DSH profile overlay 注入一个 botmux 生成的 question bridge：
+
+- official `dsh` runner：启动 `dsh --profile <name> --patch=<bridgePatch>`，patch 只对本次进程生效，不写用户 profile 的 `cordis.patch.yml`。
+- `dshRuntime='tui'`：启动 `dsh-tui --patch=<bridgePatch>`，且必须使用单 token `--patch=/abs/path`；split form `--patch /abs/path` 会被 dsh-tui launcher 的 workspace-target 逻辑吞掉 path。
+- 新版 DSH（waterfall）：bridge 监听 `user-questions/request`，用 `{ prepend: true }` 抢在原生 answerer 前；unsupported 时 dsh-tui `next()` 回原生 UI，official dsh 抛可见错误。
+- legacy DSH（`registerProvider()` 单 seat）：official botmux 默认 profile 无原生 provider，可注册 bridge provider；dsh-tui 则使用 wrapper patch（disable 原 `id: dsh-tui` + insert 唯一 wrapper entry），wrapper 先临时 wrap `registerProvider()`，把 dsh-tui 原生 provider 包成 composite provider：botmux-first、失败/unsupported 时 native fallback。
+- bridge 调 `botmux hook dsh` / `botmux hook dsh-tui` 必须使用 `hookCommandParts()` 生成 argv，不能依赖全局 shim、shell 字符串或手写 `dist/cli.js` 路径。
+- 路由身份仍由 worker 注入 env/capability 与 daemon `/api/asks` 绑定，bridge payload 不携带也不信任 session/chat/root/app 身份。
+- MVP 只接管每题都有 >=2 个合法 option label 的 request；text-only、plan-review、混合 unsupported request 整体 fallback/error。
+- 线上回滚：设置 `BOTMUX_DSH_ASK_BRIDGE=0`，然后重启 daemon/worker 或对会话执行 `/restart`，新进程不再注入 bridge patch。
+
+## 12. 已知限制（v2 backlog）
 
 - **跨重启 resume**：dsh SDK server 无 create-or-resume；`agents.create` 不 resume，持久化层拒绝同 ID 覆盖。runner 重启后开新会话（随机 sessionId）。需要 dsh 上游支持。
 - **中断/取消**：SDK 协议无 cancel；worker 杀 runner 重拉即取消，但会丢当前会话上下文（配合上一条，无法 resume）。

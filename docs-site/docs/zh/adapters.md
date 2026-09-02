@@ -54,6 +54,8 @@ runner 读取 `~/.dsh/settings.yaml` 的 `agent-default-model`（provider + mode
 
 会话 JSONL 落在 `~/.dsh/sessions/botmux/`；同一 runner 连接内多轮，daemon 重启后开新会话（不续上下文）。
 
+`ask_user_question` 通过 botmux 生成的临时 DSH profile patch 接入飞书 ask 卡片：official runner 直接注入 bridge；`dshRuntime: "tui"` 通过 dsh-tui wrapper patch 包住原生 question provider，优先飞书作答、不可表示时回退原生 TUI。若线上需要关闭，可设置 `BOTMUX_DSH_ASK_BRIDGE=0` 后重启会话。
+
 ## Mir CLI 与 MCP Bridge
 
 `botmux setup` 里选择 **Mira -> Mir CLI（本地 mircli）** 后，机器人配置会使用 `cliId: "mir"`。这个适配器通过本机 `mircli -p --lean` 执行，因此需要运行 botmux daemon 的同一系统用户已经完成 Mir CLI 登录和初始化。
