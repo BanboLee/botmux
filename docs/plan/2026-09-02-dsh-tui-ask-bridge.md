@@ -807,7 +807,7 @@ bunx vitest run test/ask-hook-dsh.test.ts test/dsh-question-bridge.test.ts test/
 - [x] W0-T2：验证 Cordis patch schema、file URL 插件加载、root insert、prepend、id 冲突。
 - [ ] W0-T3：验证 DSH userQuestions waterfall / legacy 能力检测与门控。
 - [ ] W0-T4：验证 sandbox 下 bridge 文件可读、hook command 可执行、capability 可用。
-- [ ] W0-T5：验证 DSH answer schema 与 option label/key 语义。
+- [x] W0-T5：验证 DSH answer schema 与 option label/key 语义。
 - [ ] 将 W0 验证结论写回本文；任一失败则停止后续实现。
 
 ### 实现 Todo
@@ -848,7 +848,7 @@ bunx vitest run test/ask-hook-dsh.test.ts test/dsh-question-bridge.test.ts test/
 - W0-T2：PASS。源码与 /tmp 临时脚本验证：顶层 `- insert:` 会插入 root entries；`name: file:///abs/bridge.mjs` 可被 Loader import；重复 id 会在 Loader group 层报 `duplicate loader entry id`，所以 bridge row id 必须使用包含短 hash 的唯一 id；`ctx.on(..., { prepend: true })` 通过 `unshift` 排在普通 listener 前；root/unscoped listener 能收到 agent-scoped `user-questions/request`，条件不接管时必须显式 `return next()`。相对 `./bridge.mjs` 也可按 overlay parser 锚定到 patch 目录，但 MVP 固定使用绝对 file URL 规避歧义。
 - W0-T3：未执行。
 - W0-T4：未执行。
-- W0-T5：未执行。
+- W0-T5：PASS。源码与临时脚本验证：DSH `AskUserQuestionAnswerItem.selected` 明确是 option label，不存在协议级 hidden value/index；推荐标记也是 label 文本的一部分。DSH 原生 UI/Store 对重复、空、多行、超长、Markdown label 基本不强校验，但 botmux bridge 为可表示性和回写确定性收紧：label 必须非空、非纯空白、单行、长度 <= 200、同一 question 内 exact string 唯一，并且 answer 回写原始 label 不 trim。text-only 是 DSH 原生能力但 MVP bridge unsupported；plan-review 语义特殊不接管；mixed request 无部分 claim 协议，整体 fallback/error。
 
 ---
 
