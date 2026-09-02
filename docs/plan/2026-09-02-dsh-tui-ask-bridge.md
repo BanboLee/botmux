@@ -942,9 +942,10 @@ bunx vitest run test/ask-hook-dsh.test.ts test/dsh-question-bridge.test.ts test/
 
 MVP 不硬编码版本号，采用运行时能力检测：
 
-- 若能确认 `user-questions/request` waterfall 可 prepend 接管：启用 bridge。
-- 若 official dsh legacy 且无其它 provider：可注册 legacy provider；必须测试。
-- 若 dsh-tui legacy 已有原生 provider：不接管，保留原生 TUI。
+- 若能确认 `user-questions/request` waterfall 可 prepend 接管：启用 ordinary bridge。
+- 若 official dsh legacy 且无其它 provider：注册 legacy bridge provider；若 provider seat 已被占用则 visible error。
+- 若 dsh-tui legacy：优先使用 W0-T6 已验证的 wrapper/composite provider 路径；wrapper 能禁用原 entry、导入原 dsh-tui、wrap `registerProvider()` 时启用 botmux-first/native-fallback。
+- 若 dsh-tui wrapper 安装失败、无法导入原模块、无法 wrap provider 或能力检测失败：不 spawn hook，降级为原生 TUI。
 - 检测失败时：bridge 不 spawn hook；必要时在 runner/display 中输出一次性提示，例如：
 
 ```text
