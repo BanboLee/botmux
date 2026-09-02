@@ -889,8 +889,8 @@ bunx vitest run test/ask-hook-dsh.test.ts test/dsh-question-bridge.test.ts test/
 - [x] W0-T3：验证 DSH userQuestions waterfall / legacy 能力检测与门控（当前安装 target 为 legacy，触发 wrapper 方案修订）。
 - [x] W0-T4：验证 sandbox 下 bridge 文件可读、hook command 可执行、capability 可用。
 - [x] W0-T5：验证 DSH answer schema 与 option label/key 语义。
-- [ ] W0-T6：验证 dsh-tui legacy wrapper 可行性。
-- [ ] 将 W0 验证结论写回本文；任一失败则停止后续实现。
+- [x] W0-T6：验证 dsh-tui legacy wrapper 可行性。
+- [x] 将 W0 验证结论写回本文；W0-T3 触发计划修订并新增 W0-T6，W0-T6 通过后允许继续实现。
 
 ### 实现 Todo
 
@@ -931,7 +931,7 @@ bunx vitest run test/ask-hook-dsh.test.ts test/dsh-question-bridge.test.ts test/
 - W0-T3：FAIL for 当前安装 target / PASS for alpha source。当前实际 `dsh --version` 是 `0.1.1-rc.2`，其 `@deepseek-ai/dsh-user-questions` 是 legacy `registerProvider()` 单 provider seat，没有 `user-questions/request` waterfall；`/data00/home/lixingxin/project/deepseek-harness` 源码 `0.1.2-alpha.4` 已支持 waterfall。official botmux profile 在 legacy 下没有 TUI/Web provider，可注册 bridge provider；dsh-tui legacy 下自身会注册 QuestionStore provider，普通追加 bridge row 不可靠，必须改为 dsh-tui wrapper entry：先安装 composite/wrapped provider，再调用原始 dsh-tui apply；wrapper 不可行时不接管并保留原生 TUI。
 - W0-T4：PASS。静态审查确认 adapter `sandboxReadonlyPaths()` 会在 worker 中汇入 readonlyRoots 并由 fs-policy 编译；目录必须在 buildFsPolicy 前创建。`hookCommandParts()` 在 Node 态使用当前 checkout 的 `dist/cli.js`，standalone 态直接 `<binary> hook ...`，避免 `$bunfs` 和 global shim 漂移。sandbox 写 `/run/sbxbin/botmux` shim，并把 `/run/sbxbin` 与 canonical node/CLI bin dirs 放入 PATH；bridge 使用 argv spawn 不依赖 shell。worker/tmux/sandbox 会注入 `BOTMUX_SESSION_ID/CHAT_ID/LARK_APP_ID/ROOT_MESSAGE_ID/BOTMUX_DAEMON_IPC_PORT` 与 capability relay，daemon `/api/asks` 对非 trusted-host 请求校验 capability 并绑定 daemon 侧 session/chat/app 身份。已跑回归：`bun test test/hook-command-compiled-form.test.ts test/sandbox-shim-compiled-form.test.ts test/sandbox-relay-watcher.test.ts test/session-ready-cli.test.ts test/read-isolation.test.ts`，结果 113 pass / 0 fail。
 - W0-T5：PASS。源码与临时脚本验证：DSH `AskUserQuestionAnswerItem.selected` 明确是 option label，不存在协议级 hidden value/index；推荐标记也是 label 文本的一部分。DSH 原生 UI/Store 对重复、空、多行、超长、Markdown label 基本不强校验，但 botmux bridge 为可表示性和回写确定性收紧：label 必须非空、非纯空白、单行、长度 <= 200、同一 question 内 exact string 唯一，并且 answer 回写原始 label 不 trim。text-only 是 DSH 原生能力但 MVP bridge unsupported；plan-review 语义特殊不接管；mixed request 无部分 claim 协议，整体 fallback/error。
-- W0-T6：未执行。新增原因：W0-T3 证明当前安装 dsh-tui target 是 legacy 单 provider seat，普通追加 bridge row 无法可靠接管；必须验证 wrapper entry replacement + composite provider 是否可行。
+- W0-T6：PASS。验证思路更新为“disable 原 `id: dsh-tui` + root insert wrapper”，因为 patch 机制不能直接替换 `name`（带 `name` 的 patch 是 name guard，mismatch 会 skip）。`dsh --profile dsh-tui --patch=/tmp/.../wrapper.patch.yml --dump-config` 证明原 `dsh-tui` entry 可被 `disabled: true`，并插入 wrapper row；用当前实际 profile 的原始 dsh-tui `lib/types/index.js` 绝对 file URL，真实启动时 wrapper marker 写入成功，说明 wrapper 可 import 原始 dsh-tui 并执行；独立 JS 探针验证 legacy `registerProvider` 可被临时 wrap 成 composite provider，bridgeable 走 bridge，unsupported 走 native provider，并在 dispose 后恢复。实现时必须生成 wrapper patch 而非普通追加 bridge row；wrapper 需要用当前 profile 中原始 dsh-tui package 的 resolved absolute file URL，避免 import 包名递归到自身。
 
 ---
 
