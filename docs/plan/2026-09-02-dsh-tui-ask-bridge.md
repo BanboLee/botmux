@@ -947,10 +947,10 @@ bunx vitest run test/ask-hook-dsh.test.ts test/dsh-question-bridge.test.ts test/
 
 ### 回滚与运营 Todo
 
-- [ ] 实现 `BOTMUX_DSH_ASK_BRIDGE=0` kill switch。
-- [ ] 测试 kill switch 下 official dsh / dsh-tui args 均无 `--patch=`。
-- [ ] 文档说明线上异常回滚步骤：设置 env → 重启 daemon/worker 或 `/restart` 会话。
-- [ ] 确认 bridge 目录内容寻址，不会被多 checkout 覆盖。
+- [x] 实现 `BOTMUX_DSH_ASK_BRIDGE=0` kill switch。
+- [x] 测试 kill switch 下 official dsh / dsh-tui args 均无 `--patch=`。
+- [x] 文档说明线上异常回滚步骤：设置 env → 重启 daemon/worker 或 `/restart` 会话。
+- [x] 确认 bridge 目录内容寻址，不会被多 checkout 覆盖。
 
 ### 验收 Todo
 
