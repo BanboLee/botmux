@@ -112,7 +112,8 @@ describe('DSH question bridge file generation', () => {
     expect(patch).toContain('- id: dsh-tui\n  disabled: true');
     expect(patch).toContain('botmux-dsh-tui-wrapper-');
     expect(patch).toContain('dsh-tui-wrapper.mjs');
-    expect(patch).toContain('inject:\n        - agents\n        - userQuestions');
+    expect(patch).toContain('inject:\n        - workspaceRegistry\n        - agents');
+    expect(patch).toContain('        - tuiThemes\n        - userQuestions');
 
     const plugin = readFileSync(result!.pluginPath, 'utf8');
     expect(plugin).toContain('file://');
