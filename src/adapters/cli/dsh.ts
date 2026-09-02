@@ -30,6 +30,10 @@ function pushOpt(args: string[], key: string, value: string | undefined): void {
   args.push(key, value);
 }
 
+function configuredDshHome(): string {
+  return process.env.DSH_HOME?.trim() || join(homedir(), '.dsh');
+}
+
 function dshAuthPaths(): string[] {
   const configured = process.env.DSH_HOME?.trim();
   return configured ? ['~/.dsh', configured] : ['~/.dsh'];
@@ -76,8 +80,11 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
       // filter drops authPaths that don't exist yet, and the runner can't
       // create them from inside.
       const dshHome = join(homedir(), '.dsh');
+      const activeDshHome = configuredDshHome();
       mkdirSync(dshHome, { recursive: true });
-      mkdirSync(join(dshHome, 'sessions', 'botmux'), { recursive: true });
+      mkdirSync(activeDshHome, { recursive: true });
+      mkdirSync(join(activeDshHome, 'profiles'), { recursive: true });
+      mkdirSync(join(activeDshHome, 'sessions', 'botmux'), { recursive: true });
       const args = [
         runnerArgv0('dsh-runner', runnerPath()),
         '--session-id', sessionId,

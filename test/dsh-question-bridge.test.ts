@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -51,6 +51,22 @@ describe('DSH question bridge file generation', () => {
       homeDir: home,
       hookCommand: { cmd: '/bin/botmux-current', args: ['hook', 'dsh'] },
     })).toBeNull();
+  });
+
+  it('canonicalizes a symlinked home before returning patch paths', () => {
+    const root = tmp();
+    const realHome = join(root, 'real-home');
+    const linkHome = join(root, 'link-home');
+    mkdirSync(realHome, { recursive: true });
+    symlinkSync(realHome, linkHome, 'dir');
+    const result = ensureDshQuestionBridgePatch({
+      cliId: 'dsh',
+      homeDir: linkHome,
+      hookCommand: { cmd: '/bin/current-botmux', args: ['hook', 'dsh'] },
+      buildSalt: 'canonical-home',
+    })!;
+    expect(result.patchPath.startsWith(realpathSync(realHome))).toBe(true);
+    expect(result.readonlyRoot.startsWith(realpathSync(realHome))).toBe(true);
   });
 
   it('writes an ordinary dsh bridge patch with argv hook command', () => {

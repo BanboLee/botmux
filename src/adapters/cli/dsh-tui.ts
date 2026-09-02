@@ -7,6 +7,10 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { ensureDshQuestionBridgePatch, type DshQuestionBridgePatch } from '../dsh-question-bridge.js';
 
+function configuredDshHome(): string {
+  return process.env.DSH_HOME?.trim() || join(homedir(), '.dsh');
+}
+
 function dshAuthPaths(): string[] {
   const configured = process.env.DSH_HOME?.trim();
   return configured ? ['~/.dsh', configured, '~/.dsh-tui'] : ['~/.dsh', '~/.dsh-tui'];
@@ -61,7 +65,10 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
       // resume.txt — without this, sandbox:true would silently break cross-
       // session resume (same pattern as the dsh adapter's mkdirSync).
       const home = homedir();
+      const activeDshHome = configuredDshHome();
       mkdirSync(join(home, '.dsh'), { recursive: true });
+      mkdirSync(activeDshHome, { recursive: true });
+      mkdirSync(join(activeDshHome, 'profiles'), { recursive: true });
       mkdirSync(join(home, '.dsh-tui'), { recursive: true });
       const args: string[] = [];
       const bridge = bridgePatch();

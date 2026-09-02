@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -48,9 +48,13 @@ function jsonLiteral(value: unknown): string {
   return (JSON.stringify(value) ?? 'undefined').replace(/<\//g, '<\\/');
 }
 
+function canonicalPath(path: string): string {
+  try { return realpathSync(path); } catch { return path; }
+}
+
 function dshConfigHome(homeDir: string): string {
   const configured = process.env.DSH_HOME?.trim();
-  return configured ? resolve(configured) : join(homeDir, '.dsh');
+  return configured ? canonicalPath(resolve(configured)) : join(homeDir, '.dsh');
 }
 
 function defaultDshTuiProfileDir(homeDir: string): string {
@@ -93,15 +97,15 @@ export function resolveOriginalDshTuiEntryUrl(
     const directPkgPath = join(profileDir, 'node_modules', '@deepseek-harness-tui', 'dsh-tui', 'package.json');
     if (existsSync(directPkgPath)) {
       const entry = resolve(dirname(directPkgPath), resolvePackageExportEntry(dirname(directPkgPath)));
-      return existsSync(entry) ? pathToFileURL(entry).href : null;
+      return existsSync(entry) ? pathToFileURL(canonicalPath(entry)).href : null;
     }
     const requireFromProfile = createRequire(join(profileDir, 'package.json'));
     const publicEntry = requireFromProfile.resolve('@deepseek-harness-tui/dsh-tui');
     const pkgRoot = findPackageRootFromEntry(publicEntry);
-    if (!pkgRoot) return existsSync(publicEntry) ? pathToFileURL(publicEntry).href : null;
+    if (!pkgRoot) return existsSync(publicEntry) ? pathToFileURL(canonicalPath(publicEntry)).href : null;
     const entry = resolve(pkgRoot, resolvePackageExportEntry(pkgRoot));
     if (!existsSync(entry)) return null;
-    return pathToFileURL(entry).href;
+    return pathToFileURL(canonicalPath(entry)).href;
   } catch {
     return null;
   }
@@ -138,6 +142,12 @@ function timeoutMs() {
 
 function runHook(payload, signal) {
   return new Promise((resolve) => {
+    let input;
+    try { input = JSON.stringify(payload); }
+    catch (error) {
+      resolve({ ok: false, reason: 'payload-serialize-error', detail: String(error && error.message || error) });
+      return;
+    }
     let settled = false;
     let out = '';
     let child;
@@ -182,13 +192,19 @@ function runHook(payload, signal) {
       else if (!out.trim()) done({ ok: false, reason: 'passthrough', detail: 'botmux hook returned empty stdout' });
       else done({ ok: true, text: out.trim() });
     });
-    try { child.stdin.end(JSON.stringify(payload)); }
-    catch (error) { done({ ok: false, reason: 'stdin-error', detail: String(error && error.message || error) }); }
+    try { child.stdin.end(input); }
+    catch (error) {
+      try { child.kill(); } catch {}
+      done({ ok: false, reason: 'stdin-error', detail: String(error && error.message || error) });
+    }
   });
 }
 
 function handleBridgeFailure(result, next) {
   if (RUNTIME === 'tui') return next();
+  if (result.reason === 'aborted') {
+    throw bridgeError('ASK_ABORTED', result.detail || 'ask_user_question was aborted');
+  }
   throw bridgeError('BOTMUX_ASK_BRIDGE_UNAVAILABLE', 'botmux question bridge failed: ' + result.reason + (result.detail ? ' (' + result.detail + ')' : ''));
 }
 
@@ -221,6 +237,22 @@ function classifyRequest(request) {
   return { ok: true };
 }
 
+function sanitizedQuestions(request) {
+  return request.questions.map((q) => ({
+    id: q.id,
+    question: q.question,
+    ...(q.header !== undefined ? { header: q.header } : {}),
+    ...(q.detail !== undefined ? { detail: q.detail } : {}),
+    options: q.options.map((opt) => ({
+      label: opt.label,
+      ...(opt.description !== undefined ? { description: opt.description } : {}),
+    })),
+    ...(q.multiSelect !== undefined ? { multiSelect: q.multiSelect } : {}),
+    ...(q.multi_select !== undefined ? { multi_select: q.multi_select } : {}),
+    ...(q.intent !== undefined ? { intent: q.intent } : {}),
+  }));
+}
+
 function validateAnswer(value, request) {
   if (!isRecord(value) || !Array.isArray(value.answers)) throw new Error('answer must contain answers[]');
   if (value.answers.length !== request.questions.length) throw new Error('answer count does not match question count');
@@ -246,7 +278,8 @@ function validateAnswer(value, request) {
 async function bridgeAsk(request, next) {
   const classified = classifyRequest(request);
   if (!classified.ok) return handleBridgeFailure({ reason: 'unsupported', detail: classified.reason }, next);
-  const result = await runHook({ hook_event_name: 'user-questions/request', tool_input: request }, request && request.signal);
+  const safeRequest = { questions: sanitizedQuestions(request) };
+  const result = await runHook({ hook_event_name: 'user-questions/request', tool_input: safeRequest }, request && request.signal);
   if (!result.ok) return handleBridgeFailure(result, next);
   try { return validateAnswer(JSON.parse(result.text), request); }
   catch (error) { return handleBridgeFailure({ reason: 'malformed-answer', detail: String(error && error.message || error) }, next); }
@@ -300,11 +333,11 @@ function rawService(service) {
   return service && service[Symbol.for('cordis.original')] || service;
 }
 function originalDshTuiConfig(ctx, wrapperConfig) {
-  if (wrapperConfig && Object.keys(wrapperConfig).length > 0) return wrapperConfig;
   try {
     const entry = [...ctx.loader.entries()].find((candidate) => candidate.options && candidate.options.id === 'dsh-tui');
     if (entry && entry.options && entry.options.config !== undefined) return entry.options.config;
   } catch {}
+  if (wrapperConfig && Object.keys(wrapperConfig).length > 0) return wrapperConfig;
   throw new Error('botmux dsh-tui wrapper could not find original dsh-tui config');
 }
 function wrapLegacyProvider(service) {
@@ -336,11 +369,15 @@ export async function apply(ctx, config) {
   const effectiveConfig = originalDshTuiConfig(ctx, config);
   if (!isBotmuxSessionEnv(process.env) || process.env.BOTMUX_DSH_ASK_BRIDGE === '0') return original.apply(ctx, effectiveConfig);
   const service = ctx.get && ctx.get('userQuestions');
-  const restore = service && typeof service.registerProvider === 'function'
+  const legacyRestore = service && typeof service.registerProvider === 'function'
     ? wrapLegacyProvider(service)
-    : installWaterfallBridge(ctx);
+    : undefined;
+  if (legacyRestore && typeof ctx.effect === 'function') {
+    try { ctx.effect(() => () => legacyRestore(), 'botmux-dsh-tui-question-bridge.legacy-wrap'); } catch {}
+  }
+  if (!legacyRestore) installWaterfallBridge(ctx);
   try { return await original.apply(ctx, effectiveConfig); }
-  finally { try { restore && restore(); } catch {} }
+  finally { try { legacyRestore && legacyRestore(); } catch {} }
 }
 `;
 }
@@ -385,7 +422,8 @@ export function ensureDshQuestionBridgePatch(
     : buildOrdinaryBridgePlugin(hook);
   const salt = opts.buildSalt ?? '';
   const hash = sha256(JSON.stringify({ version: BRIDGE_VERSION, cliId: opts.cliId, hook, originalDshTuiUrl, salt, content })).slice(0, 16);
-  const root = join(opts.homeDir ?? homedir(), BRIDGE_ROOT_DIR, hash);
+  const bridgeHome = canonicalPath(opts.homeDir ?? homedir());
+  const root = join(bridgeHome, BRIDGE_ROOT_DIR, hash);
   const pluginPath = join(root, runtime === 'tui' ? 'dsh-tui-wrapper.mjs' : 'bridge.mjs');
   const pluginUrl = pathToFileURL(pluginPath).href;
   if (runtime === 'tui' && originalDshTuiUrl === pluginUrl) return null;

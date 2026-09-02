@@ -790,16 +790,23 @@ describe('dsh buildArgs (runner model)', () => {
     expect(adapter.buildResumeCommand?.({ sessionId: 'sess-dsh', cliSessionId: 'session-abc' })).toBeNull();
   });
 
-  it('exposes configured DSH_HOME for sandboxed profile state', () => {
+  it('exposes and pre-creates configured DSH_HOME for sandboxed profile state', () => {
     expect(adapter.authPaths).toContain('~/.dsh');
     const previousDshHome = process.env.DSH_HOME;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-home-'));
+    const customHome = join(root, 'custom-dsh-home');
     try {
-      process.env.DSH_HOME = '/tmp/custom-dsh-home';
+      process.env.DSH_HOME = customHome;
       const configured = createDshAdapter('/opt/dsh/bin/dsh');
-      expect(configured.authPaths).toContain('/tmp/custom-dsh-home');
+      expect(configured.authPaths).toContain(customHome);
+      configured.buildArgs({ sessionId: 's', resume: false });
+      expect(existsSync(customHome)).toBe(true);
+      expect(existsSync(join(customHome, 'profiles'))).toBe(true);
+      expect(existsSync(join(customHome, 'sessions', 'botmux'))).toBe(true);
     } finally {
       if (previousDshHome === undefined) delete process.env.DSH_HOME;
       else process.env.DSH_HOME = previousDshHome;
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -948,18 +955,24 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     expect(adapter.supportsTypeAhead).not.toBe(true);
   });
 
-  it('exposes ~/.dsh, configured DSH_HOME, and ~/.dsh-tui as auth paths', () => {
+  it('exposes and pre-creates configured DSH_HOME plus ~/.dsh-tui as auth paths', () => {
     expect(adapter.authPaths).toContain('~/.dsh');
     expect(adapter.authPaths).toContain('~/.dsh-tui');
     const previousDshHome = process.env.DSH_HOME;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-tui-home-'));
+    const customHome = join(root, 'custom-dsh-home');
     try {
-      process.env.DSH_HOME = '/tmp/custom-dsh-home';
+      process.env.DSH_HOME = customHome;
       const configured = createDshTuiAdapter('/opt/dsh-tui/bin/dsh-tui');
-      expect(configured.authPaths).toContain('/tmp/custom-dsh-home');
+      expect(configured.authPaths).toContain(customHome);
       expect(configured.authPaths).toContain('~/.dsh-tui');
+      configured.buildArgs({ sessionId: 's', resume: false });
+      expect(existsSync(customHome)).toBe(true);
+      expect(existsSync(join(customHome, 'profiles'))).toBe(true);
     } finally {
       if (previousDshHome === undefined) delete process.env.DSH_HOME;
       else process.env.DSH_HOME = previousDshHome;
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
