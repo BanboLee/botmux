@@ -858,16 +858,125 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     expect(adapter.authPaths).toContain('~/.dsh-tui');
   });
 
-  it('writeInput types text and presses Enter', async () => {
-    const sent: string[] = [];
-    const keys: string[][] = [];
+  it('writeInput pastes multiline text and presses one Enter', async () => {
+    const content = 'line1\nline2\nline3';
+    const sendText = vi.fn(() => true);
+    const pasteText = vi.fn(() => true);
+    const sendSpecialKeys = vi.fn(() => true);
     const pty = {
-      sendText: (t: string) => { sent.push(t); return true; },
-      sendSpecialKeys: (...k: string[]) => { keys.push(k); return true; },
+      write: vi.fn(() => true),
+      sendText,
+      pasteText,
+      sendSpecialKeys,
     } as unknown as PtyHandle;
-    await adapter.writeInput!(pty, 'hello tui');
-    expect(sent).toEqual(['hello tui']);
-    expect(keys).toEqual([['Enter']]);
+
+    const result = await adapter.writeInput!(pty, content);
+
+    expect(result).toBeUndefined();
+    expect(pasteText).toHaveBeenCalledOnce();
+    expect(pasteText).toHaveBeenCalledWith(content);
+    expect(sendText).not.toHaveBeenCalled();
+    expect(sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('writeInput pastes a long botmux prompt as a single draft', async () => {
+    const content = [
+      '<botmux_routing>',
+      '你运行在飞书（Lark）会话中。用户在飞书阅读回复，看不到你的终端输出。',
+      '</botmux_routing>',
+      '',
+      '<user_message>',
+      '请处理这个多行请求',
+      '</user_message>',
+      '',
+      '<botmux_skills>',
+      '  <skill name="botmux-send">',
+      '    <description>向飞书话题发送消息。</description>',
+      '  </skill>',
+      '</botmux_skills>',
+    ].join('\n');
+    const sendText = vi.fn(() => true);
+    const pasteText = vi.fn(() => true);
+    const sendSpecialKeys = vi.fn(() => true);
+    const pty = {
+      write: vi.fn(() => true),
+      sendText,
+      pasteText,
+      sendSpecialKeys,
+    } as unknown as PtyHandle;
+
+    await adapter.writeInput!(pty, content);
+
+    expect(pasteText).toHaveBeenCalledTimes(1);
+    expect(pasteText).toHaveBeenCalledWith(content);
+    expect(sendText).not.toHaveBeenCalled();
+    expect(sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('writeInput wraps bracketed paste when pasteText is unavailable', async () => {
+    const content = 'line1\nline2';
+    const write = vi.fn(() => true);
+    const sendSpecialKeys = vi.fn(() => true);
+    const pty = {
+      write,
+      sendText: vi.fn(() => true),
+      sendSpecialKeys,
+    } as unknown as PtyHandle;
+
+    const result = await adapter.writeInput!(pty, content);
+
+    expect(result).toBeUndefined();
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(write).toHaveBeenCalledWith(`\x1b[200~${content}\x1b[201~`);
+    expect(pty.sendText).not.toHaveBeenCalled();
+    expect(sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('writeInput wraps bracketed paste on raw PTY fallback', async () => {
+    const content = 'line1\nline2';
+    const write = vi.fn(() => true);
+    const pty = { write } as unknown as PtyHandle;
+
+    const result = await adapter.writeInput!(pty, content);
+
+    expect(result).toBeUndefined();
+    expect(write).toHaveBeenCalledTimes(2);
+    expect(write).toHaveBeenNthCalledWith(1, `\x1b[200~${content}\x1b[201~`);
+    expect(write).toHaveBeenNthCalledWith(2, '\r');
+  });
+
+  it('writeInput returns submitted false when paste, write, or Enter is rejected', async () => {
+    await expect(adapter.writeInput!({
+      write: vi.fn(() => true),
+      pasteText: vi.fn(() => false),
+      sendSpecialKeys: vi.fn(() => true),
+    } as unknown as PtyHandle, 'paste rejected')).resolves.toEqual({ submitted: false });
+
+    await expect(adapter.writeInput!({
+      write: vi.fn(() => false),
+      sendSpecialKeys: vi.fn(() => true),
+    } as unknown as PtyHandle, 'write rejected')).resolves.toEqual({ submitted: false });
+
+    await expect(adapter.writeInput!({
+      write: vi.fn(() => false),
+    } as unknown as PtyHandle, 'raw write rejected')).resolves.toEqual({ submitted: false });
+
+    await expect(adapter.writeInput!({
+      write: vi.fn(() => true),
+      pasteText: vi.fn(() => true),
+      sendSpecialKeys: vi.fn(() => false),
+    } as unknown as PtyHandle, 'enter rejected')).resolves.toEqual({ submitted: false });
+  });
+
+  it('writeInput returns submitted false when paste throws', async () => {
+    await expect(adapter.writeInput!({
+      write: vi.fn(() => true),
+      pasteText: vi.fn(() => { throw new Error('paste failed'); }),
+      sendSpecialKeys: vi.fn(() => true),
+    } as unknown as PtyHandle, 'boom')).resolves.toEqual({ submitted: false });
   });
 });
 

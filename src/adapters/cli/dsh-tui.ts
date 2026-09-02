@@ -68,14 +68,30 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
-      if (pty.sendText && pty.sendSpecialKeys) {
-        pty.sendText(content);
-        await delay(200);
-        pty.sendSpecialKeys('Enter');
-      } else {
-        pty.write(content);
-        await delay(1000);
-        pty.write('\r');
+      // dsh-tui's Ink PromptInput treats ordinary newlines as submit keys.
+      // Botmux prompts are often multiline, so inject them as bracketed paste
+      // and press Enter exactly once after the whole draft is in the composer.
+      try {
+        if (pty.sendSpecialKeys) {
+          if (pty.pasteText) {
+            const pasted = pty.pasteText(content) as unknown;
+            if (pasted === false) return { submitted: false };
+          } else {
+            const written = pty.write(`\x1b[200~${content}\x1b[201~`);
+            if (written === false) return { submitted: false };
+          }
+          await delay(200);
+          const submitted = pty.sendSpecialKeys('Enter');
+          if (submitted === false) return { submitted: false };
+        } else {
+          const written = pty.write(`\x1b[200~${content}\x1b[201~`);
+          if (written === false) return { submitted: false };
+          await delay(200);
+          const submitted = pty.write('\r');
+          if (submitted === false) return { submitted: false };
+        }
+      } catch {
+        return { submitted: false };
       }
     },
 
