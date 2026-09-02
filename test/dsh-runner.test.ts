@@ -71,6 +71,7 @@ function spawnRunner(
     env: {
       ...process.env,
       HOME: home,
+      DSH_HOME: join(home, '.dsh'),
       FAKE_DSH_SCENARIO: scenario,
       FAKE_DSH_LOG: logPath,
       DSH_CORDIS_CONFIG: '',
@@ -198,6 +199,20 @@ describe('dsh-runner', () => {
     const initEntry = entries.find((r: any) => r.initialize);
     expect(initEntry.initialize.provider).toBe('super-relay');
     expect(initEntry.initialize.model).toBe('model_hub/es1_orange_o48');
+  });
+
+  it('honors DSH_HOME for profiles, sessions and native settings', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-home-'));
+    const dshHome = join(home, 'custom-dsh-home');
+    mkdirSync(dshHome, { recursive: true });
+    writeFileSync(join(dshHome, 'settings.yaml'), SUPER_RELAY_SETTINGS, 'utf8');
+    h = spawnRunner('happy', ['--dsh-profile', 'botmux'], { DSH_HOME: dshHome }, home);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    expect(existsSync(join(dshHome, 'profiles', 'botmux'))).toBe(true);
+    expect(existsSync(join(home, '.dsh', 'profiles', 'botmux'))).toBe(false);
+    const initEntry = readLog(h).find((r: any) => r.initialize);
+    expect(initEntry.initialize.provider).toBe('super-relay');
   });
 
   it('injects the identity preamble only on the first turn (multi-turn)', async () => {

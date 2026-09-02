@@ -224,6 +224,11 @@ interface NativeDshConfig {
   credentials: Record<string, string>;
 }
 
+function dshHomeDir(): string {
+  const configured = process.env.DSH_HOME?.trim();
+  return configured ? resolve(configured) : join(homedir(), '.dsh');
+}
+
 /** Seed a minimal dsh profile under ~/.dsh/profiles/<name> so `dsh --profile <name>`
  *  can start. dsh judges a profile's existence by its package.json (not the
  *  directory or cordis.yml), and non-shipped profiles (only "web" / "headless"
@@ -243,7 +248,7 @@ interface NativeDshConfig {
  *
  *  If the profile already exists, this is a no-op. */
 function ensureProfileDir(name: string, dshBin: string): string {
-  const dir = join(homedir(), '.dsh', 'profiles', name);
+  const dir = join(dshHomeDir(), 'profiles', name);
   mkdirSync(dir, { recursive: true });
 
   const pkgJson = join(dir, 'package.json');
@@ -329,7 +334,7 @@ function ensureProfileDir(name: string, dshBin: string): string {
  *  for the pre-release flat `KEY: value` layout used by older installations.
  *  Missing file → empty (the runtime then falls back to ambient environment). */
 function loadCredentials(): Record<string, string> {
-  const credPath = join(homedir(), '.dsh', '.credentials.yaml');
+  const credPath = join(dshHomeDir(), '.credentials.yaml');
   if (!existsSync(credPath)) return {};
   const parsed = parseYamlDocument(readFileSync(credPath, 'utf8')) as unknown;
   const source = isRecord(parsed) && parsed.version === 1 && isRecord(parsed.refs)
@@ -358,7 +363,7 @@ function resolveNativeDshConfig(): NativeDshConfig {
 
   // Resolve provider & model from ~/.dsh/settings.yaml for the initialize RPC.
   //    The plugin composition is managed entirely by the profile's cordis.patch.yml.
-  const settingsPath = join(homedir(), '.dsh', 'settings.yaml');
+  const settingsPath = join(dshHomeDir(), 'settings.yaml');
   let provider = 'deepseek-official';
   let settingsModel = '';
   if (existsSync(settingsPath)) {
@@ -834,7 +839,7 @@ async function main(): Promise<void> {
   const native = resolveNativeDshConfig();
   // Sessions live under the native dsh home (~/.dsh/sessions/botmux/<id>),
   // not ~/.botmux — the adapter binds ~/.dsh into the sandbox.
-  const sessionRoot = join(homedir(), '.dsh', 'sessions', 'botmux', args.sessionId);
+  const sessionRoot = join(dshHomeDir(), 'sessions', 'botmux', args.sessionId);
   mkdirSync(sessionRoot, { recursive: true });
 
   // Credentials from ~/.dsh/.credentials.yaml fill gaps; the ambient
