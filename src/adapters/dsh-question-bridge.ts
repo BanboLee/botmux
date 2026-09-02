@@ -241,15 +241,14 @@ function sanitizedQuestions(request) {
   return request.questions.map((q) => ({
     id: q.id,
     question: q.question,
-    ...(q.header !== undefined ? { header: q.header } : {}),
-    ...(q.detail !== undefined ? { detail: q.detail } : {}),
+    ...(typeof q.header === 'string' ? { header: q.header } : {}),
+    ...(typeof q.detail === 'string' ? { detail: q.detail } : {}),
     options: q.options.map((opt) => ({
       label: opt.label,
-      ...(opt.description !== undefined ? { description: opt.description } : {}),
+      ...(typeof opt.description === 'string' ? { description: opt.description } : {}),
     })),
-    ...(q.multiSelect !== undefined ? { multiSelect: q.multiSelect } : {}),
-    ...(q.multi_select !== undefined ? { multi_select: q.multi_select } : {}),
-    ...(q.intent !== undefined ? { intent: q.intent } : {}),
+    ...(typeof q.multiSelect === 'boolean' ? { multiSelect: q.multiSelect } : {}),
+    ...(typeof q.multi_select === 'boolean' ? { multi_select: q.multi_select } : {}),
   }));
 }
 

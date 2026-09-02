@@ -301,6 +301,53 @@ process.stdin.on('end', () => process.stdout.write(JSON.stringify({ answers: [{ 
     delete process.env.BOTMUX_LARK_APP_ID;
   });
 
+  it('generated ordinary bridge sends only JSON-safe question fields to hook', async () => {
+    const home = tmp();
+    const payloadLog = join(home, 'payload.json');
+    const hook = makeHookScript(home, `
+import { writeFileSync } from 'node:fs';
+let input = '';
+process.stdin.on('data', d => { input += d.toString('utf8'); });
+process.stdin.on('end', () => {
+  writeFileSync(process.argv[2], input);
+  const payload = JSON.parse(input);
+  process.stdout.write(JSON.stringify({ answers: [{ id: payload.tool_input.questions[0].id, selected: ['Yes'] }] }));
+});
+`);
+    process.env.BOTMUX_SESSION_ID = 's';
+    process.env.BOTMUX_CHAT_ID = 'c';
+    process.env.BOTMUX_LARK_APP_ID = 'app';
+    const result = ensureDshQuestionBridgePatch({
+      cliId: 'dsh', homeDir: home,
+      hookCommand: { cmd: process.execPath, args: [hook, payloadLog] },
+      buildSalt: 'json-safe',
+    })!;
+    const mod = await import(`${pathToFileURL(result.pluginPath).href}?case=${Date.now()}`);
+    let listener: ((request: any, next: () => Promise<any>) => Promise<any>) | undefined;
+    mod.apply({ get: () => undefined, on: (_name: string, fn: typeof listener) => { listener = fn; return () => true; } });
+    const agent: any = { id: 'agent' };
+    agent.self = agent;
+    await listener!({
+      questions: [{
+        id: 'q', question: 'Q?', header: 1n, detail: () => 'bad', multiSelect: true,
+        options: [{ label: 'Yes', description: 1n }, { label: 'No' }],
+      }],
+      agent,
+      signal: new AbortController().signal,
+      sessionId: 'spoof', chatId: 'spoof', rootMessageId: 'spoof', larkAppId: 'spoof',
+    }, async () => ({ answers: [] }));
+    const payload = JSON.parse(readFileSync(payloadLog, 'utf8'));
+    expect(payload).toEqual({
+      hook_event_name: 'user-questions/request',
+      tool_input: {
+        questions: [{ id: 'q', question: 'Q?', options: [{ label: 'Yes' }, { label: 'No' }], multiSelect: true }],
+      },
+    });
+    delete process.env.BOTMUX_SESSION_ID;
+    delete process.env.BOTMUX_CHAT_ID;
+    delete process.env.BOTMUX_LARK_APP_ID;
+  });
+
   it('generated ordinary bridge rejects malformed DSH answer schemas', async () => {
     const home = tmp();
     const hook = makeHookScript(home, `process.stdin.resume(); process.stdin.on('end', () => process.stdout.write(JSON.stringify({ answers: [{ id: 'q', selected: ['Maybe'] }] })));`);
