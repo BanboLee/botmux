@@ -57,18 +57,32 @@ function defaultDshTuiProfileDir(homeDir: string): string {
   return join(dshConfigHome(homeDir), 'profiles', DEFAULT_DSH_TUI_PROFILE);
 }
 
-function resolvePackageExportEntry(pkg: Record<string, unknown>): string {
-  const exportsField = pkg.exports;
-  if (exportsField && typeof exportsField === 'object' && !Array.isArray(exportsField)) {
-    const dot = (exportsField as Record<string, unknown>)['.'];
-    if (dot && typeof dot === 'object' && !Array.isArray(dot)) {
-      const imp = (dot as Record<string, unknown>).import ?? (dot as Record<string, unknown>).default;
-      if (typeof imp === 'string' && imp) return imp;
-    }
-    if (typeof dot === 'string' && dot) return dot;
+function findPackageRootFromEntry(entry: string): string | null {
+  let dir = dirname(entry);
+  for (;;) {
+    const pkgPath = join(dir, 'package.json');
+    if (existsSync(pkgPath)) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
   }
-  if (typeof pkg.module === 'string' && pkg.module) return pkg.module;
-  if (typeof pkg.main === 'string' && pkg.main) return pkg.main;
+}
+
+function resolvePackageExportEntry(pkgRoot: string): string {
+  try {
+    const pkg = JSON.parse(readFileSync(join(pkgRoot, 'package.json'), 'utf8')) as Record<string, unknown>;
+    const exportsField = pkg.exports;
+    if (exportsField && typeof exportsField === 'object' && !Array.isArray(exportsField)) {
+      const dot = (exportsField as Record<string, unknown>)['.'];
+      if (dot && typeof dot === 'object' && !Array.isArray(dot)) {
+        const imp = (dot as Record<string, unknown>).import ?? (dot as Record<string, unknown>).default;
+        if (typeof imp === 'string' && imp) return imp;
+      }
+      if (typeof dot === 'string' && dot) return dot;
+    }
+    if (typeof pkg.module === 'string' && pkg.module) return pkg.module;
+    if (typeof pkg.main === 'string' && pkg.main) return pkg.main;
+  } catch { /* fall back below */ }
   return 'lib/types/index.js';
 }
 
@@ -76,10 +90,16 @@ export function resolveOriginalDshTuiEntryUrl(
   profileDir: string = defaultDshTuiProfileDir(homedir()),
 ): string | null {
   try {
+    const directPkgPath = join(profileDir, 'node_modules', '@deepseek-harness-tui', 'dsh-tui', 'package.json');
+    if (existsSync(directPkgPath)) {
+      const entry = resolve(dirname(directPkgPath), resolvePackageExportEntry(dirname(directPkgPath)));
+      return existsSync(entry) ? pathToFileURL(entry).href : null;
+    }
     const requireFromProfile = createRequire(join(profileDir, 'package.json'));
-    const pkgPath = requireFromProfile.resolve('@deepseek-harness-tui/dsh-tui/package.json');
-    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as Record<string, unknown>;
-    const entry = resolve(dirname(pkgPath), resolvePackageExportEntry(pkg));
+    const publicEntry = requireFromProfile.resolve('@deepseek-harness-tui/dsh-tui');
+    const pkgRoot = findPackageRootFromEntry(publicEntry);
+    if (!pkgRoot) return existsSync(publicEntry) ? pathToFileURL(publicEntry).href : null;
+    const entry = resolve(pkgRoot, resolvePackageExportEntry(pkgRoot));
     if (!existsSync(entry)) return null;
     return pathToFileURL(entry).href;
   } catch {
@@ -93,6 +113,11 @@ const CMD = ${jsonLiteral(parts.cmd)};
 const ARGS = ${jsonLiteral([...parts.args])};
 const RUNTIME = ${jsonLiteral(runtime === 'dsh-tui' ? 'tui' : 'official')};
 const MAX_STDOUT_BYTES = 1024 * 1024;
+const MAX_LABEL_LENGTH = 200;
+
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
 
 function isBotmuxSessionEnv(env) {
   return !!(env.BOTMUX_SESSION_ID && env.BOTMUX_CHAT_ID && env.BOTMUX_LARK_APP_ID);
@@ -167,10 +192,63 @@ function handleBridgeFailure(result, next) {
   throw bridgeError('BOTMUX_ASK_BRIDGE_UNAVAILABLE', 'botmux question bridge failed: ' + result.reason + (result.detail ? ' (' + result.detail + ')' : ''));
 }
 
+function isValidLabel(value) {
+  return typeof value === 'string'
+    && value.trim().length > 0
+    && value.length <= MAX_LABEL_LENGTH
+    && !value.includes(String.fromCharCode(10))
+    && !value.includes(String.fromCharCode(13));
+}
+
+function classifyRequest(request) {
+  if (!isRecord(request) || !Array.isArray(request.questions) || request.questions.length === 0) {
+    return { ok: false, reason: 'missing questions' };
+  }
+  for (let i = 0; i < request.questions.length; i++) {
+    const q = request.questions[i];
+    if (!isRecord(q)) return { ok: false, reason: 'question ' + (i + 1) + ' is malformed' };
+    if (typeof q.id !== 'string' || !q.id.trim()) return { ok: false, reason: 'question ' + (i + 1) + ' has invalid id' };
+    if (typeof q.question !== 'string' || !q.question.trim()) return { ok: false, reason: 'question ' + (i + 1) + ' has invalid text' };
+    if (isRecord(q.intent) && q.intent.kind === 'plan-review') return { ok: false, reason: 'plan-review is not supported by botmux bridge' };
+    if (!Array.isArray(q.options) || q.options.length < 2) return { ok: false, reason: 'question ' + (i + 1) + ' has fewer than two options' };
+    const labels = new Set();
+    for (const opt of q.options) {
+      if (!isRecord(opt) || !isValidLabel(opt.label)) return { ok: false, reason: 'question ' + (i + 1) + ' has invalid option label' };
+      if (labels.has(opt.label)) return { ok: false, reason: 'question ' + (i + 1) + ' has duplicate option label' };
+      labels.add(opt.label);
+    }
+  }
+  return { ok: true };
+}
+
+function validateAnswer(value, request) {
+  if (!isRecord(value) || !Array.isArray(value.answers)) throw new Error('answer must contain answers[]');
+  if (value.answers.length !== request.questions.length) throw new Error('answer count does not match question count');
+  const answers = [];
+  for (let i = 0; i < request.questions.length; i++) {
+    const q = request.questions[i];
+    const answer = value.answers[i];
+    if (!isRecord(answer)) throw new Error('answer ' + (i + 1) + ' is malformed');
+    if (answer.id !== q.id) throw new Error('answer ' + (i + 1) + ' id mismatch');
+    if (!Array.isArray(answer.selected) || !answer.selected.every((item) => typeof item === 'string')) {
+      throw new Error('answer ' + (i + 1) + ' selected must be string[]');
+    }
+    const allowed = new Set(q.options.map((opt) => opt.label));
+    for (const selected of answer.selected) {
+      if (!allowed.has(selected)) throw new Error('answer ' + (i + 1) + ' selected unknown option');
+    }
+    if (answer.custom !== undefined && typeof answer.custom !== 'string') throw new Error('answer ' + (i + 1) + ' custom must be string');
+    answers.push({ id: answer.id, selected: [...answer.selected], ...(answer.custom !== undefined ? { custom: answer.custom } : {}) });
+  }
+  return { answers };
+}
+
 async function bridgeAsk(request, next) {
+  const classified = classifyRequest(request);
+  if (!classified.ok) return handleBridgeFailure({ reason: 'unsupported', detail: classified.reason }, next);
   const result = await runHook({ hook_event_name: 'user-questions/request', tool_input: request }, request && request.signal);
   if (!result.ok) return handleBridgeFailure(result, next);
-  try { return JSON.parse(result.text); }
+  try { return validateAnswer(JSON.parse(result.text), request); }
   catch (error) { return handleBridgeFailure({ reason: 'malformed-answer', detail: String(error && error.message || error) }, next); }
 }
 
@@ -225,8 +303,9 @@ function originalDshTuiConfig(ctx, wrapperConfig) {
   if (wrapperConfig && Object.keys(wrapperConfig).length > 0) return wrapperConfig;
   try {
     const entry = [...ctx.loader.entries()].find((candidate) => candidate.options && candidate.options.id === 'dsh-tui');
-    return entry && entry.options && entry.options.config || {};
-  } catch { return {}; }
+    if (entry && entry.options && entry.options.config !== undefined) return entry.options.config;
+  } catch {}
+  throw new Error('botmux dsh-tui wrapper could not find original dsh-tui config');
 }
 function wrapLegacyProvider(service) {
   const target = rawService(service);
@@ -307,11 +386,12 @@ export function ensureDshQuestionBridgePatch(
   const salt = opts.buildSalt ?? '';
   const hash = sha256(JSON.stringify({ version: BRIDGE_VERSION, cliId: opts.cliId, hook, originalDshTuiUrl, salt, content })).slice(0, 16);
   const root = join(opts.homeDir ?? homedir(), BRIDGE_ROOT_DIR, hash);
-  mkdirSync(root, { recursive: true, mode: 0o700 });
   const pluginPath = join(root, runtime === 'tui' ? 'dsh-tui-wrapper.mjs' : 'bridge.mjs');
+  const pluginUrl = pathToFileURL(pluginPath).href;
+  if (runtime === 'tui' && originalDshTuiUrl === pluginUrl) return null;
+  mkdirSync(root, { recursive: true, mode: 0o700 });
   const patchPath = join(root, 'cordis.patch.yml');
   atomicWriteFileSync(pluginPath, content, { mode: 0o600 });
-  const pluginUrl = pathToFileURL(pluginPath).href;
   const patch = runtime === 'tui'
     ? buildDshTuiWrapperPatch(pluginUrl, hash)
     : buildOrdinaryBridgePatch(pluginUrl, hash);
