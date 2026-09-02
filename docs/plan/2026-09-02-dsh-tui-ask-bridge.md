@@ -156,11 +156,14 @@
 
 **official dsh patch**：root `insert` 一个 ordinary bridge entry。
 
-**dsh-tui patch**：不只追加普通 bridge row，而是 patch 既有 `id: dsh-tui` entry 的 `name` 为 generated wrapper：
+**dsh-tui patch**：不能直接 patch 既有 `id: dsh-tui` entry 的 `name`（DSH patch 里的 `name` 是 guard，mismatch 会 skip），因此采用“禁用原 entry + 插入 wrapper entry”：
 
 ```yaml
 - id: dsh-tui
-  name: 'file:///abs/path/to/dsh-tui-wrapper.mjs'
+  disabled: true
+- insert:
+    - id: botmux-dsh-tui-wrapper-<shortHash>
+      name: 'file:///abs/path/to/dsh-tui-wrapper.mjs'
 ```
 
 wrapper 必须重新导出原 dsh-tui 的 `Config`/`inject`，并在 `apply(ctx, config)` 中先安装 bridge，再调用原 dsh-tui `apply(ctx, config)`。这样在 legacy `registerProvider()` 单 seat 版本下，wrapper 可以临时 wrap `service.registerProvider()`，把 dsh-tui 原生 provider 包成 composite provider：botmux bridge first，失败/unsupported 再调用原生 provider。
@@ -508,11 +511,11 @@ git commit -m "test(dsh): 固定 question answer label 映射规则"
 
 #### W0-T6：dsh-tui legacy wrapper 可行性验证
 
-**目标**：验证在不修改 dsh-tui 源码的前提下，能否用 overlay patch 将 `id: dsh-tui` 的 `name` 替换成 wrapper，并在 wrapper 内导入原始 dsh-tui、临时 wrap legacy `registerProvider()`，从而支持 botmux-first/native-fallback。
+**目标**：验证在不修改 dsh-tui 源码的前提下，能否用 overlay patch 禁用原 `id: dsh-tui` entry 并插入 wrapper entry；wrapper 内导入原始 dsh-tui、临时 wrap legacy `registerProvider()`，从而支持 botmux-first/native-fallback。
 
 **验证项**：
 
-- overlay patch 可按 `id: dsh-tui` 替换原 entry `name`，且保留原 row 的 `config` / `inject` 或由 wrapper re-export `Config` / `inject`。
+- overlay patch 可将原 `id: dsh-tui` 置为 `disabled: true`，并插入唯一 id wrapper entry；wrapper re-export 原 dsh-tui 的 `Config` / `inject`，并复用同一 config。
 - wrapper import 原始 `@deepseek-harness-tui/dsh-tui` 不会递归导入自身；如存在递归风险，生成器必须使用原包的 resolved absolute file URL。
 - wrapper 在调用原始 `apply()` 前能拿到/创建 `userQuestions` service，并 wrap `registerProvider()`。
 - dsh-tui 原生 provider 注册后实际注册的是 composite provider；bridge unsupported 时会调用 native provider。
@@ -582,7 +585,7 @@ git commit -m "feat(dsh): 增加 userQuestions ask hook 适配器"
 - content hash 目录隔离。
 - 原子写、0600 文件权限。
 - official dsh 生成 ordinary bridge plugin + root insert patch。
-- dsh-tui 生成 wrapper plugin + `id: dsh-tui` entry replacement patch。
+- dsh-tui 生成 wrapper plugin + “disable 原 `id: dsh-tui`、insert wrapper entry” patch。
 - wrapper 必须使用原始 dsh-tui 模块的 resolved absolute file URL，避免替换后 import 自己造成递归。
 - kill switch off 返回 null。
 - 测试 Node/standalone 通过注入参数或 mock 验证 command parts 不走 global shim。
