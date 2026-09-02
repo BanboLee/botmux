@@ -125,6 +125,7 @@
 
 - 不改 dsh-TUI 仓库。
 - 不改 deepseek-harness 仓库。
+- 验收隔离：上述 sibling 仓库只允许只读调研；若它们存在预先未跟踪/脏文件，不由本任务清理，也不计入本分支实现范围。Gate C 以 `another_botmux` 当前分支相对 `origin/master` 的 diff 为准，同时记录 sibling 脏状态为外部前置事实。
 - 不改现有 OpenCode/Claude/CoCo/TraeX adapter 逻辑。
 - 不改 `src/core/ask-broker.ts`、`src/im/lark/ask-card.ts`、`src/core/ask-types.ts`，除非 W3 公共 ask 扩展被单独批准；若触碰公共 ask，必须增加所有既有 adapter 回归。
 - 不改 bot 配置 schema；MVP kill switch 只用 env。
