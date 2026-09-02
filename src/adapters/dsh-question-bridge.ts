@@ -167,7 +167,7 @@ function runHook(payload, signal) {
     timer = setTimeout(() => {
       try { child.kill(); } catch {}
       done({ ok: false, reason: 'timeout', detail: 'botmux hook timed out' });
-    }, timeoutMs() + 5000);
+    }, timeoutMs() + 100);
     if (typeof timer.unref === 'function') timer.unref();
     child.stdout.on('data', (d) => {
       out += d.toString('utf8');

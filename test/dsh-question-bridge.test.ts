@@ -203,6 +203,52 @@ process.stdin.on('end', () => process.stdout.write(JSON.stringify({ answers: [{ 
     delete process.env.BOTMUX_LARK_APP_ID;
   });
 
+  it('generated ordinary bridge reports spawn, nonzero, timeout, abort and overflow failures', async () => {
+    process.env.BOTMUX_SESSION_ID = 's';
+    process.env.BOTMUX_CHAT_ID = 'c';
+    process.env.BOTMUX_LARK_APP_ID = 'app';
+    process.env.BOTMUX_DSH_ASK_TIMEOUT_MS = '10';
+    const request = { questions: [{ id: 'q', question: 'Q?', options: [{ label: 'Yes' }, { label: 'No' }] }] };
+    const runOfficial = async (home: string, hookCommand: { cmd: string; args: string[] }, salt: string, signal?: AbortSignal) => {
+      const result = ensureDshQuestionBridgePatch({ cliId: 'dsh', homeDir: home, hookCommand, buildSalt: salt })!;
+      const mod = await import(`${pathToFileURL(result.pluginPath).href}?case=${Date.now()}-${salt}`);
+      let listener: ((request: any, next: () => Promise<any>) => Promise<any>) | undefined;
+      mod.apply({ get: () => undefined, on: (_name: string, fn: typeof listener) => { listener = fn; return () => true; } });
+      return listener!({ ...request, ...(signal ? { signal } : {}) }, async () => ({ answers: [] }));
+    };
+
+    const spawnHome = tmp();
+    await expect(runOfficial(spawnHome, { cmd: '/definitely/missing/botmux', args: [] }, 'spawn-error'))
+      .rejects.toThrow(/child-error|spawn-error/);
+
+    const nonzeroHome = tmp();
+    const nonzero = makeHookScript(nonzeroHome, `process.exit(7);`);
+    await expect(runOfficial(nonzeroHome, { cmd: process.execPath, args: [nonzero] }, 'nonzero'))
+      .rejects.toThrow(/nonzero-exit/);
+
+    const timeoutHome = tmp();
+    const hang = makeHookScript(timeoutHome, `setTimeout(() => {}, 10000);`);
+    await expect(runOfficial(timeoutHome, { cmd: process.execPath, args: [hang] }, 'timeout'))
+      .rejects.toThrow(/timeout/);
+
+    const abortHome = tmp();
+    const abortScript = makeHookScript(abortHome, `setTimeout(() => {}, 10000);`);
+    const controller = new AbortController();
+    const abortPromise = runOfficial(abortHome, { cmd: process.execPath, args: [abortScript] }, 'abort', controller.signal);
+    controller.abort();
+    await expect(abortPromise).rejects.toThrow(/aborted/);
+
+    const overflowHome = tmp();
+    const overflow = makeHookScript(overflowHome, `process.stdin.resume(); process.stdin.on('end', () => process.stdout.write('x'.repeat(1024 * 1024 + 1)));`);
+    await expect(runOfficial(overflowHome, { cmd: process.execPath, args: [overflow] }, 'overflow'))
+      .rejects.toThrow(/stdout-overflow/);
+
+    delete process.env.BOTMUX_SESSION_ID;
+    delete process.env.BOTMUX_CHAT_ID;
+    delete process.env.BOTMUX_LARK_APP_ID;
+    delete process.env.BOTMUX_DSH_ASK_TIMEOUT_MS;
+  });
+
   it('generated ordinary bridge throws visible errors on passthrough and malformed hook output', async () => {
     const home = tmp();
     const passthroughHook = makeHookScript(home, `process.stdin.resume(); process.stdin.on('end', () => {});`);
