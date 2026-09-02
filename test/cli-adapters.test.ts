@@ -703,6 +703,16 @@ describe('mira buildArgs', () => {
 
 describe('dsh buildArgs (runner model)', () => {
   const adapter = createDshAdapter('/opt/dsh/bin/dsh');
+  const originalBridgeFlag = process.env.BOTMUX_DSH_ASK_BRIDGE;
+
+  beforeEach(() => {
+    process.env.BOTMUX_DSH_ASK_BRIDGE = '0';
+  });
+
+  afterEach(() => {
+    if (originalBridgeFlag === undefined) delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    else process.env.BOTMUX_DSH_ASK_BRIDGE = originalBridgeFlag;
+  });
 
   it('spawns the node runner and passes the dsh runtime binary', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-dsh', resume: false, workingDir: '/repo/root' });
@@ -739,6 +749,25 @@ describe('dsh buildArgs (runner model)', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, turnTimeoutMs: 30 * 60 * 1000 });
     expect(args).toContain('--turn-timeout-ms');
     expect(args).toContain(String(30 * 60 * 1000));
+  });
+
+  it('passes the question bridge patch to the runner when enabled', () => {
+    delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-bridge-home-'));
+    const previousHome = process.env.HOME;
+    try {
+      process.env.HOME = root;
+      const bridgeAdapter = createDshAdapter('/opt/dsh/bin/dsh');
+      const args = bridgeAdapter.buildArgs({ sessionId: 's', resume: false });
+      const patchIdx = args.indexOf('--bridge-patch');
+      expect(patchIdx).toBeGreaterThanOrEqual(0);
+      expect(args[patchIdx + 1]).toContain(join(root, '.botmux', 'dsh-question-bridge'));
+      expect(bridgeAdapter.sandboxReadonlyPaths?.()).toEqual([expect.stringContaining(join(root, '.botmux', 'dsh-question-bridge'))]);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('omits --turn-timeout-ms when unset or non-positive', () => {
