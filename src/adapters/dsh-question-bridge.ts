@@ -179,9 +179,11 @@ function installWaterfallBridge(ctx) {
   return ctx.on('user-questions/request', (request, next) => bridgeAsk(request, next), { prepend: true });
 }
 
-function installLegacyOfficialProvider(service) {
+function installLegacyOfficialProvider(ctx, service) {
   if (service.provider !== undefined) return undefined;
-  return service.registerProvider({ ask: request => bridgeAsk(request, () => Promise.reject(bridgeError('BOTMUX_ASK_BRIDGE_UNAVAILABLE', 'botmux question bridge declined request'))) });
+  const dispose = service.registerProvider({ ask: request => bridgeAsk(request, () => Promise.reject(bridgeError('BOTMUX_ASK_BRIDGE_UNAVAILABLE', 'botmux question bridge declined request'))) });
+  try { ctx.effect(() => dispose, 'botmux-dsh-question-bridge.legacy-provider'); } catch {}
+  return dispose;
 }
 `;
 }
@@ -195,7 +197,7 @@ export function apply(ctx) {
   if (!isBotmuxSessionEnv(process.env) || process.env.BOTMUX_DSH_ASK_BRIDGE === '0') return;
   const service = ctx.get && ctx.get('userQuestions');
   if (service && typeof service.registerProvider === 'function') {
-    installLegacyOfficialProvider(service);
+    installLegacyOfficialProvider(ctx, service);
     return;
   }
   installWaterfallBridge(ctx);
