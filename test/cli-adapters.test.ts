@@ -751,7 +751,7 @@ describe('dsh buildArgs (runner model)', () => {
     expect(args).toContain(String(30 * 60 * 1000));
   });
 
-  it('passes the question bridge patch to the runner when enabled', () => {
+  it('passes the question bridge patch to the runner when enabled for the default botmux profile', () => {
     delete process.env.BOTMUX_DSH_ASK_BRIDGE;
     const root = mkdtempSync(join(tmpdir(), 'dsh-bridge-home-'));
     const previousHome = process.env.HOME;
@@ -768,6 +768,16 @@ describe('dsh buildArgs (runner model)', () => {
       else process.env.HOME = previousHome;
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it('does not inject the question bridge into custom dsh profiles', () => {
+    delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    const bridgeAdapter = createDshAdapter('/opt/dsh/bin/dsh');
+    const args = bridgeAdapter.buildArgs({ sessionId: 's', resume: false, dshProfile: 'custom' });
+    expect(args).toContain('--dsh-profile');
+    expect(args).toContain('custom');
+    expect(args).not.toContain('--bridge-patch');
+    expect(bridgeAdapter.sandboxReadonlyPaths?.()).toEqual([]);
   });
 
   it('omits --turn-timeout-ms when unset or non-positive', () => {

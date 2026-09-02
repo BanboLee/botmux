@@ -62,8 +62,7 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
     },
 
     sandboxReadonlyPaths() {
-      const bridge = bridgePatch();
-      return bridge ? [bridge.readonlyRoot] : [];
+      return cachedBridge ? [cachedBridge.readonlyRoot] : [];
     },
 
     buildArgs({ sessionId, workingDir, botName, botOpenId, locale, model, turnTimeoutMs, dshProfile }) {
@@ -84,8 +83,12 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
       pushOpt(args, '--bot-open-id', botOpenId);
       pushOpt(args, '--locale', locale);
       pushOpt(args, '--model', model && model.trim() ? model.trim() : undefined);
-      pushOpt(args, '--dsh-profile', dshProfile && dshProfile.trim() ? dshProfile.trim() : 'botmux');
-      const bridge = bridgePatch();
+      const profile = dshProfile && dshProfile.trim() ? dshProfile.trim() : 'botmux';
+      pushOpt(args, '--dsh-profile', profile);
+      // Legacy DSH has a single provider seat. Only auto-inject into the
+      // botmux-owned default profile where we know no user question provider is
+      // present; custom profiles may intentionally carry their own provider.
+      const bridge = profile === 'botmux' ? bridgePatch() : null;
       pushOpt(args, '--bridge-patch', bridge?.patchPath);
       // Per-bot turn timeout override; undefined → runner default (10 min).
       pushOpt(args, '--turn-timeout-ms', typeof turnTimeoutMs === 'number' && turnTimeoutMs > 0
