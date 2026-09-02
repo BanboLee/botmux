@@ -6,6 +6,15 @@ import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
+const BRACKETED_PASTE_START = '\x1b[200~';
+const BRACKETED_PASTE_END = '\x1b[201~';
+
+function sendBracketedPaste(pty: PtyHandle, content: string): boolean {
+  const framed = `${BRACKETED_PASTE_START}${content}${BRACKETED_PASTE_END}`;
+  if (pty.sendText) return pty.sendText(framed) !== false;
+  return pty.write(framed) !== false;
+}
+
 /**
  * dsh-tui adapter — PTY-driven full-screen TUI for DeepSeek Harness.
  *
@@ -72,21 +81,18 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
       // Botmux prompts are often multiline, so inject them as bracketed paste
       // and press Enter exactly once after the whole draft is in the composer.
       try {
+        // Emit the markers ourselves instead of relying on backend pasteText():
+        // tmux/zellij wrap pasteText correctly, but herdr's pasteText is only a
+        // literal write. One explicit wire format keeps every backend equivalent.
+        const pasted = sendBracketedPaste(pty, content);
+        if (!pasted) return { submitted: false };
+
         if (pty.sendSpecialKeys) {
-          if (pty.pasteText) {
-            const pasted = pty.pasteText(content) as unknown;
-            if (pasted === false) return { submitted: false };
-          } else {
-            const written = pty.write(`\x1b[200~${content}\x1b[201~`);
-            if (written === false) return { submitted: false };
-          }
           await delay(200);
           const submitted = pty.sendSpecialKeys('Enter');
           if (submitted === false) return { submitted: false };
         } else {
-          const written = pty.write(`\x1b[200~${content}\x1b[201~`);
-          if (written === false) return { submitted: false };
-          await delay(200);
+          await delay(1000);
           const submitted = pty.write('\r');
           if (submitted === false) return { submitted: false };
         }

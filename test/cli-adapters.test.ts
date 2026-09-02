@@ -858,7 +858,7 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     expect(adapter.authPaths).toContain('~/.dsh-tui');
   });
 
-  it('writeInput pastes multiline text and presses one Enter', async () => {
+  it('writeInput frames multiline text itself and presses one Enter', async () => {
     const content = 'line1\nline2\nline3';
     const sendText = vi.fn(() => true);
     const pasteText = vi.fn(() => true);
@@ -873,9 +873,9 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     const result = await adapter.writeInput!(pty, content);
 
     expect(result).toBeUndefined();
-    expect(pasteText).toHaveBeenCalledOnce();
-    expect(pasteText).toHaveBeenCalledWith(content);
-    expect(sendText).not.toHaveBeenCalled();
+    expect(sendText).toHaveBeenCalledOnce();
+    expect(sendText).toHaveBeenCalledWith(`\x1b[200~${content}\x1b[201~`);
+    expect(pasteText).not.toHaveBeenCalled();
     expect(sendSpecialKeys).toHaveBeenCalledTimes(1);
     expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
   });
@@ -908,20 +908,39 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
 
     await adapter.writeInput!(pty, content);
 
-    expect(pasteText).toHaveBeenCalledTimes(1);
-    expect(pasteText).toHaveBeenCalledWith(content);
-    expect(sendText).not.toHaveBeenCalled();
+    expect(sendText).toHaveBeenCalledTimes(1);
+    expect(sendText).toHaveBeenCalledWith(`\x1b[200~${content}\x1b[201~`);
+    expect(pasteText).not.toHaveBeenCalled();
     expect(sendSpecialKeys).toHaveBeenCalledTimes(1);
     expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
   });
 
-  it('writeInput wraps bracketed paste when pasteText is unavailable', async () => {
+  it('writeInput ignores void-returning pasteText and treats void sends as successful', async () => {
+    const content = 'line1\nline2';
+    const sendText = vi.fn(() => undefined);
+    const pasteText = vi.fn(() => undefined);
+    const sendSpecialKeys = vi.fn(() => undefined);
+    const pty = {
+      write: vi.fn(() => true),
+      sendText,
+      pasteText,
+      sendSpecialKeys,
+    } as unknown as PtyHandle;
+
+    const result = await adapter.writeInput!(pty, content);
+
+    expect(result).toBeUndefined();
+    expect(sendText).toHaveBeenCalledWith(`\x1b[200~${content}\x1b[201~`);
+    expect(pasteText).not.toHaveBeenCalled();
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('writeInput wraps bracketed paste with write when sendText is unavailable', async () => {
     const content = 'line1\nline2';
     const write = vi.fn(() => true);
     const sendSpecialKeys = vi.fn(() => true);
     const pty = {
       write,
-      sendText: vi.fn(() => true),
       sendSpecialKeys,
     } as unknown as PtyHandle;
 
@@ -930,7 +949,6 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     expect(result).toBeUndefined();
     expect(write).toHaveBeenCalledTimes(1);
     expect(write).toHaveBeenCalledWith(`\x1b[200~${content}\x1b[201~`);
-    expect(pty.sendText).not.toHaveBeenCalled();
     expect(sendSpecialKeys).toHaveBeenCalledTimes(1);
     expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
   });
@@ -951,7 +969,7 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
   it('writeInput returns submitted false when paste, write, or Enter is rejected', async () => {
     await expect(adapter.writeInput!({
       write: vi.fn(() => true),
-      pasteText: vi.fn(() => false),
+      sendText: vi.fn(() => false),
       sendSpecialKeys: vi.fn(() => true),
     } as unknown as PtyHandle, 'paste rejected')).resolves.toEqual({ submitted: false });
 
@@ -966,15 +984,15 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
 
     await expect(adapter.writeInput!({
       write: vi.fn(() => true),
-      pasteText: vi.fn(() => true),
+      sendText: vi.fn(() => true),
       sendSpecialKeys: vi.fn(() => false),
     } as unknown as PtyHandle, 'enter rejected')).resolves.toEqual({ submitted: false });
   });
 
-  it('writeInput returns submitted false when paste throws', async () => {
+  it('writeInput returns submitted false when bracketed paste send throws', async () => {
     await expect(adapter.writeInput!({
       write: vi.fn(() => true),
-      pasteText: vi.fn(() => { throw new Error('paste failed'); }),
+      sendText: vi.fn(() => { throw new Error('paste failed'); }),
       sendSpecialKeys: vi.fn(() => true),
     } as unknown as PtyHandle, 'boom')).resolves.toEqual({ submitted: false });
   });
