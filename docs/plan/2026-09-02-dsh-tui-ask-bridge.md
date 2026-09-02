@@ -944,7 +944,7 @@ bunx vitest run test/ask-hook-dsh.test.ts test/dsh-question-bridge.test.ts test/
 - [x] W3-T1：公共 ask 链路回归保护；本轮未修改公共 ask 类型/card，后续验收仍跑既有 hook 回归。
 - [x] W3-T2：更新设计与测试文档。
 - [x] W4-T1：fake 集成测试。
-- [ ] W4-T2：真实 smoke 矩阵。
+- [ ] W4-T2：真实 smoke 矩阵（等待用户确认是否允许重启 live daemon；自动化替代与本地 profile patch smoke 已通过）。
 
 ### 回滚与运营 Todo
 
@@ -955,13 +955,13 @@ bunx vitest run test/ask-hook-dsh.test.ts test/dsh-question-bridge.test.ts test/
 
 ### 验收 Todo
 
-- [ ] 并行 Gate A：代码质量与简洁性。
-- [ ] 并行 Gate B：编译与基础测试。
-- [ ] 并行 Gate C：计划漂移与范围控制。
-- [ ] 并行 Gate D：架构合理性与安全路由。
-- [ ] 并行 Gate E：测试充分性。
-- [ ] 若任一 Gate 失败：修复并重新并行运行 A-E。
-- [ ] 五个 Gate 同轮全部通过后，整理最终交付说明。
+- [x] 并行 Gate A：代码质量与简洁性。
+- [x] 并行 Gate B：编译与基础测试。
+- [x] 并行 Gate C：计划漂移与范围控制。
+- [x] 并行 Gate D：架构合理性与安全路由。
+- [x] 并行 Gate E：测试充分性。
+- [x] 若任一 Gate 失败：修复并重新并行运行 A-E。
+- [x] 五个 Gate 同轮全部通过后，整理最终交付说明。
 
 ---
 
