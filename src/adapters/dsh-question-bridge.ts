@@ -331,12 +331,37 @@ export const Config = original.Config;
 function rawService(service) {
   return service && service[Symbol.for('cordis.original')] || service;
 }
+function isJsExpression(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) && typeof value.__jsExpr === 'string';
+}
+function isConfigObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+function evaluateJsExpression(ctx, value) {
+  return Function('ctx', 'with (ctx) { return eval(' + JSON.stringify(value.__jsExpr) + '); }')(ctx);
+}
+function resolveDshTuiConfigExpressions(ctx, value) {
+  if (!isJsExpression(value)) return value;
+  return evaluateJsExpression(ctx, value);
+}
+function materializeDshTuiConfig(ctx, config) {
+  if (!isConfigObject(config)) return config;
+  const workspace = resolveDshTuiConfigExpressions(ctx, config.workspace);
+  const preset = resolveDshTuiConfigExpressions(ctx, config.preset);
+  const sessionId = resolveDshTuiConfigExpressions(ctx, config.sessionId);
+  if (Object.is(workspace, config.workspace) && Object.is(preset, config.preset) && Object.is(sessionId, config.sessionId)) {
+    return config;
+  }
+  return { ...config, workspace, preset, sessionId };
+}
 function originalDshTuiConfig(ctx, wrapperConfig) {
+  let originalConfig;
   try {
     const entry = [...ctx.loader.entries()].find((candidate) => candidate.options && candidate.options.id === 'dsh-tui');
-    if (entry && entry.options && entry.options.config !== undefined) return entry.options.config;
+    if (entry && entry.options && entry.options.config !== undefined) originalConfig = entry.options.config;
   } catch {}
-  if (wrapperConfig && Object.keys(wrapperConfig).length > 0) return wrapperConfig;
+  if (originalConfig !== undefined) return materializeDshTuiConfig(ctx, originalConfig);
+  if (isConfigObject(wrapperConfig) && Object.keys(wrapperConfig).length > 0) return materializeDshTuiConfig(ctx, wrapperConfig);
   throw new Error('botmux dsh-tui wrapper could not find original dsh-tui config');
 }
 function wrapLegacyProvider(service) {

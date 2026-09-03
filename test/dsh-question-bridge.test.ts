@@ -431,6 +431,76 @@ export async function apply() {}
     delete process.env.BOTMUX_LARK_APP_ID;
   });
 
+  it('generated dsh-tui wrapper resolves raw env-expression workspace config before original apply', async () => {
+    const home = tmp();
+    const originalSource = `
+export const name = 'dsh-tui';
+export const inject = ['agents'];
+export const Config = { marker: true };
+export async function apply(_ctx, config) {
+  if (typeof config.workspace !== 'string') throw new TypeError('workspace must be a string');
+  globalThis.__botmuxWrapperConfig = config;
+}
+`;
+    const profile = makeDshTuiProfile(home, originalSource);
+    process.env.BOTMUX_SESSION_ID = 's';
+    process.env.BOTMUX_CHAT_ID = 'c';
+    process.env.BOTMUX_LARK_APP_ID = 'app';
+    process.env.DSH_TUI_WORKSPACE_TARGET = '/tmp/dsh-workspace';
+    process.env.DSH_TUI_PRESET = 'standard';
+    process.env.DSH_TUI_RESUME_SESSION = 'session-from-env';
+    const result = ensureDshQuestionBridgePatch({
+      cliId: 'dsh-tui',
+      homeDir: home,
+      dshTuiProfileDir: profile,
+      hookCommand: { cmd: process.execPath, args: ['-e', ''] },
+      buildSalt: 'raw-js-config',
+    })!;
+    const mod = await import(`${pathToFileURL(result.pluginPath).href}?case=${Date.now()}`);
+    const workspaceExpression = { __jsExpr: 'process.env.DSH_TUI_WORKSPACE_TARGET ?? undefined' };
+    const presetExpression = { __jsExpr: 'process.env.DSH_TUI_PRESET ?? undefined' };
+    const sessionExpression = { __jsExpr: 'process.env.DSH_TUI_RESUME_SESSION ?? process.env.DSH_CC_RESUME_SESSION ?? undefined' };
+    const service: any = { registerProvider() { return () => undefined; } };
+    const ctx: any = {
+      userQuestions: service,
+      get: (name: string) => name === 'userQuestions' ? service : undefined,
+      effect: () => undefined,
+      loader: {
+        entries: function* () {
+          yield {
+            options: {
+              id: 'dsh-tui',
+              config: {
+                provider: 'deepseek-official',
+                fullscreen: true,
+                effort: 'max',
+                preset: presetExpression,
+                workspace: workspaceExpression,
+                sessionId: sessionExpression,
+              },
+            },
+          };
+        },
+      },
+    };
+    await mod.apply(ctx, {});
+    expect((globalThis as any).__botmuxWrapperConfig).toMatchObject({
+      provider: 'deepseek-official',
+      fullscreen: true,
+      effort: 'max',
+      preset: 'standard',
+      workspace: '/tmp/dsh-workspace',
+      sessionId: 'session-from-env',
+    });
+    delete (globalThis as any).__botmuxWrapperConfig;
+    delete process.env.BOTMUX_SESSION_ID;
+    delete process.env.BOTMUX_CHAT_ID;
+    delete process.env.BOTMUX_LARK_APP_ID;
+    delete process.env.DSH_TUI_WORKSPACE_TARGET;
+    delete process.env.DSH_TUI_PRESET;
+    delete process.env.DSH_TUI_RESUME_SESSION;
+  });
+
   it('generated dsh-tui wrapper prefers bridge answers before native provider', async () => {
     const home = tmp();
     const originalSource = `
