@@ -1,8 +1,8 @@
 # dsh / dsh-tui ask_user_question 飞书桥接实现计划
 
-> 状态：计划已通过第二轮双 subagent review，并已获用户批准；进入实现阶段。  
-> 分支基线：`master`，已 fast-forward 到 `origin/master @ f5fa07bff21174d0678b688cda8784018d538de9`。  
-> 约束：在用户 review 明确通过前，**不得修改任何实现代码**；本文只描述后续实施计划。
+> 状态：计划已通过第二轮双 subagent review，并已获用户批准；实现已进入验收收敛阶段。
+> 分支基线：`master`，已 fast-forward 到 `origin/master @ f5fa07bff21174d0678b688cda8784018d538de9`。
+> 约束：后续只做验证、文档补齐与必要修复；每完成计划 Todo 仍同步更新本文并提交。
 
 ## 0. 背景与当前事实
 
@@ -955,13 +955,13 @@ bunx vitest run test/ask-hook-dsh.test.ts test/dsh-question-bridge.test.ts test/
 
 ### 验收 Todo
 
-- [x] 并行 Gate A：代码质量与简洁性。
-- [x] 并行 Gate B：编译与基础测试。
-- [x] 并行 Gate C：计划漂移与范围控制。
-- [x] 并行 Gate D：架构合理性与安全路由。
-- [x] 并行 Gate E：测试充分性。
+- [ ] 并行 Gate A：代码质量与简洁性（最新 HEAD 重跑中）。
+- [ ] 并行 Gate B：编译与基础测试（最新 HEAD 重跑中）。
+- [ ] 并行 Gate C：计划漂移与范围控制（最新 HEAD 重跑中）。
+- [ ] 并行 Gate D：架构合理性与安全路由（最新 HEAD 重跑中）。
+- [ ] 并行 Gate E：测试充分性（最新 HEAD 重跑中）。
 - [x] 若任一 Gate 失败：修复并重新并行运行 A-E。
-- [x] 五个 Gate 同轮全部通过后，整理最终交付说明。
+- [ ] 五个 Gate 同轮全部通过后，整理最终交付说明。
 
 ---
 
