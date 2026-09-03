@@ -128,13 +128,12 @@ const dshAdapter: HookAskAdapter = {
       ? ((parsed.raw as { rawQuestions: RawDshQuestion[] }).rawQuestions)
       : [];
     const customText = (comment ?? '').trim();
-    const singleQuestionCustom = parsed.questions.length === 1 && customText.length > 0;
     const answers = parsed.questions.map((_q, i) => {
       const selected = [...(answersByQuestion[i] ?? [])];
       return {
         id: rawQuestionId(rawQuestions[i] ?? {}, i),
         selected,
-        ...(selected.length === 0 && singleQuestionCustom ? { custom: customText } : {}),
+        ...(selected.length === 0 && customText.length > 0 ? { custom: customText } : {}),
       };
     });
     return JSON.stringify({ answers });

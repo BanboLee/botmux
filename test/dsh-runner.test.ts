@@ -494,6 +494,23 @@ records:
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
   });
 
+  it('parses flat credential files with YAML comments through the bundled parser', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
+    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS, 'SUPER_RELAY_API_KEY: cred-from-flat-file  # production key\n');
+    h = spawnRunner('happy', [], {
+      SUPER_RELAY_API_KEY: undefined,
+      FAKE_DSH_EXPECT_ENV_JSON: JSON.stringify({ SUPER_RELAY_API_KEY: 'cred-from-flat-file' }),
+    }, home);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+  });
+
+  it('keeps yaml as a static import so bun --compile bundles the real parser', () => {
+    const source = readFileSync(RUNNER_PATH, 'utf8');
+    expect(source).toContain("from 'yaml'");
+    expect(source).not.toContain("req('yaml')");
+    expect(source).not.toContain('parseMinimalYaml');
+  });
+
   it('lets ambient credentials override the versioned credential file', async () => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
     writeNativeDshConfig(home, SUPER_RELAY_SETTINGS, `

@@ -71,7 +71,8 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
     },
 
     sandboxReadonlyPaths() {
-      return cachedBridge ? [cachedBridge.readonlyRoot] : [];
+      const bridge = bridgePatch();
+      return bridge ? [bridge.readonlyRoot] : [];
     },
 
     buildArgs({ sessionId, workingDir, botName, botOpenId, locale, model, turnTimeoutMs, dshProfile }) {

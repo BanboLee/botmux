@@ -770,6 +770,21 @@ describe('dsh buildArgs (runner model)', () => {
     }
   });
 
+  it('materializes the question bridge for sandbox readonly paths even before buildArgs runs', () => {
+    delete process.env.BOTMUX_DSH_ASK_BRIDGE;
+    const root = mkdtempSync(join(tmpdir(), 'dsh-bridge-home-'));
+    const previousHome = process.env.HOME;
+    try {
+      process.env.HOME = root;
+      const bridgeAdapter = createDshAdapter('/opt/dsh/bin/dsh');
+      expect(bridgeAdapter.sandboxReadonlyPaths?.()).toEqual([expect.stringContaining(join(root, '.botmux', 'dsh-question-bridge'))]);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('does not inject the question bridge into custom dsh profiles', () => {
     delete process.env.BOTMUX_DSH_ASK_BRIDGE;
     const bridgeAdapter = createDshAdapter('/opt/dsh/bin/dsh');
@@ -777,7 +792,7 @@ describe('dsh buildArgs (runner model)', () => {
     expect(args).toContain('--dsh-profile');
     expect(args).toContain('custom');
     expect(args).not.toContain('--bridge-patch');
-    expect(bridgeAdapter.sandboxReadonlyPaths?.()).toEqual([]);
+    expect(bridgeAdapter.sandboxReadonlyPaths?.()).toEqual([expect.stringContaining(join(homedir(), '.botmux', 'dsh-question-bridge'))]);
   });
 
   it('omits --turn-timeout-ms when unset or non-positive', () => {

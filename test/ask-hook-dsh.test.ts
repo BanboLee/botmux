@@ -143,12 +143,12 @@ describe('DSH user-questions hook adapter', () => {
       });
     });
 
-    it('does not spread one custom reply across multiple questions', () => {
+    it('uses a typed custom reply for each unanswered question', () => {
       const parsed = dsh.parseQuestions(multiPayload)!;
       const out = JSON.parse(dsh.formatAnswer([[], ['研发团队']], parsed, '补充说明'));
       expect(out).toEqual({
         answers: [
-          { id: 'scope', selected: [] },
+          { id: 'scope', selected: [], custom: '补充说明' },
           { id: 'notify', selected: ['研发团队'] },
         ],
       });

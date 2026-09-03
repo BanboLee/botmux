@@ -32,7 +32,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { createRequire } from 'node:module';
+import { parse as parseYaml } from 'yaml';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 
 const DSH_MARKER = '::botmux-dsh:';
@@ -138,49 +138,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-let parseYamlImpl: ((input: string) => unknown) | undefined;
-
-function scalarYamlValue(raw: string): unknown {
-  const value = raw.trim();
-  if (!value) return {};
-  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-    return value.slice(1, -1);
-  }
-  if (value === 'true') return true;
-  if (value === 'false') return false;
-  const numeric = Number(value);
-  if (Number.isFinite(numeric) && /^-?\d+(?:\.\d+)?$/.test(value)) return numeric;
-  return value;
-}
-
-function parseMinimalYaml(input: string): unknown {
-  const root: Record<string, unknown> = {};
-  const stack: Array<{ indent: number; value: Record<string, unknown> }> = [{ indent: -1, value: root }];
-  for (const line of input.split(/\r?\n/)) {
-    if (!line.trim() || line.trimStart().startsWith('#')) continue;
-    const match = /^(\s*)([^:#]+):(?:\s*(.*))?$/.exec(line);
-    if (!match) continue;
-    const indent = match[1]!.length;
-    const key = match[2]!.trim();
-    const rawValue = match[3] ?? '';
-    while (stack.length > 1 && indent <= stack[stack.length - 1]!.indent) stack.pop();
-    const parent = stack[stack.length - 1]!.value;
-    const value = scalarYamlValue(rawValue);
-    parent[key] = value;
-    if (isRecord(value) && rawValue.trim() === '') stack.push({ indent, value });
-  }
-  return root;
-}
-
 function parseYamlDocument(input: string): unknown {
-  if (!parseYamlImpl) {
-    try {
-      const req = createRequire(import.meta.url);
-      const mod = req('yaml') as { parse?: (value: string) => unknown };
-      parseYamlImpl = typeof mod.parse === 'function' ? mod.parse : undefined;
-    } catch { /* dependency unavailable in some source-tree test checkouts */ }
-  }
-  return parseYamlImpl ? parseYamlImpl(input) : parseMinimalYaml(input);
+  return parseYaml(input);
 }
 
 function readJsonRecord(filePath: string): Record<string, unknown> | null {
