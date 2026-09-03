@@ -64,8 +64,8 @@
 
 ### 1.2 不实现
 
-1. 不修改 `/data00/home/lixingxin/project/dsh-TUI/**`。
-2. 不修改 `/data00/home/lixingxin/project/deepseek-harness/**`。
+1. 不修改 sibling checkout `dsh-TUI/**`。
+2. 不修改 sibling checkout `deepseek-harness/**`。
 3. 不做 PTY 抓屏、屏幕 OCR、按键模拟 dsh-tui 问卷面板。
 4. MVP 不支持 text-only 问题；后续单独扩展 botmux ask text input。
 5. MVP 不接管 `intent.kind === 'plan-review'` 或 approval 语义。
@@ -944,7 +944,7 @@ bunx vitest run test/ask-hook-dsh.test.ts test/dsh-question-bridge.test.ts test/
 - [x] W3-T1：公共 ask 链路回归保护；本轮未修改公共 ask 类型/card，后续验收仍跑既有 hook 回归。
 - [x] W3-T2：更新设计与测试文档。
 - [x] W4-T1：fake 集成测试。
-- [x] W4-T2：真实 smoke 矩阵（dsh-tui 与 official dsh 单问单选 live smoke 均通过；official dsh 验证中补齐 botmux profile 的 `dsh-llm-pi-ai-with-session` 与 `@deepseek-ai/dsh-tool-ask-user` 后通过）。
+- [x] W4-T2：真实 smoke 矩阵（dsh-tui 与 official dsh 单问单选 live smoke 均通过；official dsh 验证中补齐本机默认 provider 所需 profile 配置与 `@deepseek-ai/dsh-tool-ask-user` 后通过）。
 
 ### 回滚与运营 Todo
 
@@ -971,17 +971,17 @@ bunx vitest run test/ask-hook-dsh.test.ts test/dsh-question-bridge.test.ts test/
 
 - W0-T1：PASS。临时 fake `dsh` 探测确认：`dsh-tui --patch=/tmp/p1.yml --resume abc --patch=/tmp/p2.yml /tmp/workspace-target` 最终调用 `dsh --profile dsh-tui --patch=/tmp/p1.yml --patch=/tmp/p2.yml`，`--resume` 被 launcher 消费为 env，绝对 workspace target 不透传；双 token `--patch /tmp/p1.yml` 会只透传 `--patch`，路径被 launcher 当 workspace target 吃掉。因此实现必须使用单 token `--patch=/abs/path`，并由测试锁定。
 - W0-T2：PASS。源码与 /tmp 临时脚本验证：顶层 `- insert:` 会插入 root entries；`name: file:///abs/bridge.mjs` 可被 Loader import；重复 id 会在 Loader group 层报 `duplicate loader entry id`，所以 bridge row id 必须使用包含短 hash 的唯一 id；`ctx.on(..., { prepend: true })` 通过 `unshift` 排在普通 listener 前；root/unscoped listener 能收到 agent-scoped `user-questions/request`，条件不接管时必须显式 `return next()`。相对 `./bridge.mjs` 也可按 overlay parser 锚定到 patch 目录，但 MVP 固定使用绝对 file URL 规避歧义。
-- W0-T3：PASS（能力分类结果触发方案修订）。当前实际 `dsh --version` 是 `0.1.1-rc.2`，其 `@deepseek-ai/dsh-user-questions` 是 legacy `registerProvider()` 单 provider seat，没有 `user-questions/request` waterfall；`/data00/home/lixingxin/project/deepseek-harness` 源码 `0.1.2-alpha.4` 已支持 waterfall。official botmux profile 在 legacy 下没有 TUI/Web provider，可注册 bridge provider；dsh-tui legacy 下自身会注册 QuestionStore provider，普通追加 bridge row 不可靠，必须改为 dsh-tui wrapper entry：先安装 composite/wrapped provider，再调用原始 dsh-tui apply；wrapper 不可行时不接管并保留原生 TUI。
+- W0-T3：PASS（能力分类结果触发方案修订）。当前实际 `dsh --version` 是 `0.1.1-rc.2`，其 `@deepseek-ai/dsh-user-questions` 是 legacy `registerProvider()` 单 provider seat，没有 `user-questions/request` waterfall；sibling `deepseek-harness` 源码 `0.1.2-alpha.4` 已支持 waterfall。official botmux profile 在 legacy 下没有 TUI/Web provider，可注册 bridge provider；dsh-tui legacy 下自身会注册 QuestionStore provider，普通追加 bridge row 不可靠，必须改为 dsh-tui wrapper entry：先安装 composite/wrapped provider，再调用原始 dsh-tui apply；wrapper 不可行时不接管并保留原生 TUI。
 - W0-T4：PASS。静态审查确认 adapter `sandboxReadonlyPaths()` 会在 worker 中汇入 readonlyRoots 并由 fs-policy 编译；目录必须在 buildFsPolicy 前创建。`hookCommandParts()` 在 Node 态使用当前 checkout 的 `dist/cli.js`，standalone 态直接 `<binary> hook ...`，避免 `$bunfs` 和 global shim 漂移。sandbox 写 `/run/sbxbin/botmux` shim，并把 `/run/sbxbin` 与 canonical node/CLI bin dirs 放入 PATH；bridge 使用 argv spawn 不依赖 shell。worker/tmux/sandbox 会注入 `BOTMUX_SESSION_ID/CHAT_ID/LARK_APP_ID/ROOT_MESSAGE_ID/BOTMUX_DAEMON_IPC_PORT` 与 capability relay，daemon `/api/asks` 对非 trusted-host 请求校验 capability 并绑定 daemon 侧 session/chat/app 身份。已跑回归：`bun test test/hook-command-compiled-form.test.ts test/sandbox-shim-compiled-form.test.ts test/sandbox-relay-watcher.test.ts test/session-ready-cli.test.ts test/read-isolation.test.ts`，结果 113 pass / 0 fail。
 - W0-T5：PASS。源码与临时脚本验证：DSH `AskUserQuestionAnswerItem.selected` 明确是 option label，不存在协议级 hidden value/index；推荐标记也是 label 文本的一部分。DSH 原生 UI/Store 对重复、空、多行、超长、Markdown label 基本不强校验，但 botmux bridge 为可表示性和回写确定性收紧：label 必须非空、非纯空白、单行、长度 <= 200、同一 question 内 exact string 唯一，并且 answer 回写原始 label 不 trim。text-only 是 DSH 原生能力但 MVP bridge unsupported；plan-review 语义特殊不接管；mixed request 无部分 claim 协议，整体 fallback/error。
 - W0-T6：PASS after revision。原“按 `id: dsh-tui` 直接替换 `name`”方案失败：DSH patch 的 `name` 是 mismatch guard，不是 override 字段，会 warn 并 skip。修订方案为“disable 原 `id: dsh-tui` + root insert 唯一 id wrapper”：`dsh --profile dsh-tui --patch=/tmp/.../wrapper.patch.yml --dump-config` 证明原 entry 可 `disabled: true`，wrapper row 可插入且无 duplicate id；用当前实际 profile 的原始 dsh-tui `lib/types/index.js` 绝对 file URL，真实启动时 wrapper marker 写入成功，说明 wrapper 可 import 原始 dsh-tui 并执行；独立 JS 探针验证 legacy `registerProvider` 可被临时 wrap 成 composite provider，bridgeable 走 bridge，unsupported/failure 走 native provider，并在 dispose 后恢复。实现时必须生成 wrapper patch 而非普通追加 bridge row；wrapper 需要用当前 profile 中原始 dsh-tui package 的 resolved absolute file URL，避免 import 包名递归到自身；W4 smoke 仍需覆盖真实交互式 TTY 下 wrapper 启动。
 
 ## 8.1 W4 smoke 结果记录
 
-- dsh-tui live smoke：PASS。新启动 dsh-tui 进程携带 `--patch=/home/lixingxin/.botmux/dsh-question-bridge/.../cordis.patch.yml`；原生 `AskUserQuestion` 触发 `ask-broker: registered + persisted ask 8bca76f1…`，飞书选择卡出现并选择“成功”，回答返回 CLI。
-- official dsh live smoke：PASS。临时测试 bot 切为 `cliId: dsh` + `dshProfile: botmux` 后，runner 启动命令携带 `--bridge-patch /data00/home/lixingxin/.botmux/dsh-question-bridge/c504d47546b27650/cordis.patch.yml`；补齐 botmux profile 的 `dsh-llm-pi-ai-with-session` route 和 `@deepseek-ai/dsh-tool-ask-user` 后，session `0819c371-04d7-457e-8917-3318d1e7755a` 记录 `ask-broker: registered + persisted ask 6ebee303-c55c-497d-b8c5-2c596e06ba72`，飞书选择卡已选择“成功”，随后 `Bridge final_output forwarded ... 2 chars` 返回 `成功`。
-- 验证后已恢复临时测试 bot 配置为 `cliId: dsh-tui` 并单独重启；日志确认 `Bot 2/5 ... (cli: dsh-tui)`、`CLI version: 0.9.2 (launcher)`。
-- 外部 sibling repo 状态记录：`/data00/home/lixingxin/project/dsh-TUI` 有未跟踪 `swap-pane`；`/data00/home/lixingxin/project/deepseek-harness` 有未跟踪 `data/` 与 `swap-pane`。这些不属于 `another_botmux` 本分支 diff，未纳入交付。
+- dsh-tui live smoke：PASS。新启动 dsh-tui 进程携带临时 `--patch=<bridgePatch>`；原生 `AskUserQuestion` 触发 `ask-broker: registered + persisted ask ...`，飞书选择卡出现并选择“成功”，回答返回 CLI。
+- official dsh live smoke：PASS。临时测试 bot 切为 `cliId: dsh` + `dshProfile: botmux` 后，runner 启动命令携带 `--bridge-patch <bridgePatch>`；补齐本机默认 provider 所需 profile route 和 `@deepseek-ai/dsh-tool-ask-user` 后，目标 session 记录 `ask-broker: registered + persisted ask ...`，飞书选择卡已选择“成功”，随后 `Bridge final_output forwarded ...` 返回成功结果。
+- 验证后已恢复临时测试 bot 配置为 `cliId: dsh-tui` 并单独重启；日志确认该 bot 回到 dsh-tui launcher。
+- 外部 sibling repo 状态记录：sibling checkout `dsh-TUI` 有未跟踪 `swap-pane`；sibling checkout `deepseek-harness` 有未跟踪 `data/` 与 `swap-pane`。这些不属于 `another_botmux` 本分支 diff，未纳入交付。
 
 ---
 
