@@ -139,15 +139,26 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
     // rather than dropped. The worker input gate can therefore write queued
     // Lark messages while the TUI is busy instead of waiting for an idle
     // detection, which the incremental renderer would otherwise starve (the
-    // static screen never re-emits the ❯ row, so readyPattern alone never
-    // proves idle again after the first turn).
+    // static screen never re-emits the ❯ row while a turn is in flight, so
+    // readyPattern alone never proves idle again after the first turn).
+    //
+    // Semantics note: botmux's writeInput always submits with Enter, so every
+    // queued message is STEERED into the active turn (a follow-up amendment) —
+    // it is not queued as a fresh topic after the turn, and there is no
+    // structured transcript bridge to attribute the merged reply. That matches
+    // the codex/pi type-ahead contract and is the intended behaviour for
+    // follow-ups; a brand-new question mid-turn lands on the same steer path.
     supportsTypeAhead: true,
-    // With type-ahead in place the first prompt must still not be held too
-    // long: the TUI's Ink startup render can swallow stdin sent before the
-    // composer is mounted, but the TUI boots in ~1-3s, so the soft 15s
-    // first-prompt timeout is more than enough and avoids waiting out the
-    // full 90s hard cap when idle detection never fires.
-    deferFirstPromptTimeoutUntilReady: false,
+    // The TUI's Ink startup render can swallow stdin sent before the composer
+    // is mounted; hold the first prompt until ❯ appears. The TUI boots in
+    // three stages (launcher shell → profile node bin → `dsh --profile`), and
+    // a first run additionally runs `dsh plugin add` (a pnpm install) — that
+    // path can exceed any soft timeout, so we keep the 90s hard cap. With
+    // type-ahead enabled the hard-cap fallback is a safe flush for a booted
+    // TUI (decideHardTimeoutAction -> 'flush'), so deferring does not
+    // reintroduce the queued-message stall: it only delays the first write
+    // until idle is proven or the hard cap fires.
+    deferFirstPromptTimeoutUntilReady: true,
     altScreen: false,
     // ~/.dsh holds profiles + credentials + sessions; ~/.dsh-tui holds
     // resume.txt. Both must survive the file sandbox.

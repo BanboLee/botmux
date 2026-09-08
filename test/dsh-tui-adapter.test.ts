@@ -31,8 +31,8 @@ describe('dsh-tui adapter', () => {
     expect(createDshTuiAdapter().supportsTypeAhead).toBe(true);
   });
 
-  it('does not defer the soft first-prompt timeout (TUI boots in ~1-3s)', () => {
-    expect(createDshTuiAdapter().deferFirstPromptTimeoutUntilReady).toBe(false);
+  it('defers the soft first-prompt timeout until readyPattern or the 90s hard cap', () => {
+    expect(createDshTuiAdapter().deferFirstPromptTimeoutUntilReady).toBe(true);
   });
 
   it('input gate admits dsh-tui messages once the first prompt has been reached', () => {
@@ -59,10 +59,12 @@ describe('dsh-tui adapter', () => {
     ).toBe(false);
   });
 
-  it('releases the soft first-prompt timeout at 15s and drains via type-ahead flush', () => {
+  it('holds the first prompt past the soft timeout but flushes safely at the hard cap', () => {
     const adapter = createDshTuiAdapter();
-    // deferFirstPromptTimeoutUntilReady=false ⇒ the soft 15s timeout releases
-    // the first prompt instead of waiting out the 90s hard cap.
+    // deferFirstPromptTimeoutUntilReady=true + readyPattern ⇒ the soft 15s
+    // timeout does NOT release: the TUI boots in three stages and a first run
+    // runs `dsh plugin add` (pnpm install), which can exceed any soft window,
+    // and writing before the composer is mounted would be silently swallowed.
     expect(
       shouldReleaseFirstPromptTimeout({
         deferFirstPromptTimeoutUntilReady: adapter.deferFirstPromptTimeoutUntilReady === true,
@@ -70,9 +72,18 @@ describe('dsh-tui adapter', () => {
         elapsedMs: 15_000,
         hardTimeoutMs: 90_000,
       }),
+    ).toBe(false);
+    // The 90s hard cap does release…
+    expect(
+      shouldReleaseFirstPromptTimeout({
+        deferFirstPromptTimeoutUntilReady: adapter.deferFirstPromptTimeoutUntilReady === true,
+        hasReadyPattern: !!adapter.readyPattern,
+        elapsedMs: 90_000,
+        hardTimeoutMs: 90_000,
+      }),
     ).toBe(true);
-    // A type-ahead adapter drains the held first message through flushPending()
-    // directly (no need to mark prompt-ready first).
+    // …and for a type-ahead adapter the hard-cap fallback is a safe flush
+    // (the TUI is booted by then), not a forced mark-ready.
     expect(decideHardTimeoutAction(adapter.supportsTypeAhead === true)).toBe('flush');
   });
 });
