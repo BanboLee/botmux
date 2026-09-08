@@ -15,7 +15,7 @@
  * step boundary) instead of blocking, so writing while busy is safe — the
  * same contract codex/coco/claude rely on for type-ahead.
  *
- * Run:  pnpm vitest run --project unit test/dsh-tui-adapter.test.ts
+ * Run:  bunx vitest run --project unit test/dsh-tui-adapter.test.ts
  */
 import { describe, expect, it, vi } from 'vitest';
 
@@ -24,7 +24,7 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import { createDshTuiAdapter } from '../src/adapters/cli/dsh-tui.js';
-import { shouldWriteNow } from '../src/utils/input-gate.js';
+import { decideHardTimeoutAction, shouldReleaseFirstPromptTimeout, shouldWriteNow } from '../src/utils/input-gate.js';
 
 describe('dsh-tui adapter', () => {
   it('supports type-ahead so queued messages are written while the TUI is busy', () => {
@@ -57,5 +57,22 @@ describe('dsh-tui adapter', () => {
         awaitingFirstPrompt: true,
       }),
     ).toBe(false);
+  });
+
+  it('releases the soft first-prompt timeout at 15s and drains via type-ahead flush', () => {
+    const adapter = createDshTuiAdapter();
+    // deferFirstPromptTimeoutUntilReady=false ⇒ the soft 15s timeout releases
+    // the first prompt instead of waiting out the 90s hard cap.
+    expect(
+      shouldReleaseFirstPromptTimeout({
+        deferFirstPromptTimeoutUntilReady: adapter.deferFirstPromptTimeoutUntilReady === true,
+        hasReadyPattern: !!adapter.readyPattern,
+        elapsedMs: 15_000,
+        hardTimeoutMs: 90_000,
+      }),
+    ).toBe(true);
+    // A type-ahead adapter drains the held first message through flushPending()
+    // directly (no need to mark prompt-ready first).
+    expect(decideHardTimeoutAction(adapter.supportsTypeAhead === true)).toBe('flush');
   });
 });
