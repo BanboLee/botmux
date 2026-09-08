@@ -133,9 +133,21 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
     readyPattern: /❯/,
     completionPattern: undefined,
     systemHints: [],
-    // The TUI's Ink startup render can swallow stdin sent before the composer
-    // is mounted; hold the first prompt until ❯ appears (90s hard cap in worker).
-    deferFirstPromptTimeoutUntilReady: true,
+    // Type-ahead: the TUI's PromptInput stays mounted and writable while a
+    // turn is working — a non-empty draft submitted with Enter is routed
+    // through channel.steer (injected at the active turn's next step boundary)
+    // rather than dropped. The worker input gate can therefore write queued
+    // Lark messages while the TUI is busy instead of waiting for an idle
+    // detection, which the incremental renderer would otherwise starve (the
+    // static screen never re-emits the ❯ row, so readyPattern alone never
+    // proves idle again after the first turn).
+    supportsTypeAhead: true,
+    // With type-ahead in place the first prompt must still not be held too
+    // long: the TUI's Ink startup render can swallow stdin sent before the
+    // composer is mounted, but the TUI boots in ~1-3s, so the soft 15s
+    // first-prompt timeout is more than enough and avoids waiting out the
+    // full 90s hard cap when idle detection never fires.
+    deferFirstPromptTimeoutUntilReady: false,
     altScreen: false,
     // ~/.dsh holds profiles + credentials + sessions; ~/.dsh-tui holds
     // resume.txt. Both must survive the file sandbox.
