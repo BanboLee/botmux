@@ -163,4 +163,81 @@ setInterval(() => {}, 1_000);
     expect(Math.abs(geometry.input.bottom - geometry.send.bottom)).toBeLessThanOrEqual(0.5);
     expect(geometry.input.height).toBe(42);
   });
+
+  // ── 焦点归属 + 修饰键转发（真实浏览器）─────────────────────────────────────
+  // 上面两条是几何；下面两条是这次回归的行为面：点一下终端之后按键还能不能到
+  // 终端。鼠标点击必须把焦点留在 xterm，触摸点一下才把焦点交给底栏 textarea，
+  // 但两种情况都要在 WS 上看到同一个 {"type":"input","data":"\u0001"}。
+  //
+  // 合成 KeyboardEvent 带不出 keyCode（xterm 的映射按 keyCode 分支），所以走
+  // xterm 那条路时显式补一个 65；走底栏那条路时页面读的是 e.key，不需要补。
+  const activeElementInfo = (): Promise<{ id: string; className: string }> =>
+    page!.evaluate(() => {
+      const active: Element | null = document.activeElement;
+      return { id: active?.id ?? '', className: active?.className?.toString() ?? '' };
+    });
+  const pressComposerCtrlA = async (): Promise<void> => {
+    await page!.evaluate(() => {
+      document.getElementById('mobile-input')!.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true, cancelable: true }),
+      );
+    });
+  };
+  const armFrameRecorder = async (): Promise<void> => {
+    await page!.evaluate(() => {
+      const store = window as unknown as { ws_: { send(data: string): void }; __frames?: string[] };
+      if (!store.__frames) {
+        store.__frames = [];
+        const original = store.ws_.send.bind(store.ws_);
+        store.ws_.send = (data: string): void => {
+          (store.__frames as string[]).push(data);
+          return original(data);
+        };
+      }
+      store.__frames.length = 0;
+    });
+  };
+  const recordedFrames = (): Promise<string[]> =>
+    page!.evaluate(() => (window as unknown as { __frames?: string[] }).__frames ?? []);
+
+  it('鼠标点击终端不抢走 xterm 焦点，紧接着的 Ctrl+A 仍然到达终端', async () => {
+    await page!.waitForFunction(
+      () => !(document.getElementById('mobile-input') as HTMLTextAreaElement).disabled,
+    );
+    await armFrameRecorder();
+
+    const screen = (await page!.locator('.xterm-screen').boundingBox())!;
+    await page!.mouse.click(screen.x + 24, screen.y + 12);
+
+    // 回归点：旧监听对任何 click 都 showKeyboard()，这里会变成 mobile-input。
+    const active = await activeElementInfo();
+    expect(active.id, JSON.stringify(active)).not.toBe('mobile-input');
+    expect(active.className, JSON.stringify(active)).toContain('xterm');
+
+    await page!.evaluate(() => {
+      const event = new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true, cancelable: true });
+      Object.defineProperty(event, 'keyCode', { get: () => 65 });
+      (document.activeElement ?? document.body).dispatchEvent(event);
+    });
+
+    expect(await recordedFrames()).toContain(JSON.stringify({ type: 'input', data: '\x01' }));
+  });
+
+  it('触摸点一下终端把焦点交给底栏，空框 Ctrl+A 由底栏转发同样到达终端', async () => {
+    const screen = (await page!.locator('.xterm-screen').boundingBox())!;
+    await page!.touchscreen.tap(screen.x + 24, screen.y + 12);
+    await page!.waitForFunction(() => document.activeElement?.id === 'mobile-input');
+
+    // 空框（无草稿）才是终端语义：Ctrl+A → \x01。
+    await armFrameRecorder();
+    await page!.evaluate(() => { (document.getElementById('mobile-input') as HTMLTextAreaElement).value = ''; });
+    await pressComposerCtrlA();
+    expect(await recordedFrames()).toContain(JSON.stringify({ type: 'input', data: '\x01' }));
+
+    // 有草稿时同一个键留在输入框（全选），一条字节都不许发。
+    await armFrameRecorder();
+    await page!.evaluate(() => { (document.getElementById('mobile-input') as HTMLTextAreaElement).value = 'ls -la'; });
+    await pressComposerCtrlA();
+    expect(await recordedFrames()).toEqual([]);
+  });
 });

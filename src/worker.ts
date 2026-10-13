@@ -65,6 +65,7 @@ import {
   decodeTerminalWriteFrameSource,
   terminalWriteFrame,
 } from './core/terminal-write-frame.js';
+import { modifierKeySequenceSource } from './utils/web-terminal-modifier-keys.js';
 import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
 import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
@@ -22541,6 +22542,10 @@ if(!${isTmuxMode && !isPipeMode}){
 //   • live   : each keystroke is diff'd to ANSI cursor/backspace/insert sequences
 //              via a grapheme-aware mirror, so Chinese IME and fast typing work.
 // Read-only sessions never show it (no token ⇒ no body.has-token).
+// 「底栏里的修饰键 → 终端字节序列」映射 —— 与单测同一份实现，原样嵌进来（这段页面
+// 代码住在模板字符串里，import 不进来）。xterm 只监听它自己的 textarea，焦点在这个
+// 底栏上时它的键盘映射整条路都不跑，所以 Ctrl+A 这类键必须在这里自己补上。
+var _wbModifierKeySequence=${modifierKeySequenceSource};
 if(isTouch&&hasToken){(function(){
   document.body.classList.add('has-token');
   var bar=document.getElementById('mobile-input-bar');
@@ -22753,6 +22758,17 @@ if(isTouch&&hasToken){(function(){
     resizeTa();
     if(mode===LIVE&&!mirror.composing)syncMirror(ta.value);});
   ta.addEventListener('keydown',function(e){
+    // 修饰键（Ctrl/Alt）先走映射表：焦点在底栏这个 textarea 上时 xterm 收不到任何
+    // 按键（它只监听自己的 textarea），所以 Ctrl+A 这类组合必须在这里补转发，走与
+    // Tab/Esc/空框 Backspace 完全相同的那条通道（live 走 sendLiveKey 连同镜像一起
+    // 结算，buffer 走 sendInput）。表本身在 src/utils/web-terminal-modifier-keys.ts，
+    // 页面里这份是它的源码内嵌；草稿非空时 Ctrl+A/C/V/X/Z 会由它返回 null，留给
+    // 输入框自己全选/复制/粘贴/剪切/撤销，与「空框 Backspace 才转发 ⌫」同一条哲学。
+    // 必须排在下面的方向键分支之前：Ctrl+← 是 CSI 1;5D（按词移动），不能被当成裸
+    // 的左方向键吞掉。
+    var mseq=_wbModifierKeySequence(e,{hasDraft:!!ta.value,composing:mirror.composing});
+    if(mseq){e.preventDefault();
+      if(mode===LIVE)sendLiveKey(mseq);else sendInput(mseq);return;}
     // live mode intercepts nav keys so they go to the terminal, not the textarea
     if(mode===LIVE&&!mirror.composing&&!e.isComposing&&['Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].indexOf(e.key)>=0){
       e.preventDefault();
@@ -22781,8 +22797,31 @@ if(isTouch&&hasToken){(function(){
   if(typeof ResizeObserver!=='undefined'){
     try{new ResizeObserver(measureBar).observe(bar)}catch(_e){}
   }
-  // tapping the terminal area surfaces the keyboard (mirrors woof's focus hint)
-  document.getElementById('terminal').addEventListener('click',function(){showKeyboard();},{passive:true});
+  // 点一下终端就把焦点交给底栏、让软键盘浮上来（照抄 woof 的 focus hint）——
+  // 但只有真实的手指/手写笔才这么做。这里就是本次修的回归：旧监听对任何 click
+  // 都 showKeyboard()，于是在 isTouch 为真的浏览器里，鼠标/触控板点一下终端就把
+  // 焦点从 xterm 挪到底栏 textarea，此后所有按键（Ctrl+A 在内）都落到 textarea，
+  // xterm 一个字节都收不到。
+  //
+  // 为什么挂在 click 而不是 pointerup：触摸一次之后浏览器还会补一串兼容鼠标事件，
+  // 而 xterm 是在自己的 mousedown 里 focus 它的 textarea 的。真实 Chromium 里实测
+  // 的次序（test/web-terminal-mobile-layout.e2e.ts 逐个记下来的）：
+  //   pointerdown:touch → touchstart → pointerup:touch（此时 focus 底栏成功）
+  //   → touchend → mousedown → focusin:xterm-helper-textarea（焦点被抢回去）
+  //   → mouseup → click:touch
+  // 所以在 pointerup 里 focus 会被随后的 mousedown 抢走；click 是这一串里最后一
+  // 个，也是老监听原本用的那个，顺序上只有它稳（拖拽本来就不产生 click，手指滚动
+  // 回看不会因此弹出软键盘）。
+  //   • 带 PointerEvent 的浏览器里 click 就是 PointerEvent，能读出 pointerType：
+  //     鼠标/触控板的点击一律不管，焦点留给 xterm。
+  //   • 读不到 pointerType 的（没有 PointerEvent 的老 WebView —— 那种形态也没有
+  //     鼠标）保持老行为，不然软键盘就再也弹不出来。
+  document.getElementById('terminal').addEventListener('click',function(e){
+    var pt=e&&e.pointerType;
+    if(pt&&pt!=='touch'&&pt!=='pen')return;
+    // 同步调用：iOS 只在用户手势栈里弹软键盘，这里不能引入 await/微任务。
+    showKeyboard();
+  },{passive:true});
   // keep the bar above the software keyboard using visualViewport when available
   if(window.visualViewport){
     var vkT=0;

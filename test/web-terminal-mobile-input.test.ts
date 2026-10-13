@@ -2,6 +2,19 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { formatMobileInputModeOsc, MOBILE_INPUT_MODE_OSC_REGEX } from '../src/services/web-terminal-settings-store.js';
+import {
+  modifierKeySequenceSource,
+  type ModifierKeyContext,
+  type ModifierKeyEvent,
+} from '../src/utils/web-terminal-modifier-keys.js';
+
+// 页面里那份修饰键映射是「源码内嵌」（worker.ts 的模板字符串），这里按页面完全
+// 相同的方式求值后作为全局注入。映射表本身由 web-terminal-modifier-keys.test.ts
+// 逐条覆盖，这一边断言的是页面接线：走哪条发送通道、守卫是否接上了。
+const injectedModifierKeys = new Function(`return (${modifierKeySequenceSource});`)() as (
+  e: ModifierKeyEvent,
+  ctx?: ModifierKeyContext,
+) => string | null;
 
 const workerSource = (): string => readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
 
@@ -56,7 +69,8 @@ class FakeElement {
 
   setAttribute(name: string, value: string): void { this.attributes.set(name, value); }
   getAttribute(name: string): string | null { return this.attributes.get(name) ?? null; }
-  focus(): void {}
+  focusCount = 0;
+  focus(): void { this.focusCount += 1; }
   blur(): void {}
   getBoundingClientRect(): { height: number } {
     return { height: this.rectHeight ?? this.offsetHeight };
@@ -74,6 +88,7 @@ class FakeElement {
 interface MobileHarness {
   bar: FakeElement;
   textarea: FakeElement;
+  terminal: FakeElement;
   controls: FakeElement[];
   shortcut(action: string): FakeElement | undefined;
   sentInputs(): string[];
@@ -163,6 +178,7 @@ function bootMobileInput(options: {
     '_wbMobileWriteState',
     '_wbInitialMobileInputMode',
     '_wbSyncMobileInputMode',
+    '_wbModifierKeySequence',
     `${extractMobileInputScript(source)}\nreturn {setWriteState:_wbMobileWriteState,setInputMode:_wbSetMobileInputMode};`,
   )(
     true,
@@ -177,6 +193,7 @@ function bootMobileInput(options: {
     null,
     options.initialMode,
     options.onSyncMode,
+    injectedModifierKeys,
   ) as {
     setWriteState: ((value: boolean | null) => void) | null;
     setInputMode: ((mode: string) => void) | null;
@@ -186,6 +203,7 @@ function bootMobileInput(options: {
   return {
     bar,
     textarea,
+    terminal,
     controls,
     shortcut: action => shortcutButtons.find(button => button.getAttribute('data-sk') === action),
     sentInputs: () => sent.map(payload => JSON.parse(payload).data as string),
@@ -752,5 +770,99 @@ describe('手机 Web 终端输入栏', () => {
     for (const line of storageLines) {
       expect(line).not.toMatch(/mode|mobile|input|buffer|live|setting/i);
     }
+  });
+
+  it('鼠标点击终端不再把焦点抢到底栏，手指/手写笔的点击才照旧弹出键盘', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+
+    // 回归点：旧监听对任何 click 都 showKeyboard()，于是在 isTouch 为真的浏览器里，
+    // 鼠标点一下终端就把焦点从 xterm 挪到底栏 textarea，此后所有按键（Ctrl+A 在内）
+    // 都落到 textarea，xterm 一个字节都收不到。
+    page.terminal.dispatch('click', { pointerType: 'mouse' });
+    expect(page.textarea.focusCount).toBe(0);
+    // 触控板走的也是 mouse。
+    page.terminal.dispatch('click', { pointerType: 'mouse' });
+    expect(page.textarea.focusCount).toBe(0);
+
+    // 手指点击：仍要在同步用户手势里 focus()，iOS 靠它弹软键盘。
+    page.terminal.dispatch('click', { pointerType: 'touch' });
+    expect(page.textarea.focusCount).toBe(1);
+
+    // 手写笔同属真实指针。
+    page.terminal.dispatch('click', { pointerType: 'pen' });
+    expect(page.textarea.focusCount).toBe(2);
+
+    // 没有 PointerEvent 的老 WebView 读不到 pointerType（那种形态也没有鼠标）：
+    // 必须保持老行为，否则软键盘永远弹不出来。
+    page.terminal.dispatch('click', {});
+    expect(page.textarea.focusCount).toBe(3);
+    page.terminal.dispatch('click', { pointerType: '' });
+    expect(page.textarea.focusCount).toBe(4);
+
+    const source = workerSource();
+    // 旧的无条件 click 监听必须消失：焦点归属现在由 pointerType 决定。
+    expect(source).not.toContain(
+      "document.getElementById('terminal').addEventListener('click',function(){showKeyboard();},{passive:true});",
+    );
+    expect(source).toContain(
+      "  document.getElementById('terminal').addEventListener('click',function(e){\n"
+      + '    var pt=e&&e.pointerType;\n'
+      + "    if(pt&&pt!=='touch'&&pt!=='pen')return;",
+    );
+  });
+
+  it('系统键盘的 Ctrl+A 在空框时转发 0x01，草稿非空时留给输入框全选', () => {
+    const empty = bootMobileInput({ wsHasWrite: true });
+    empty.textarea.value = '';
+    empty.textarea.dispatch('keydown', { key: 'a', ctrlKey: true });
+    expect(empty.sentInputs()).toEqual(['\x01']);
+
+    // 有草稿时 Ctrl+A/C/V/X/Z 是输入框自己的本地语义，一条字节都不许发。
+    const draft = bootMobileInput({ wsHasWrite: true });
+    draft.textarea.value = 'ls -la';
+    for (const key of ['a', 'c', 'v', 'x', 'z']) {
+      draft.textarea.dispatch('keydown', { key, ctrlKey: true });
+    }
+    expect(draft.sentInputs()).toEqual([]);
+
+    // 其余修饰键不受草稿影响：Ctrl+[ 仍然把 ESC 送给终端。
+    draft.textarea.dispatch('keydown', { key: '[', ctrlKey: true });
+    expect(draft.sentInputs()).toEqual(['\x1b']);
+  });
+
+  it('实时模式下修饰键连同镜像一起结算，且不会被前面的方向键分支当成裸方向键', () => {
+    const page = bootMobileInput({ wsHasWrite: true, initialMode: 'live' });
+    expect(page.bar.getAttribute('data-mode')).toBe('live');
+    page.textarea.value = '';
+    page.textarea.dispatch('keydown', { key: 'ArrowLeft', ctrlKey: true });
+    // 纯方向键分支会发 \x1b[D；Ctrl+← 必须发按词移动的 CSI 1;5D。
+    expect(page.sentInputs()).toEqual(['\x1b[1;5D']);
+
+    page.textarea.dispatch('keydown', { key: 'ArrowRight' });
+    expect(page.sentInputs()).toEqual(['\x1b[1;5D', '\x1b[C']);
+  });
+
+  it('⌘ 与输入法组合态下的修饰键都不转发', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    page.textarea.value = '';
+    page.textarea.dispatch('keydown', { key: 'a', metaKey: true });
+    expect(page.sentInputs()).toEqual([]);
+
+    page.textarea.dispatch('compositionstart');
+    page.textarea.dispatch('keydown', { key: 'a', ctrlKey: true });
+    expect(page.sentInputs()).toEqual([]);
+
+    page.textarea.dispatch('compositionend');
+    page.textarea.dispatch('keydown', { key: 'a', ctrlKey: true, isComposing: true });
+    expect(page.sentInputs()).toEqual([]);
+  });
+
+  it('页面注入的是同一份映射源码（一份实现两处跑）', () => {
+    expect(workerSource()).toContain('var _wbModifierKeySequence=${modifierKeySequenceSource};');
+    expect(workerSource()).toContain(
+      'var mseq=_wbModifierKeySequence(e,{hasDraft:!!ta.value,composing:mirror.composing});',
+    );
+    // 注入的那份必须能独立求值（不引用任何外部标识符）。
+    expect(injectedModifierKeys({ key: 'a', ctrlKey: true })).toBe('\x01');
   });
 });
