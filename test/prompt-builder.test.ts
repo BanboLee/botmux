@@ -132,6 +132,57 @@ describe('buildNewTopicPrompt', () => {
     expect(prompt).toContain(`<session_id>${SESSION_ID}</session_id>`);
   });
 
+  it('selects the dsh-tui adapter capabilities when dshRuntime=tui', () => {
+    const previousCliId = mockBotConfig.cliId;
+    const previousRuntime = mockBotConfig.dshRuntime;
+    try {
+      mockBotConfig.cliId = 'dsh';
+      mockBotConfig.dshRuntime = 'tui';
+      const prompt = buildNewTopicPrompt(
+        'hello', SESSION_ID, 'dsh', undefined, undefined, undefined, undefined, undefined,
+        { name: 'Bot', openId: 'ou_bot' }, 'zh', undefined,
+        { larkAppId: 'app_test', chatId: 'oc_1' },
+      );
+      expect(prompt).toContain('<botmux_routing>');
+      expect(prompt).toContain(`<session_id>${SESSION_ID}</session_id>`);
+      expect(prompt).toContain('botmux send');
+
+      mockBotConfig.dshRuntime = 'official';
+      const official = buildNewTopicPrompt(
+        'hello', SESSION_ID, 'dsh', undefined, undefined, undefined, undefined, undefined,
+        { name: 'Bot', openId: 'ou_bot' }, 'zh', undefined,
+        { larkAppId: 'app_test', chatId: 'oc_1' },
+      );
+      expect(official).not.toContain('<botmux_routing>');
+      expect(official).not.toContain('<session_id>');
+    } finally {
+      mockBotConfig.cliId = previousCliId;
+      if (previousRuntime === undefined) delete mockBotConfig.dshRuntime;
+      else mockBotConfig.dshRuntime = previousRuntime;
+    }
+  });
+
+  it('selects the dsh-tui adapter capabilities for follow-ups when dshRuntime=tui', () => {
+    const previousCliId = mockBotConfig.cliId;
+    const previousRuntime = mockBotConfig.dshRuntime;
+    try {
+      mockBotConfig.cliId = 'dsh';
+      mockBotConfig.dshRuntime = 'tui';
+      const prompt = buildFollowUpCliInput('hello', SESSION_ID, { cliId: 'dsh', larkAppId: 'app_test' }).content;
+      expect(prompt).toContain(`<session_id>${SESSION_ID}</session_id>`);
+      expect(prompt).toContain('<botmux_reminder>');
+
+      mockBotConfig.dshRuntime = 'official';
+      const official = buildFollowUpCliInput('hello', SESSION_ID, { cliId: 'dsh', larkAppId: 'app_test' }).content;
+      expect(official).not.toContain('<session_id>');
+      expect(official).toContain('<botmux_reminder>');
+    } finally {
+      mockBotConfig.cliId = previousCliId;
+      if (previousRuntime === undefined) delete mockBotConfig.dshRuntime;
+      else mockBotConfig.dshRuntime = previousRuntime;
+    }
+  });
+
   it('delivers ebsd diagnosis text inside a non-command service envelope', () => {
     const prompt = buildNewTopicPrompt(
       '诊断这个卷',
@@ -1519,5 +1570,17 @@ describe('senderTagHideEmail', () => {
     expect(buffered).not.toContain('email=');
     expect(buffered).toContain('ou_email_test');
     expect(buildFollowUpContent('body@example.test', 'sid', { cliId, sender, larkAppId: 'app_test' })).toContain('body@example.test');
+  });
+});
+
+
+describe('resolveEffectiveCliId', () => {
+  it('maps only dsh + tui to dsh-tui', async () => {
+    const { resolveEffectiveCliId } = await import('../src/adapters/cli/effective-cli.js');
+    expect(resolveEffectiveCliId('dsh', 'tui')).toBe('dsh-tui');
+    expect(resolveEffectiveCliId('dsh', 'official')).toBe('dsh');
+    expect(resolveEffectiveCliId('dsh', undefined)).toBe('dsh');
+    expect(resolveEffectiveCliId('dsh-tui', 'official')).toBe('dsh-tui');
+    expect(resolveEffectiveCliId('codex', 'tui')).toBe('codex');
   });
 });
