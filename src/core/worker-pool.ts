@@ -54,7 +54,7 @@ import { coalesceMarginalAdmissionRetry } from './admission-reclaim.js';
 import { reclaimIdleWorkersForAdmissionAfterTurnDrain } from './idle-worker-sweeper.js';
 import { createWorkerStderrRing, WORKER_ERROR_MARKER, type WorkerStderrRing } from './worker-stderr-ring.js';
 import * as sessionStore from '../services/session-store.js';
-import { clearActiveWorkerCliId, clearPendingDshRuntime, getActiveWorkerCliId, getPendingDshRuntime, setActiveWorkerCliId, setPendingDshRuntime } from './active-worker-cli.js';
+import { clearActiveWorkerCliId, clearPendingDshRuntime, getActiveWorkerCliId, getPendingDshRuntime, resolveReadyWorkerCliId, retireDshRuntimeGeneration, setActiveWorkerCliId, setPendingDshRuntime } from './active-worker-cli.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { recordTurnInputCommit } from '../services/idempotency-store.js';
 import { CODEX_CAPACITY_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId } from '../services/codex-transcript.js';
@@ -6829,6 +6829,7 @@ export function killWorker(
   const closeNeedsRemoteGrace = closeFrozenType !== undefined
     && isRemoteBackendType(closeFrozenType);
   armWorkerKillBackstop(w, tag(ds), closeNeedsRemoteGrace ? 24_000 : opts.codexCleanupRelease ? 6_000 : WORKER_SIGTERM_BACKSTOP_MS);
+  retireDshRuntimeGeneration(ds.session.sessionId);
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
@@ -6869,6 +6870,7 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
     try { w.kill('SIGTERM'); } catch { /* already gone */ }
     armWorkerKillBackstop(w, tag(ds));
   }
+  retireDshRuntimeGeneration(ds.session.sessionId);
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
@@ -9427,6 +9429,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   }
   armWorkerKillBackstop(w, tag(ds));
 
+  retireDshRuntimeGeneration(ds.session.sessionId);
   ds.worker = null;
   ds.workerReady = false;
   // The CLI is destroyed by the suspend; the cold resume brings a new one.
@@ -16615,8 +16618,14 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored ready from stale/transferring worker generation`);
           break;
         }
+        const reportedCliId = resolveReadyWorkerCliId(
+          msg.effectiveCliId,
+          getPendingDshRuntime(ds.session.sessionId),
+        );
         clearPendingDshRuntime(ds.session.sessionId);
-        setActiveWorkerCliId(ds.session.sessionId, msg.effectiveCliId, msg.workerPid ?? worker.pid);
+        // worker.pid is daemon-owned and authoritative for the exit fence; the
+        // worker's self-report is diagnostic only.
+        setActiveWorkerCliId(ds.session.sessionId, reportedCliId, worker.pid);
         startupState.ready = true;
         startupState.onPreReadyExit = undefined;
         ds.workerReady = true;
@@ -20539,8 +20548,7 @@ function setupWorkerHandlers(
       }
       ds.worker = null;
       ds.workerReady = false;
-      clearActiveWorkerCliId(ds.session.sessionId, worker.pid);
-      clearPendingDshRuntime(ds.session.sessionId);
+      retireDshRuntimeGeneration(ds.session.sessionId);
       // The worker process died; its CLI died with it.
       ds.cliReady = false;
       ds.workerPort = null;

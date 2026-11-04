@@ -14,6 +14,7 @@
  * Run: pnpm vitest run test/card-handler-stop-compact.test.ts
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { dshRuntimeForSession } from '../src/core/worker-pool.js';
 
 // ─── Mocks (before importing the module under test) ───────────────────────
 
@@ -416,18 +417,34 @@ describe('compact_session card action', () => {
 
   // dsh-tui 是 PTY 驱动的交互式 TUI，raw /compact 有效；它靠 bot 级 dshRuntime='tui'
   // 选中（cliId 仍是 'dsh'），所以 handler 必须把运行时一并喂给谓词，不能只看 cliId。
-  it('still delivers for a dsh bot running the interactive TUI (dshRuntime=tui)', async () => {
+  it('still delivers for an active dsh-tui worker even when live config changed to official', async () => {
+    vi.mocked(getBot).mockReturnValueOnce({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'dsh', dshRuntime: 'official' },
+      resolvedAllowedUsers: [],
+      botName: 'testbot',
+      botOpenId: 'ou_bot',
+    } as any);
+    vi.mocked(dshRuntimeForSession).mockReturnValueOnce('tui');
+    const ds = makeDs({ sessionOverrides: { cliId: 'dsh' } as any });
+    const deliver = vi.fn();
+    const result = await handleCardAction(actionData('compact_session'), depsWith(ds, deliver), LARK_APP_ID);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(result.toast.type).toBe('success');
+  });
+
+  it('refuses when the active dsh worker is official even if live config says tui', async () => {
     vi.mocked(getBot).mockReturnValueOnce({
       config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'dsh', dshRuntime: 'tui' },
       resolvedAllowedUsers: [],
       botName: 'testbot',
       botOpenId: 'ou_bot',
     } as any);
+    vi.mocked(dshRuntimeForSession).mockReturnValueOnce('official');
     const ds = makeDs({ sessionOverrides: { cliId: 'dsh' } as any });
     const deliver = vi.fn();
     const result = await handleCardAction(actionData('compact_session'), depsWith(ds, deliver), LARK_APP_ID);
-    expect(deliver).toHaveBeenCalledTimes(1);
-    expect(result.toast.type).toBe('success');
+    expect(deliver).not.toHaveBeenCalled();
+    expect(result.toast.type).toBe('warning');
   });
 
   it('is silently blocked for non-operators (canOperate gate)', async () => {

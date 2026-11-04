@@ -15,6 +15,7 @@ import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
+import { retireDshRuntimeGeneration } from './active-worker-cli.js';
 import {
   closeSessionForBackgroundCleanup,
   forkWorker,
@@ -1983,6 +1984,7 @@ async function triggerSessionTurnAdmitted(
   if (deps.activeSessions.get(key) !== newDs
     || newDs.session.status !== 'active'
     || !newDs.initialStartPending) {
+    retireDshRuntimeGeneration(session.sessionId);
     if (newDs.session.status !== 'closed') sessionStore.closeSession(session.sessionId);
     return {
       ok: false,

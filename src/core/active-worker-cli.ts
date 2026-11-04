@@ -38,7 +38,25 @@ export function getPendingDshRuntime(sessionId: string): DshRuntime | undefined 
   return pendingDshRuntime.get(sessionId);
 }
 
+/** Resolve the ready generation's adapter from the worker report, falling back
+ *  to the prompt-builder sample when an older worker omits the field. */
+export function resolveReadyWorkerCliId(
+  reported: CliId | undefined,
+  pending: DshRuntime | undefined,
+): CliId | undefined {
+  if (reported) return reported;
+  return pending === 'tui' ? 'dsh-tui' : pending === 'official' ? 'dsh' : undefined;
+}
+
 export function clearPendingDshRuntime(sessionId: string): void {
+  pendingDshRuntime.delete(sessionId);
+}
+
+/** Retire both memory-only pieces when a generation is detached/aborted.
+ *  Call before the daemon drops the worker reference so the exit guard cannot
+ *  skip cleanup. */
+export function retireDshRuntimeGeneration(sessionId: string): void {
+  activeWorkerCli.delete(sessionId);
   pendingDshRuntime.delete(sessionId);
 }
 

@@ -116,7 +116,7 @@ import type { TriggerRequest } from '../src/services/trigger-types.js';
 import { setBotLookup, setDefaultLocale, t } from '../src/i18n/index.js';
 import { BOTMUX_SHELL_HINTS, buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
 import type { DaemonSession } from '../src/core/types.js';
-import { clearActiveWorkerCliId, clearPendingDshRuntime, setActiveWorkerCliId, setPendingDshRuntime } from '../src/core/active-worker-cli.js';
+import { clearActiveWorkerCliId, clearPendingDshRuntime, getActiveWorkerCliId, getPendingDshRuntime, resolveReadyWorkerCliId, retireDshRuntimeGeneration, setActiveWorkerCliId, setPendingDshRuntime } from '../src/core/active-worker-cli.js';
 
 // ─── Tests ────────────────────────────────────────────────────────────────
 
@@ -1631,5 +1631,27 @@ describe('resolveEffectiveCliId', () => {
     expect(resolveEffectiveCliId('dsh', undefined)).toBe('dsh');
     expect(resolveEffectiveCliId('dsh-tui', 'official')).toBe('dsh-tui');
     expect(resolveEffectiveCliId('codex', 'tui')).toBe('codex');
+  });
+});
+
+describe('active worker dsh runtime generation', () => {
+  it('fills a missing ready report from the single-sampled pending runtime', () => {
+    expect(resolveReadyWorkerCliId(undefined, 'tui')).toBe('dsh-tui');
+    expect(resolveReadyWorkerCliId(undefined, 'official')).toBe('dsh');
+    expect(resolveReadyWorkerCliId('dsh-tui', 'official')).toBe('dsh-tui');
+    expect(resolveReadyWorkerCliId(undefined, undefined)).toBeUndefined();
+  });
+
+  it('retires both active and pending memory on detach/abort', () => {
+    const id = 'retire-test-session';
+    try {
+      setActiveWorkerCliId(id, 'dsh-tui', 7);
+      setPendingDshRuntime(id, 'official');
+      retireDshRuntimeGeneration(id);
+      expect(getActiveWorkerCliId(id)).toBeUndefined();
+      expect(getPendingDshRuntime(id)).toBeUndefined();
+    } finally {
+      retireDshRuntimeGeneration(id);
+    }
   });
 });
