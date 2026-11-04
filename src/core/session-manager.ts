@@ -22,6 +22,7 @@ import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } fr
 import { logger } from '../utils/logger.js';
 import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { resolveEffectiveCliId } from '../adapters/cli/effective-cli.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks } from '../adapters/cli/shared-hints.js';
@@ -1386,6 +1387,20 @@ type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'credentials' | 'sess
 /** opening 的 hook 模式（#794 后续）：whiteboard/sender/mentions 搬进 hook envelope，
  *  PTY 文本只剩用户正文（+ role/summaryMemory 等稳定上下文）。与 follow-up 同一套
  *  sidecar/claim 机制。inline 模式（hookMode=false）输出与历史完全一致。 */
+
+/** Prompt/envelope capability must follow the adapter the worker will actually
+ *  spawn. Persisted `dsh` + live `dshRuntime=tui` resolves to `dsh-tui`; using
+ *  the persisted id here made the opening prompt skip routing/session/identity
+ *  because the headless `dsh` adapter claims `injectsSessionContext`. */
+function promptEffectiveCliId(cliId: CliId, larkAppId?: string): CliId {
+  if (cliId !== 'dsh' || !larkAppId) return cliId;
+  try {
+    return resolveEffectiveCliId(cliId, getBot(larkAppId).config.dshRuntime) ?? cliId;
+  } catch {
+    return cliId;
+  }
+}
+
 function buildNewTopicBlocks(
   userMessage: string,
   sessionId: string,
@@ -1401,6 +1416,7 @@ function buildNewTopicBlocks(
   opts?: NewTopicOpts,
   hookMode = false,
 ): Array<{ key: NewTopicBlockKey; text: string }> {
+  cliId = promptEffectiveCliId(cliId, opts?.larkAppId);
   if (zeroPromptInjectionForBot(opts?.larkAppId, cliId, opts?.promptInjection)) {
     return [{ key: 'userMessage', text: buildZeroPromptInput([userMessage, ...(followUps ?? [])].join('\n\n'), attachments) }];
   }
@@ -1816,6 +1832,7 @@ function buildFollowUpBlocks(
   opts?: FollowUpOpts,
   hookMode = false,
 ): Array<{ key: FollowUpBlockKey; text: string }> {
+  if (opts?.cliId) opts = { ...opts, cliId: promptEffectiveCliId(opts.cliId, opts.larkAppId) };
   if (zeroPromptInjectionForBot(opts?.larkAppId, opts?.cliId, opts?.promptInjection)) {
     return [{ key: 'userMessage', text: buildZeroPromptInput(content, opts?.attachments) }];
   }
