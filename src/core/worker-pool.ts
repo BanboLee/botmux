@@ -6787,6 +6787,7 @@ export function killWorker(
   invalidateStuckWarning(ds, 'killWorker');
   invalidateTuiPrompt(ds, 'killWorker');
   if (!ds.worker || ds.worker.killed) {
+    retireDshRuntimeGeneration(ds.session.sessionId);
     // No live worker to receive {type:'close'}, so its destroySession() — which
     // tears down the persistent backing session (tmux/herdr/zellij/zmx) — never
     // fires. Those sessions survive a worker exit BY DESIGN (idle-suspend /
@@ -15173,6 +15174,7 @@ export function forkWorker(
     const reason = (err as Error)?.message ?? String(err);
     logger.error(`[${t}] Worker fork error: ${reason}`);
     if (ds.worker === worker) {
+      retireDshRuntimeGeneration(ds.session.sessionId);
       if (ds.session.queuedActivationPending) {
         // The durable opening journal remains authoritative until the adapter
         // proves submission. A failed child must release only its runtime
@@ -22401,6 +22403,7 @@ export function forkAdoptWorker(
     trackLifecycleRetirement(ds, replacedWorker);
     try { replacedWorker.send({ type: 'close' } as DaemonToWorker); } catch {}
     try { replacedWorker.kill(); } catch {}
+    retireDshRuntimeGeneration(ds.session.sessionId);
     ds.worker = null;
     ds.workerReady = false;
     ds.workerPort = null;
@@ -22665,6 +22668,7 @@ export function forkAdoptWorker(
     worker.send(initMsg);
   });
   } catch (err) {
+    retireDshRuntimeGeneration(ds.session.sessionId);
     if (ds.worker === worker) ds.worker = null;
     try { worker.kill(); } catch { /* best-effort pre-init child fence */ }
     throw err;
