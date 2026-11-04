@@ -54,6 +54,7 @@ import { coalesceMarginalAdmissionRetry } from './admission-reclaim.js';
 import { reclaimIdleWorkersForAdmissionAfterTurnDrain } from './idle-worker-sweeper.js';
 import { createWorkerStderrRing, WORKER_ERROR_MARKER, type WorkerStderrRing } from './worker-stderr-ring.js';
 import * as sessionStore from '../services/session-store.js';
+import { clearActiveWorkerCliId, clearPendingDshRuntime, getActiveWorkerCliId, getPendingDshRuntime, setActiveWorkerCliId, setPendingDshRuntime } from './active-worker-cli.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { recordTurnInputCommit } from '../services/idempotency-store.js';
 import { CODEX_CAPACITY_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId } from '../services/codex-transcript.js';
@@ -2195,23 +2196,15 @@ function startupFailureNotice(ds: DaemonSession, cliName: string, reason: string
   return tr('worker.start_failed', { cliName, reason, sessionId: tag(ds), logPath }, loc);
 }
 
-/** Live per-bot `dshRuntime` for a session's card. Only meaningful for cliId
- *  'dsh': 'tui' means the worker spawns the PTY-driven dsh-tui adapter (a real
- *  interactive TUI), so `/compact` affordances stay enabled. Read from the LIVE
- *  bot config on purpose — `SessionCliLaunchSnapshotV1` has no dshRuntime field
- *  and the worker likewise pairs a frozen cliId with the live runtime, so this
- *  matches what actually spawns. */
+/** Effective dsh runtime for a session's card/raw-passthrough gate. Only
+ *  meaningful for cliId 'dsh': prefer the adapter id reported by the live
+ *  worker generation; when no worker is live, fall back to the live bot config.
+ *  This keeps a dashboard toggle from rewriting the surface of a worker that is
+ *  already running. */
 export function dshRuntimeForSession(ds: DaemonSession): 'official' | 'tui' | undefined {
-  if (ds.session.dshRuntime) return ds.session.dshRuntime;
-  try {
-    return getBot(ds.larkAppId).config.dshRuntime;
-  } catch {
-    return undefined;
-  }
-}
-
-/** Live config, used only when a new worker generation is actually spawned. */
-function liveDshRuntimeForSession(ds: DaemonSession): 'official' | 'tui' | undefined {
+  const active = getActiveWorkerCliId(ds.session.sessionId);
+  if (active === 'dsh-tui') return 'tui';
+  if (active === 'dsh') return 'official';
   try {
     return getBot(ds.larkAppId).config.dshRuntime;
   } catch {
@@ -13158,6 +13151,10 @@ function rollbackWorkerForkPreInit(
   queuedSnapshot: QueuedWorkerForkSnapshot | undefined,
   acceptedDispatch: AcceptedWorkerForkDispatch | undefined,
 ): void {
+  // A pre-init failure means no worker exists for this generation. Drop the
+  // memory-only runtime sample so the next path re-samples live config.
+  clearActiveWorkerCliId(ds.session.sessionId);
+  clearPendingDshRuntime(ds.session.sessionId);
   const exactActivationInput = ds.session.queuedActivationInput;
   const exactActivationTurnId = ds.session.queuedActivationTurnId;
   const exactActivationDispatchAttempt = ds.session.queuedActivationDispatchAttempt;
@@ -15126,14 +15123,13 @@ export function forkWorker(
     sessionStore.updateSession(ds.session);
   }
 
-  // Freeze the effective dsh runtime for THIS worker generation. Active-worker
-  // prompts/readbacks use session.dshRuntime; a later dashboard toggle only
-  // affects the next spawn/refork, never the adapter already running.
-  if ((ds.session.cliId ?? botCfg.cliId) === 'dsh') {
-    const liveDshRuntime = liveDshRuntimeForSession(ds);
-    if (liveDshRuntime === undefined) delete ds.session.dshRuntime;
-    else ds.session.dshRuntime = liveDshRuntime;
-    sessionStore.updateSession(ds.session);
+  // A new generation has not reported its adapter yet; do not let an outgoing
+  // worker's memory-only value leak into workerless prompt/card decisions.
+  clearActiveWorkerCliId(ds.session.sessionId);
+  if ((ds.session.cliId ?? botCfg.cliId) === 'dsh' && getPendingDshRuntime(ds.session.sessionId) === undefined) {
+    // No prompt-builder sample (raw/adopt path): sample once here, right before
+    // the worker init reads the same value.
+    setPendingDshRuntime(ds.session.sessionId, botCfg.dshRuntime ?? 'official');
   }
 
   // Node: fork `dist/worker.js`. Standalone binary: re-exec THIS binary with the
@@ -15325,8 +15321,9 @@ export function forkWorker(
     // dsh profile name: read live from bot config so it takes effect on the
     // next worker fork without recreating the session.
     dshProfile: botCfg.dshProfile,
-    // dsh runtime variant (official runner vs dsh-tui PTY TUI).
-    dshRuntime: botCfg.dshRuntime,
+    // dsh runtime variant (official runner vs dsh-tui PTY TUI). Use the value
+    // sampled when the prompt was built, so build and fork cannot disagree.
+    dshRuntime: getPendingDshRuntime(ds.session.sessionId) ?? botCfg.dshRuntime,
     disableCliBypass: botCfg.disableCliBypass === true,
     // Codex App no-progress nudge tuning: read live from bot config so
     // /config set noProgressNotify takes effect on the next worker fork
@@ -16618,6 +16615,8 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored ready from stale/transferring worker generation`);
           break;
         }
+        clearPendingDshRuntime(ds.session.sessionId);
+        setActiveWorkerCliId(ds.session.sessionId, msg.effectiveCliId, msg.workerPid ?? worker.pid);
         startupState.ready = true;
         startupState.onPreReadyExit = undefined;
         ds.workerReady = true;
@@ -20540,6 +20539,8 @@ function setupWorkerHandlers(
       }
       ds.worker = null;
       ds.workerReady = false;
+      clearActiveWorkerCliId(ds.session.sessionId, worker.pid);
+      clearPendingDshRuntime(ds.session.sessionId);
       // The worker process died; its CLI died with it.
       ds.cliReady = false;
       ds.workerPort = null;

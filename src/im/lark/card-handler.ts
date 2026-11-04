@@ -4825,7 +4825,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // button whose /compact gets dropped as non-frame input or, worse, delivered to
       // the model as an ordinary user message. Refuse here too, so the button path can
       // never reopen a channel the router deliberately closed.
-      if (cliHasNoRawPassthroughSurface(sessionCliId(ds), { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })) {
+      if (cliHasNoRawPassthroughSurface(sessionCliId(ds), { dshRuntime: dshRuntimeForSession(ds) })) {
         return { toast: { type: 'warning', content: t('card.action.compact_unsupported', undefined, locDs) } };
       }
       if (!deps.deliverPassthroughCommand) {
@@ -4880,7 +4880,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         // Same pre-check the submission does: CLIs without a raw passthrough
         // surface cannot switch via /model — say so instead of showing a picker
         // whose only outcome is a refusal.
-        if (cliHasNoRawPassthroughSurface(sessionCliId(ds), { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })) {
+        if (cliHasNoRawPassthroughSurface(sessionCliId(ds), { dshRuntime: dshRuntimeForSession(ds) })) {
           const cardJson = menuNoticeCard(t('card.reply_actions.model_unsupported', undefined, loc));
           await deliverEphemeralOrReply(ds, operatorOpenId, cardJson, 'interactive',
             () => sessionReply(rootId, cardJson, 'interactive'));
@@ -4925,7 +4925,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (!ds.worker || ds.worker.killed) {
         return { toast: { type: 'warning', content: t('daemon.cmd_needs_active_cli', { cmd: '/model' }, loc) } };
       }
-      if (cliHasNoRawPassthroughSurface(sessionCliId(ds), { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })
+      if (cliHasNoRawPassthroughSurface(sessionCliId(ds), { dshRuntime: dshRuntimeForSession(ds) })
         || !deps.deliverPassthroughCommand) {
         return { toast: { type: 'warning', content: t('card.reply_actions.model_unsupported', undefined, loc) } };
       }

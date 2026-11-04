@@ -30757,6 +30757,8 @@ process.on('message', async (raw: unknown) => {
           token: writeToken,
           viewToken,
           cardViewToken,
+          ...(cliAdapter ? { effectiveCliId: cliAdapter.id as CliId } : {}),
+          workerPid: process.pid,
           ...(capturedSpawnCommand ? { spawnCommand: capturedSpawnCommand } : {}),
           // A fast initial turn can complete via `botmux send` before Herdr
           // reports idle and this ready IPC is emitted. Tell the daemon not to

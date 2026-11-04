@@ -94,10 +94,11 @@ const NO_RAW_PASSTHROUGH_CLI_IDS: ReadonlySet<string> = new Set(['codex-app', 'm
  * so daemon/card-side callers only ever see the bare `'dsh'` and must pass the
  * runtime to get the right answer.
  *
- * `dshRuntime` is read from the LIVE bot config, never from
- * `SessionCliLaunchSnapshotV1` — that snapshot has no such field, and the worker
- * likewise pairs a frozen `cliId` with the live `dshRuntime`. Reading bot config
- * therefore matches what actually spawns.
+ * `dshRuntime` must describe the LIVE worker generation: daemon callers use
+ * `dshRuntimeForSession()`, which prefers the adapter id reported by the ready
+ * worker and falls back to the live bot config only when no worker is live.
+ * That keeps a dashboard toggle from rewriting the surface of a worker that is
+ * already running.
  *
  * Omitting `opts` is deliberately FAIL-CLOSED: bare `'dsh'` resolves to the
  * headless JSON-RPC runner and returns true (no raw surface). Refusing a

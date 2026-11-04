@@ -116,6 +116,7 @@ import type { TriggerRequest } from '../src/services/trigger-types.js';
 import { setBotLookup, setDefaultLocale, t } from '../src/i18n/index.js';
 import { BOTMUX_SHELL_HINTS, buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { clearActiveWorkerCliId, clearPendingDshRuntime, setActiveWorkerCliId, setPendingDshRuntime } from '../src/core/active-worker-cli.js';
 
 // ─── Tests ────────────────────────────────────────────────────────────────
 
@@ -146,6 +147,7 @@ describe('buildNewTopicPrompt', () => {
       expect(prompt).toContain('<botmux_routing>');
       expect(prompt).toContain(`<session_id>${SESSION_ID}</session_id>`);
       expect(prompt).toContain('botmux send');
+      clearPendingDshRuntime(SESSION_ID);
 
       mockBotConfig.dshRuntime = 'official';
       const official = buildNewTopicPrompt(
@@ -168,9 +170,12 @@ describe('buildNewTopicPrompt', () => {
     try {
       mockBotConfig.cliId = 'dsh';
       mockBotConfig.dshRuntime = 'tui';
+      clearActiveWorkerCliId(SESSION_ID);
+      clearPendingDshRuntime(SESSION_ID);
       const prompt = buildFollowUpCliInput('hello', SESSION_ID, { cliId: 'dsh', larkAppId: 'app_test' }).content;
       expect(prompt).toContain(`<session_id>${SESSION_ID}</session_id>`);
       expect(prompt).toContain('<botmux_reminder>');
+      clearPendingDshRuntime(SESSION_ID);
 
       mockBotConfig.dshRuntime = 'official';
       const official = buildFollowUpCliInput('hello', SESSION_ID, { cliId: 'dsh', larkAppId: 'app_test' }).content;
@@ -183,23 +188,19 @@ describe('buildNewTopicPrompt', () => {
     }
   });
 
-  it('keeps an active worker\'s frozen dsh runtime when live config changes', () => {
+  it('uses the live worker-reported adapter across a config change', () => {
     const previousCliId = mockBotConfig.cliId;
     const previousRuntime = mockBotConfig.dshRuntime;
     try {
       mockBotConfig.cliId = 'dsh';
       mockBotConfig.dshRuntime = 'official';
-      mockGetSession.mockReturnValue({ sessionId: SESSION_ID, dshRuntime: 'tui' } as any);
+      clearActiveWorkerCliId(SESSION_ID);
+      clearPendingDshRuntime(SESSION_ID);
+      setActiveWorkerCliId(SESSION_ID, 'dsh-tui', 4242);
 
       const followUp = buildFollowUpCliInput('hello', SESSION_ID, { cliId: 'dsh', larkAppId: 'app_test' }).content;
       expect(followUp).toContain(`<session_id>${SESSION_ID}</session_id>`);
       expect(followUp).toContain('<botmux_reminder>');
-
-      const refork = buildFollowUpCliInput('hello', SESSION_ID, {
-        cliId: 'dsh', larkAppId: 'app_test', dshRuntimeOverride: 'live',
-      }).content;
-      expect(refork).not.toContain('<session_id>');
-      expect(refork).toContain('<botmux_reminder>');
 
       const opening = buildNewTopicPrompt(
         'hello', SESSION_ID, 'dsh', undefined, undefined, undefined, undefined, undefined,
@@ -207,11 +208,27 @@ describe('buildNewTopicPrompt', () => {
         { larkAppId: 'app_test', chatId: 'oc_1' },
       );
       expect(opening).toContain('<botmux_routing>');
+
+      // Refork/exit: no live worker entry -> live config.
+      clearActiveWorkerCliId(SESSION_ID, 9999);
+      expect(buildFollowUpCliInput('hello', SESSION_ID, { cliId: 'dsh', larkAppId: 'app_test' }).content)
+        .toContain(`<session_id>${SESSION_ID}</session_id>`); // stale exit does not clear pid 4242
+      clearActiveWorkerCliId(SESSION_ID, 4242);
+      clearPendingDshRuntime(SESSION_ID);
+      expect(buildFollowUpCliInput('hello', SESSION_ID, { cliId: 'dsh', larkAppId: 'app_test' }).content)
+        .not.toContain('<session_id>');
+
+      // A prompt-builder sample is consumed by the next fork even if live changes.
+      setPendingDshRuntime(SESSION_ID, 'tui');
+      mockBotConfig.dshRuntime = 'official';
+      expect(buildFollowUpCliInput('hello', SESSION_ID, { cliId: 'dsh', larkAppId: 'app_test' }).content)
+        .toContain(`<session_id>${SESSION_ID}</session_id>`);
     } finally {
+      clearActiveWorkerCliId(SESSION_ID);
+      clearPendingDshRuntime(SESSION_ID);
       mockBotConfig.cliId = previousCliId;
       if (previousRuntime === undefined) delete mockBotConfig.dshRuntime;
       else mockBotConfig.dshRuntime = previousRuntime;
-      mockGetSession.mockReturnValue(undefined as any);
     }
   });
 

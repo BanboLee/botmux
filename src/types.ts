@@ -1116,11 +1116,6 @@ export interface Session {
   suspendedColdResume?: boolean;
   /** CLI used to spawn this session, frozen at creation so bot-level CLI edits only affect new sessions. */
   cliId?: import('./adapters/cli/types.js').CliId;
-  /** Effective dsh runtime frozen when the current worker generation was spawned.
-   *  Prompt capability decisions for an ACTIVE worker must use this value, not
-   *  the live bot config: changing the dashboard toggle only affects the next
-   *  spawn/refork. Absent on non-dsh sessions and before the first spawn. */
-  dshRuntime?: 'official' | 'tui';
   /** Frozen at creation; absent on historical/adopted sessions means default. */
   promptInjection?: 'default' | 'none';
   /** Bot-owned /cli selection, authoritative when present. */
@@ -2270,6 +2265,11 @@ export type WorkerToDaemon =
        * worker replacement but rotates when a closed session is resumed. */
       cardViewToken?: string;
       spawnCommand?: string;
+      /** Adapter actually spawned by this worker generation (memory-only on the
+       *  daemon side; a later dashboard toggle must not rewrite it). */
+      effectiveCliId?: import('./adapters/cli/types.js').CliId;
+      /** Process id owning that adapter; fences late exits from clearing a newer generation. */
+      workerPid?: number;
       replyAlreadySent?: boolean;
       turnId?: string;
       dispatchAttempt?: number;
