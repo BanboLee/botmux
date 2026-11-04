@@ -183,6 +183,38 @@ describe('buildNewTopicPrompt', () => {
     }
   });
 
+  it('keeps an active worker\'s frozen dsh runtime when live config changes', () => {
+    const previousCliId = mockBotConfig.cliId;
+    const previousRuntime = mockBotConfig.dshRuntime;
+    try {
+      mockBotConfig.cliId = 'dsh';
+      mockBotConfig.dshRuntime = 'official';
+      mockGetSession.mockReturnValue({ sessionId: SESSION_ID, dshRuntime: 'tui' } as any);
+
+      const followUp = buildFollowUpCliInput('hello', SESSION_ID, { cliId: 'dsh', larkAppId: 'app_test' }).content;
+      expect(followUp).toContain(`<session_id>${SESSION_ID}</session_id>`);
+      expect(followUp).toContain('<botmux_reminder>');
+
+      const refork = buildFollowUpCliInput('hello', SESSION_ID, {
+        cliId: 'dsh', larkAppId: 'app_test', dshRuntimeOverride: 'live',
+      }).content;
+      expect(refork).not.toContain('<session_id>');
+      expect(refork).toContain('<botmux_reminder>');
+
+      const opening = buildNewTopicPrompt(
+        'hello', SESSION_ID, 'dsh', undefined, undefined, undefined, undefined, undefined,
+        { name: 'Bot', openId: 'ou_bot' }, 'zh', undefined,
+        { larkAppId: 'app_test', chatId: 'oc_1' },
+      );
+      expect(opening).toContain('<botmux_routing>');
+    } finally {
+      mockBotConfig.cliId = previousCliId;
+      if (previousRuntime === undefined) delete mockBotConfig.dshRuntime;
+      else mockBotConfig.dshRuntime = previousRuntime;
+      mockGetSession.mockReturnValue(undefined as any);
+    }
+  });
+
   it('delivers ebsd diagnosis text inside a non-command service envelope', () => {
     const prompt = buildNewTopicPrompt(
       '诊断这个卷',

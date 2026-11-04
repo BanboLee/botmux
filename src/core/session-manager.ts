@@ -1404,13 +1404,26 @@ type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'credentials' | 'sess
  *  spawn. Persisted `dsh` + live `dshRuntime=tui` resolves to `dsh-tui`; using
  *  the persisted id here made the opening prompt skip routing/session/identity
  *  because the headless `dsh` adapter claims `injectsSessionContext`. */
-function promptEffectiveCliId(cliId: CliId, larkAppId?: string): CliId {
-  if (cliId !== 'dsh' || !larkAppId) return cliId;
-  try {
-    return resolveEffectiveCliId(cliId, getBot(larkAppId).config.dshRuntime) ?? cliId;
-  } catch {
-    return cliId;
+function promptEffectiveCliId(
+  cliId: CliId,
+  larkAppId?: string,
+  sessionId?: string,
+  runtimeOverride?: 'official' | 'tui' | 'live',
+): CliId {
+  if (cliId !== 'dsh') return cliId;
+  let runtime: 'official' | 'tui' | undefined;
+  if (runtimeOverride && runtimeOverride !== 'live') {
+    runtime = runtimeOverride;
+  } else if (runtimeOverride !== 'live' && sessionId) {
+    // Active-worker consistency: the adapter was fixed at spawn. A live
+    // dshRuntime change must not rewrite the capabilities of a worker that is
+    // still running. Refork passes 'live' explicitly.
+    try { runtime = sessionStore.getSession(sessionId)?.dshRuntime; } catch { /* fall through */ }
   }
+  if (runtime === undefined && larkAppId) {
+    try { runtime = getBot(larkAppId).config.dshRuntime; } catch { /* fall through */ }
+  }
+  return resolveEffectiveCliId(cliId, runtime) ?? cliId;
 }
 
 function buildNewTopicBlocks(
@@ -1428,7 +1441,7 @@ function buildNewTopicBlocks(
   opts?: NewTopicOpts,
   hookMode = false,
 ): Array<{ key: NewTopicBlockKey; text: string }> {
-  cliId = promptEffectiveCliId(cliId, opts?.larkAppId);
+  cliId = promptEffectiveCliId(cliId, opts?.larkAppId, sessionId);
   if (zeroPromptInjectionForBot(opts?.larkAppId, cliId, opts?.promptInjection)) {
     return [{ key: 'userMessage', text: buildZeroPromptInput([userMessage, ...(followUps ?? [])].join('\n\n'), attachments) }];
   }
@@ -1850,6 +1863,9 @@ type FollowUpOpts = {
   solo?: boolean;
   /** solo 裸文本时剥掉开头的自 @（同 buildBridgeInputContent）。 */
   selfMention?: { name?: string | null; openId?: string | null };
+  /** 'live' is for refork (a new worker will spawn with the live config);
+   *  an explicit value pins the capability without reading session/config. */
+  dshRuntimeOverride?: 'official' | 'tui' | 'live';
 };
 
 function buildFollowUpBlocks(
@@ -1858,7 +1874,7 @@ function buildFollowUpBlocks(
   opts?: FollowUpOpts,
   hookMode = false,
 ): Array<{ key: FollowUpBlockKey; text: string }> {
-  if (opts?.cliId) opts = { ...opts, cliId: promptEffectiveCliId(opts.cliId, opts.larkAppId) };
+  if (opts?.cliId) opts = { ...opts, cliId: promptEffectiveCliId(opts.cliId, opts.larkAppId, sessionId, opts.dshRuntimeOverride) };
   if (zeroPromptInjectionForBot(opts?.larkAppId, opts?.cliId, opts?.promptInjection)) {
     return [{ key: 'userMessage', text: buildZeroPromptInput(content, opts?.attachments) }];
   }
@@ -2359,6 +2375,9 @@ export function buildReforkCliInput(
     isAdoptMode: false,
     cliId: opts?.cliId,
     cliPathOverride: opts?.cliPathOverride,
+    // Refork will spawn a new worker from the live config, so its prompt must
+    // use the live dsh runtime rather than the outgoing worker's frozen value.
+    dshRuntimeOverride: 'live',
     locale,
     sender: opts?.sender,
     larkAppId: ds.larkAppId,

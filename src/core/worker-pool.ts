@@ -2202,6 +2202,16 @@ function startupFailureNotice(ds: DaemonSession, cliName: string, reason: string
  *  and the worker likewise pairs a frozen cliId with the live runtime, so this
  *  matches what actually spawns. */
 export function dshRuntimeForSession(ds: DaemonSession): 'official' | 'tui' | undefined {
+  if (ds.session.dshRuntime) return ds.session.dshRuntime;
+  try {
+    return getBot(ds.larkAppId).config.dshRuntime;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Live config, used only when a new worker generation is actually spawned. */
+function liveDshRuntimeForSession(ds: DaemonSession): 'official' | 'tui' | undefined {
   try {
     return getBot(ds.larkAppId).config.dshRuntime;
   } catch {
@@ -15113,6 +15123,16 @@ export function forkWorker(
     };
   }
   if (queuedForkSnapshot && !codexAppDispatchId) {
+    sessionStore.updateSession(ds.session);
+  }
+
+  // Freeze the effective dsh runtime for THIS worker generation. Active-worker
+  // prompts/readbacks use session.dshRuntime; a later dashboard toggle only
+  // affects the next spawn/refork, never the adapter already running.
+  if ((ds.session.cliId ?? botCfg.cliId) === 'dsh') {
+    const liveDshRuntime = liveDshRuntimeForSession(ds);
+    if (liveDshRuntime === undefined) delete ds.session.dshRuntime;
+    else ds.session.dshRuntime = liveDshRuntime;
     sessionStore.updateSession(ds.session);
   }
 
